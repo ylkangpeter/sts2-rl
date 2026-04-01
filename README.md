@@ -11,7 +11,7 @@
 ```text
 workspace/
   sts2-cli/
-  st2rl/
+  sts2-rl/
 ```
 
 - 如果你的 `sts2-cli` 不在相邻目录，设置 `STS2_CLI_ROOT` 即可。
@@ -26,7 +26,7 @@ workspace/
 安装：
 
 ```powershell
-cd .\st2rl
+cd .\sts2-rl
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -39,7 +39,7 @@ pip install -e ".[rl]"
 
 ## 配置
 
-运行栈配置在 [configs/runtime_stack.json](D:/github/st2rl/configs/runtime_stack.json)。
+运行栈配置在 `configs/runtime_stack.json`。
 
 - `projects.sts2_cli_root` 默认指向相邻目录 `..\sts2-cli`
 - `projects.game_dir` 默认留空，优先读取环境变量 `STS2_GAME_DIR`
@@ -62,7 +62,7 @@ $env:STS2_CLI_ROOT="C:\path\to\sts2-cli"
 启动 service + dashboard：
 
 ```powershell
-cd .\st2rl
+cd .\sts2-rl
 .\scripts\start_stack.ps1
 ```
 
@@ -85,12 +85,52 @@ python .\python\http_game_service.py
 Invoke-RestMethod http://localhost:5000/health
 ```
 
-## 回归测试
+## 快速开始
 
-回归链路入口是 [examples/test_cli_game.py](D:/github/st2rl/examples/test_cli_game.py)：
+1. 准备相邻目录中的两个仓库：
+
+```text
+workspace/
+  sts2-cli/
+  sts2-rl/
+```
+
+2. 在 `sts2-cli` 中完成初始化：
 
 ```powershell
-cd .\st2rl
+cd ..\sts2-cli
+pip install -r requirements.txt
+python .\python\play.py --lang en
+```
+
+3. 设置游戏目录并启动 HTTP 服务：
+
+```powershell
+$env:STS2_GAME_DIR="C:\path\to\SlayTheSpire2"
+python .\python\http_game_service.py
+```
+
+4. 回到 `sts2-rl` 安装并启动 dashboard：
+
+```powershell
+cd ..\sts2-rl
+pip install -r requirements.txt
+pip install -e .
+.\scripts\start_stack.ps1
+```
+
+5. 打开 dashboard：
+
+```text
+http://127.0.0.1:8787
+```
+
+## 回归测试
+
+回归链路入口是 `examples/test_cli_game.py`：
+
+```powershell
+cd .\sts2-rl
 python .\examples\test_cli_game.py --workers 4 --rounds 50
 ```
 
@@ -104,12 +144,12 @@ python .\examples\test_cli_game.py --workers 4 --rounds 50
 
 ## 正式训练
 
-训练入口是 [scripts/train_http_cli_rl.py](D:/github/st2rl/scripts/train_http_cli_rl.py)，默认配置在 [configs/train_http_cli_rl.yaml](D:/github/st2rl/configs/train_http_cli_rl.yaml)。
+训练入口是 `scripts/train_http_cli_rl.py`，默认配置在 `configs/train_http_cli_rl.yaml`。
 
 启动训练：
 
 ```powershell
-cd .\st2rl
+cd .\sts2-rl
 python .\scripts\train_http_cli_rl.py
 ```
 
@@ -118,6 +158,19 @@ python .\scripts\train_http_cli_rl.py
 ```powershell
 python .\scripts\train_http_cli_rl.py --num-envs 4 --vec-env subproc --experiment-name baseline_reward_v1
 ```
+
+如果你希望在启动脚本里顺带启动训练 client：
+
+```powershell
+.\scripts\start_stack.ps1 -IncludeClient
+```
+
+常见训练调参项：
+
+- `configs/train_http_cli_rl.yaml` 里的 `training.num_envs`
+- `configs/train_http_cli_rl.yaml` 里的 `training.total_timesteps`
+- `configs/train_http_cli_rl.yaml` 里的 `environment.reward_config`
+- 命令行参数 `--experiment-name`
 
 训练输出目录：
 
@@ -130,7 +183,7 @@ models/http_cli_rl/<experiment_name>/<run_id>/
 启动 dashboard：
 
 ```powershell
-cd .\st2rl
+cd .\sts2-rl
 python .\scripts\training_dashboard.py
 ```
 
@@ -138,5 +191,5 @@ python .\scripts\training_dashboard.py
 
 ## 备注
 
-- [README_UNIFIED.md](D:/github/st2rl/README_UNIFIED.md) 保留为旧架构草稿，当前以本 README 为准。
+- `README_UNIFIED.md` 保留为旧架构草稿，当前以本 README 为准。
 - 当前正式训练链路已经不再依赖旧的 `STS2MCP` 工作流。
