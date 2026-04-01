@@ -1,0 +1,34 @@
+# -*- coding: utf-8 -*-
+# UI training configuration
+
+mode: ui
+
+environment:
+  character: Ironclad
+  max_steps: 5000
+  host: localhost
+  agent_port: 8080
+  mcp_port: 15526
+  use_mcp: true
+
+model:
+  learning_rate: 3.0e-4
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  verbose: 1
+
+training:
+  total_timesteps: 100000
+  save_freq: 10000
+  verbose: 1
+
+paths:
+  save_dir: "./models/unified"
+  model_name: "ppo_sts2_ui"

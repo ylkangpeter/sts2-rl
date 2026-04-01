@@ -1,0 +1,55 @@
+# -*- coding: utf-8 -*-
+# HTTP CLI RL training configuration
+
+mode: headless
+
+environment:
+  character: Ironclad
+  max_steps: 5000
+  base_url: http://localhost:5000
+  game_dir:
+  timeout_seconds: 30
+  stuck_warn_threshold: 60
+  stuck_abort_threshold: 140
+  no_action_combat_abort_threshold: 12
+  no_action_combat_proceed_threshold: 3
+  reward_config:
+    hp_delta_weight: 0.08
+    damage_penalty_weight: 0.8
+    gold_delta_weight: 0.01
+    combat_victory_reward: 5.0
+    card_reward_seen_reward: 0.2
+    elite_reward: 2.0
+    shop_high_gold_reward: 0.4
+    shop_low_gold_penalty: -0.5
+    terminal_victory_reward: 100.0
+    terminal_defeat_penalty: -100.0
+    invalid_action_penalty: -0.1
+    stuck_penalty: -10.0
+    progress_floor_reward: 1.0
+
+model:
+  learning_rate: 3.0e-4
+  n_steps: 1024
+  batch_size: 128
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  verbose: 1
+  tensorboard_log: ./logs/tensorboard
+
+training:
+  total_timesteps: 1000000
+  save_freq: 2048
+  verbose: 1
+  num_envs: 4
+  vec_env: subproc
+
+paths:
+  save_dir: ./models/http_cli_rl
+  experiment_name: baseline_reward_v1
+  model_name: ppo_http_cli_rl

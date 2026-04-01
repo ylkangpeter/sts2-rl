@@ -1,0 +1,73 @@
+{
+  "python_executable": "python",
+  "projects": {
+    "st2rl_root": "..",
+    "sts2_cli_root": "..\\sts2-cli",
+    "game_dir": ""
+  },
+  "service": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 5000,
+    "health_path": "/health",
+    "script": "python\\http_game_service.py",
+    "workdir": ".",
+    "process_match": "python\\\\http_game_service.py"
+  },
+  "dashboard": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8787,
+    "health_path": "/api/state",
+    "script": "scripts\\training_dashboard.py",
+    "workdir": ".",
+    "process_match": "scripts\\\\training_dashboard.py",
+    "env": {
+      "ST2RL_LOG_LEVEL": "WARNING"
+    }
+  },
+  "watchdog": {
+    "enabled": false,
+    "script": "scripts\\training_watchdog.py",
+    "workdir": ".",
+    "process_match": "scripts\\\\training_watchdog.py",
+    "env": {
+      "ST2RL_LOG_LEVEL": "WARNING"
+    },
+    "poll_seconds": 15,
+    "per_floor_timeout_seconds": 60,
+    "stale_slot_seconds": 75,
+    "stagnant_steps_threshold": 2,
+    "restart_cooldown_seconds": 180,
+    "no_training_grace_seconds": 45,
+    "total_timesteps": 1000000
+  },
+  "session_supervisor": {
+    "enabled": false,
+    "script": "scripts\\training_session_supervisor.py",
+    "workdir": ".",
+    "process_match": "scripts\\\\training_session_supervisor.py",
+    "env": {
+      "ST2RL_LOG_LEVEL": "WARNING"
+    },
+    "poll_seconds": 15,
+    "floor_timeout_seconds": 60,
+    "stale_slot_seconds": 75,
+    "stagnant_steps_threshold": 2,
+    "intervention_cooldown_seconds": 90,
+    "uptime_grace_seconds": 60
+  },
+  "client": {
+    "enabled": true,
+    "script": "scripts\\train_http_cli_rl.py",
+    "workdir": ".",
+    "process_match": "scripts\\\\train_http_cli_rl.py",
+    "args": [
+      "--experiment-name",
+      "baseline_reward_v1"
+    ],
+    "env": {
+      "ST2RL_LOG_LEVEL": "WARNING"
+    }
+  }
+}
