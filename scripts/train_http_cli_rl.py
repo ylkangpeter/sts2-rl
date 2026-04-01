@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("D:/github/st2rl/configs/train_http_cli_rl.yaml"),
+        default=Path(__file__).resolve().parents[1] / "configs" / "train_http_cli_rl.yaml",
         help="Path to YAML training config.",
     )
     parser.add_argument(

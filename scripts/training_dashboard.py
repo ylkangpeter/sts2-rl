@@ -2444,11 +2444,11 @@ HTML = """<!doctype html>
         if (hpCell) hpCell.classList.add('metric-strong');
         if (rewardCell) rewardCell.classList.add('metric-warn');
         if (victoryCell && victoryCell.textContent === 'True') victoryCell.classList.add('metric-good');
-        const session = historicalBest[row.rowIndex - 1];
-        if (session) {
-          const runDir = `D:/github/st2rl/models/http_cli_rl/${session.experiment_name}/${session.run_id}`;
-          row.addEventListener('click', () => loadSession(session.game_id, runDir));
-        }
+          const session = historicalBest[row.rowIndex - 1];
+          if (session) {
+            const runDir = session.run_dir || '';
+            row.addEventListener('click', () => loadSession(session.game_id, runDir));
+          }
       });
     }
     refresh();
