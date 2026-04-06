@@ -15,7 +15,11 @@ from gymnasium import spaces
 
 from st2rl.gameplay.knowledge_matcher import DEFAULT_MISMATCH_LOG_PATH, KnowledgeMatcher
 from st2rl.gameplay.types import FlowAction, GameStateView
-from st2rl.protocols.http_cli import HttpCliProtocol, HttpCliProtocolConfig
+from st2rl.protocols.http_cli import (
+    HttpCliProtocol,
+    HttpCliProtocolConfig,
+    mark_headless_unsupported_card,
+)
 from st2rl.training.action_codec import create_action_space, decode_action
 from st2rl.training.reward import RewardConfig, RewardTracker
 from st2rl.training.telemetry import SessionLeaderboardStore, SlotTelemetry
@@ -40,6 +44,8 @@ class HttpCliEnvConfig:
     stuck_abort_threshold: int = 140
     no_action_combat_abort_threshold: int = 12
     no_action_combat_proceed_threshold: int = 3
+    async_combat_poll_attempts: int = 12
+    async_combat_poll_interval_seconds: float = 0.25
     observation_max_hand: int = 10
     observation_max_enemies: int = 5
     seed_offset: int = 0
@@ -124,6 +130,7 @@ class HttpCliRlEnv(gym.Env):
         self._protocol_error_streak = 0
         self._deadlock_error_streak = 0
         self._termination_reason: Optional[str] = None
+        self._combat_deadlock_card_ids: set[str] = set()
 
     def _normalize_room_type(self, value: Any, *, symbol: Any = None) -> str:
         text = str(value or symbol or "").strip().lower()
@@ -836,7 +843,11 @@ class HttpCliRlEnv(gym.Env):
     def _best_effort_combat_action(self, state: Optional[GameStateView]) -> Optional[FlowAction]:
         if state is None or state.decision != "combat_play":
             return None
-        playable = state.playable_cards()
+        playable = [
+            card
+            for card in state.playable_cards()
+            if str(card.get("id") or "").strip().upper() not in self._combat_deadlock_card_ids
+        ]
         enemies = state.living_enemies()
         if playable:
             attack_cards = [card for card in playable if str(card.get("type") or "").lower() == "attack"]
@@ -869,6 +880,30 @@ class HttpCliRlEnv(gym.Env):
                 args["target_index"] = target.get("index")
             return FlowAction("use_potion", args)
         return None
+
+    def _remember_deadlock_card(self, state: Optional[GameStateView], action: Optional[FlowAction]) -> None:
+        if state is None or action is None or action.name != "play_card":
+            return
+        selected_index = action.args.get("card_index")
+        if selected_index is None:
+            return
+        for card in state.hand:
+            if not isinstance(card, dict) or card.get("index") != selected_index:
+                continue
+            card_id = str(card.get("id") or "").strip().upper()
+            if not card_id:
+                return
+            self._combat_deadlock_card_ids.add(card_id)
+            mark_headless_unsupported_card(card)
+            self.logger.warning(
+                "Marking card as headless-unsupported after combat deadlock: slot=%s seed=%s game_id=%s card_id=%s card_name=%s",
+                self.config.seed_offset,
+                self._seed,
+                self._game_id,
+                card_id,
+                card.get("name"),
+            )
+            return
 
     def _encode_cards(self, cards: list[Dict[str, Any]], max_count: int) -> list[float]:
         features: list[float] = []
@@ -1035,6 +1070,62 @@ class HttpCliRlEnv(gym.Env):
         )
         return any(token in message for token in tokens) or bool(last_state and "state" in str(last_state).lower())
 
+    def _is_shop_like_error(self, payload: dict[str, Any] | None) -> bool:
+        if not payload:
+            return False
+        message = str(payload.get("message", "") or "").lower()
+        return any(
+            token in message
+            for token in (
+                "buy relic failed",
+                "buy potion failed",
+                "buy card failed",
+                "relic already purchased",
+                "not enough gold",
+                "not in a shop",
+                "purge_card",
+                "remove_card",
+                "buy_relic",
+                "buy_potion",
+                "buy_card",
+            )
+        )
+
+    def _should_poll_for_async_combat_progress(
+        self,
+        before_state: Optional[GameStateView],
+        action: FlowAction,
+    ) -> bool:
+        if before_state is None or before_state.decision != "combat_play":
+            return False
+        if before_state.playable_cards():
+            return False
+        return action.name in {"end_turn", "proceed"}
+
+    def _poll_for_async_combat_progress(
+        self,
+        before_marker: str,
+    ) -> bool:
+        if self._game_id is None:
+            return False
+
+        for _ in range(max(1, self.config.async_combat_poll_attempts)):
+            time.sleep(max(0.01, self.config.async_combat_poll_interval_seconds))
+            try:
+                raw_state = self.protocol.get_state(self._game_id)
+            except Exception:
+                continue
+            candidate = self.protocol.adapt_state(raw_state)
+            if self._progress_marker(candidate) == before_marker:
+                continue
+            self._state = candidate
+            self.reward_tracker.reset(candidate)
+            self._protocol_error_streak = 0
+            self._deadlock_error_streak = 0
+            return True
+
+        return False
+
     def _zero_observation(self) -> np.ndarray:
         return np.zeros(self.observation_space.shape, dtype=np.float32)
 
@@ -1121,6 +1212,7 @@ class HttpCliRlEnv(gym.Env):
             self._protocol_error_streak = 0
             self._deadlock_error_streak = 0
             self._termination_reason = None
+            self._combat_deadlock_card_ids = set()
             try:
                 self.protocol.health_check(retries=self.config.health_check_retries)
                 start = self.protocol.start_game(self.config.character, self._seed, self.config.seed_offset)
@@ -1183,59 +1275,63 @@ class HttpCliRlEnv(gym.Env):
                 self._protocol_error_streak += 1
                 if self._is_deadlock_error(result.raw):
                     self._deadlock_error_streak += 1
-                reward += self.reward_tracker.on_invalid_action()
-                recovery = self.protocol.recover_action_from_error(result.raw, self._state) or FlowAction("proceed")
-                retry = self.protocol.step(self._game_id, self.protocol.sanitize_action(self._state, recovery, random))
-                if retry.status != "success":
-                    self._protocol_error_streak += 1
-                    if self._is_deadlock_error(retry.raw):
-                        self._deadlock_error_streak += 1
-                    try:
-                        raw_state = self.protocol.get_state(self._game_id)
-                        self._state = self.protocol.adapt_state(raw_state)
-                        forced_combat_action = self._best_effort_combat_action(self._state)
-                        if forced_combat_action is not None:
-                            forced_result = self.protocol.step(
-                                self._game_id,
-                                self.protocol.sanitize_action(self._state, forced_combat_action, random),
-                            )
-                            if forced_result.status == "success" and forced_result.state:
-                                result = forced_result
-                                self._state = self.protocol.adapt_state(forced_result.state)
-                                self._protocol_error_streak = 0
-                                self._deadlock_error_streak = 0
-                                reward += self.reward_tracker.on_invalid_action()
-                                time.sleep(self.config.recovery_delay_seconds)
-                            else:
-                                reward += self.reward_tracker.on_invalid_action()
-                                time.sleep(self.config.recovery_delay_seconds)
-                        else:
-                            reward += self.reward_tracker.on_invalid_action()
-                            time.sleep(self.config.recovery_delay_seconds)
-                    except Exception:
-                        reward += self.reward_tracker.on_stuck()
-                        obs = self._get_observation(self._state)
-                        self._episode_reward += reward
-                        self._termination_reason = "fatal_protocol_error"
-                        self._record_trace_step(
-                            before_state=before_state,
-                            action=sanitized,
-                            after_state=self._state,
-                            reward=reward,
-                            status="fatal_error",
-                        )
-                        info = {
-                            "decision": self._state.decision,
-                            "episode_reward": self._episode_reward,
-                            "episode_steps": self._step_count,
-                            "error": str(result.raw),
-                            "termination_reason": "fatal_protocol_error",
-                        }
-                        self._record_episode_summary(terminated=False, truncated=True)
-                        self._write_current_slot(active=False)
-                        return obs, reward, False, True, info
+                if self._should_poll_for_async_combat_progress(before_state, sanitized) and self._poll_for_async_combat_progress(before_marker):
+                    result = type(result)(status="success", state=self._state.raw if self._state is not None else None)
                 else:
-                    result = retry
+                    reward += self.reward_tracker.on_invalid_action()
+                    recovery = self.protocol.recover_action_from_error(result.raw, self._state) or FlowAction("proceed")
+                    retry = self.protocol.step(self._game_id, self.protocol.sanitize_action(self._state, recovery, random))
+                    if retry.status != "success":
+                        self._protocol_error_streak += 1
+                        if self._is_deadlock_error(retry.raw):
+                            self._deadlock_error_streak += 1
+                            self._remember_deadlock_card(before_state, sanitized)
+                        if self._should_poll_for_async_combat_progress(self._state, recovery) and self._poll_for_async_combat_progress(before_marker):
+                            result = type(result)(status="success", state=self._state.raw if self._state is not None else None)
+                        else:
+                            should_probe_state = not (
+                                self._state is None
+                                or self._state.decision != "combat_play"
+                                or self._is_shop_like_error(result.raw)
+                                or self._is_shop_like_error(retry.raw)
+                            )
+                            if should_probe_state:
+                                try:
+                                    raw_state = self.protocol.get_state(self._game_id)
+                                    self._state = self.protocol.adapt_state(raw_state)
+                                    forced_combat_action = self._best_effort_combat_action(self._state)
+                                    if forced_combat_action is not None:
+                                        forced_result = self.protocol.step(
+                                            self._game_id,
+                                            self.protocol.sanitize_action(self._state, forced_combat_action, random),
+                                        )
+                                        if forced_result.status == "success" and forced_result.state:
+                                            result = forced_result
+                                            self._state = self.protocol.adapt_state(forced_result.state)
+                                            self._protocol_error_streak = 0
+                                            self._deadlock_error_streak = 0
+                                            reward += self.reward_tracker.on_invalid_action()
+                                            time.sleep(self.config.recovery_delay_seconds)
+                                        else:
+                                            reward += self.reward_tracker.on_invalid_action()
+                                            abort_episode = True
+                                            termination_reason = "protocol_deadlock"
+                                            time.sleep(self.config.recovery_delay_seconds)
+                                    else:
+                                        reward += self.reward_tracker.on_invalid_action()
+                                        abort_episode = True
+                                        termination_reason = "protocol_deadlock"
+                                        time.sleep(self.config.recovery_delay_seconds)
+                                except Exception:
+                                    reward += self.reward_tracker.on_stuck()
+                                    abort_episode = True
+                                    termination_reason = "protocol_deadlock"
+                            else:
+                                reward += self.reward_tracker.on_stuck()
+                                abort_episode = True
+                                termination_reason = "protocol_deadlock"
+                    else:
+                        result = retry
             else:
                 self._protocol_error_streak = 0
                 self._deadlock_error_streak = 0

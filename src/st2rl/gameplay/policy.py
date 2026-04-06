@@ -4,6 +4,17 @@
 import random
 
 from st2rl.gameplay.config import FlowPolicyConfig
+from st2rl.gameplay.heuristics import (
+    best_shop_card,
+    best_shop_potion,
+    best_shop_relic,
+    choose_card_reward,
+    choose_event_option,
+    choose_purge_target,
+    choose_upgrade_target,
+    is_shop_context,
+    shop_purge_cost,
+)
 from st2rl.gameplay.types import FlowAction, GameStateView, card_needs_enemy_target
 
 
@@ -52,7 +63,7 @@ class SimpleFlowPolicy:
                 if state.gold >= self.config.shop_high_gold_threshold:
                     weight = 2.1
                 elif state.gold < self.config.shop_low_gold_threshold:
-                    weight = 0.35
+                    weight = 0.15
             elif "rest" in room_type:
                 weight = 1.8 if hp_ratio < self.config.rest_heal_threshold else 0.85
             elif "treasure" in room_type:
@@ -77,44 +88,47 @@ class SimpleFlowPolicy:
         return FlowAction("play_card", args)
 
     def _pick_card_reward_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
-        if state.cards and (not state.can_skip or rng.random() < self.config.card_reward_take_probability):
-            card = rng.choice(state.cards)
-            return FlowAction("choose_card_reward", {"card_index": card.get("index", 0)})
+        deck = list(state.player.get("deck") or [])
+        choice = choose_card_reward(state.cards, deck, state.can_skip)
+        if choice is not None:
+            return FlowAction("choose_card_reward", {"card_index": choice.get("index", 0)})
         return FlowAction("skip_reward")
 
     def _pick_shop_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         if state.gold < self.config.shop_low_gold_threshold:
             return FlowAction("leave_shop")
 
-        candidates: list[FlowAction] = []
-        for card in state.cards:
-            if card.get("cost", 9999) <= state.gold:
-                candidates.append(FlowAction("buy_card", {"card_index": card.get("index", 0)}))
-        for relic in state.relics:
-            if relic.get("cost", 9999) <= state.gold:
-                candidates.extend([FlowAction("buy_relic", {"relic_index": relic.get("index", 0)})] * 3)
-        for potion in state.potions:
-            if potion.get("cost", 9999) <= state.gold:
-                candidates.append(FlowAction("buy_potion", {"potion_index": potion.get("index", 0)}))
-        purge_cost = int(state.raw.get("purge_cost") or 999999)
-        if state.gold >= purge_cost:
-            for card in state.player.get("deck") or []:
-                if isinstance(card, dict) and card.get("index") is not None:
-                    candidates.append(FlowAction("purge_card", {"card_index": card.get("index", 0)}))
+        best_relic = best_shop_relic(state.relics, state.gold)
+        if best_relic is not None:
+            return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
+
+        purge_cost = shop_purge_cost(state)
+        purge_target = choose_purge_target(list(state.player.get("deck") or []))
+        if state.gold >= purge_cost and purge_target is not None:
+            return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
+
+        best_card = best_shop_card(state.cards, state.gold, list(state.player.get("deck") or []))
+        if best_card is not None:
+            return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
+
+        best_potion = best_shop_potion(state.potions, state.gold)
+        if best_potion is not None and state.gold >= self.config.shop_high_gold_threshold:
+            return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
 
         buy_probability = self.config.shop_buy_probability
         if state.gold >= self.config.shop_high_gold_threshold:
             buy_probability = max(buy_probability, 0.8)
-        if candidates and rng.random() < buy_probability:
-            return rng.choice(candidates)
+        if rng.random() < buy_probability:
+            best_card = best_shop_card(state.cards, state.gold, list(state.player.get("deck") or []))
+            if best_card is not None:
+                return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
         return FlowAction("leave_shop")
 
     def _pick_event_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         options = state.options or state.choices
-        unlocked = [option for option in options if not option.get("is_locked")]
-        if not unlocked:
+        pick = choose_event_option(options, state)
+        if pick is None:
             return FlowAction("proceed")
-        pick = rng.choice(unlocked)
         return FlowAction("choose_option", {"option_index": pick.get("index", 0)})
 
     def _pick_rest_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
@@ -157,6 +171,15 @@ class SimpleFlowPolicy:
         indices = [str(card.get("index", i)) for i, card in enumerate(state.cards)]
         if not indices:
             return FlowAction("skip_select")
+
+        if is_shop_context(state):
+            purge_target = choose_purge_target(state.cards)
+            if purge_target is not None:
+                return FlowAction("select_cards", {"indices": str(purge_target.get("index", 0))})
+
+        upgrade_target = choose_upgrade_target(state.cards)
+        if upgrade_target is not None:
+            return FlowAction("select_cards", {"indices": str(upgrade_target.get("index", 0))})
 
         if state.min_select == 0 and rng.random() < self.config.card_select_skip_probability:
             return FlowAction("skip_select")

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """HTTP CLI protocol adapter for sts2-cli."""
 
 import os
@@ -13,6 +13,18 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 
+from st2rl.gameplay.heuristics import (
+    best_shop_card,
+    best_shop_potion,
+    best_shop_relic,
+    choose_card_reward,
+    choose_purge_target,
+    choose_upgrade_target,
+    is_shop_context,
+    shop_purge_cost,
+    should_replace_potion,
+    worst_owned_potion,
+)
 from st2rl.gameplay.types import FlowAction, GameStateView, card_needs_enemy_target
 from st2rl.protocols.base import FlowProtocol, ProtocolStartResult, ProtocolStepResult
 
@@ -33,6 +45,7 @@ ACTION_ALIAS = {
     "buy_card": "buy_card",
     "buy_relic": "buy_relic",
     "buy_potion": "buy_potion",
+    "discard_potion": "discard_potion",
     "use_potion": "use_potion",
     "purge_card": "purge_card",
     "select_bundle": "select_bundle",
@@ -71,9 +84,29 @@ def _is_buyable_shop_card(card: Dict[str, Any]) -> bool:
     return True
 
 
+def _is_placeholder_shop_relic(relic: Dict[str, Any]) -> bool:
+    if not isinstance(relic, dict):
+        return True
+    name = str(relic.get("name") or "").strip()
+    description = str(relic.get("description") or "").strip()
+    if not name or name.startswith("?.") or name == "?":
+        return True
+    if description.startswith("?.") or description == "?":
+        return True
+    return False
+
+
 def _is_headless_unsupported_card(card: Dict[str, Any]) -> bool:
     card_id = str(card.get("id") or "").strip().upper()
     return card_id in UNSUPPORTED_HEADLESS_CARD_IDS
+
+
+def mark_headless_unsupported_card(card: Dict[str, Any] | None) -> None:
+    if not isinstance(card, dict):
+        return
+    card_id = str(card.get("id") or "").strip().upper()
+    if card_id:
+        UNSUPPORTED_HEADLESS_CARD_IDS.add(card_id)
 
 
 def _safe_int(value: Any, default: Optional[int] = 0) -> Optional[int]:
@@ -115,8 +148,9 @@ def _potion_heal_amount(potion: Dict[str, Any]) -> int:
 
     text = f"{potion.get('name') or ''} {potion.get('description') or ''}"
     lowered = text.lower()
+    chinese_heal_tokens = ("恢复", "治疗", "回复", "生命")
     if not any(token in lowered for token in ("heal", "healing", "restore", "recover", "regain")) and not any(
-        token in text for token in ("恢复", "回复", "治疗", "生命")
+        token in text for token in chinese_heal_tokens
     ):
         return 0
     digits = [int(match) for match in re.findall(r"\d+", text)]
@@ -258,6 +292,34 @@ class HttpCliProtocol(FlowProtocol):
         if data.get("status") != "healthy":
             raise RuntimeError(f"Service health check failed: {data}")
 
+    def _list_games(self) -> list[Dict[str, Any]]:
+        data = self._request("GET", "/games", retries=1)
+        if data.get("status") != "success":
+            return []
+        games = data.get("games")
+        return list(games) if isinstance(games, list) else []
+
+    @staticmethod
+    def _slot_matches_game(slot: int, game: Dict[str, Any]) -> bool:
+        slot_token = f"_{int(slot):02d}_"
+        for key in ("seed", "game_id"):
+            value = str(game.get(key) or "")
+            if slot_token in value:
+                return True
+        return False
+
+    def _close_worker_slot_game(self, worker_slot: int) -> bool:
+        for game in self._list_games():
+            if not isinstance(game, dict) or not self._slot_matches_game(worker_slot, game):
+                continue
+            game_id = str(game.get("game_id") or "").strip()
+            if not game_id:
+                continue
+            result = self._request("POST", f"/close/{game_id}", payload={}, retries=1)
+            if result.get("status") == "success":
+                return True
+        return False
+
     def start_game(self, character: str, seed: str, worker_slot: int | None = None) -> ProtocolStartResult:
         payload = {"character": character, "seed": seed}
         if worker_slot is not None:
@@ -266,10 +328,25 @@ class HttpCliProtocol(FlowProtocol):
         if game_dir:
             payload["game_dir"] = game_dir
 
-        data = self._request("POST", "/start", payload=payload)
-        if data.get("status") != "success":
-            raise RuntimeError(f"Start game failed: {data}")
-        return ProtocolStartResult(game_id=data["game_id"], raw_state=data.get("state") or {})
+        attempts = 2 if worker_slot is not None else 1
+        last_error: Dict[str, Any] | None = None
+        for attempt in range(attempts):
+            data = self._request("POST", "/start", payload=payload)
+            if data.get("status") == "success":
+                return ProtocolStartResult(game_id=data["game_id"], raw_state=data.get("state") or {})
+
+            last_error = data
+            message = str(data.get("message") or "")
+            if (
+                worker_slot is None
+                or attempt >= attempts - 1
+                or "busy" not in message.lower()
+                or not self._close_worker_slot_game(int(worker_slot))
+            ):
+                break
+            time.sleep(self.config.close_retry_delay_seconds)
+
+        raise RuntimeError(f"Start game failed: {last_error}")
 
     def get_state(self, game_id: str) -> Dict[str, Any]:
         data = self._request("GET", f"/state/{game_id}", retries=2)
@@ -357,6 +434,8 @@ class HttpCliProtocol(FlowProtocol):
                     if _combat_potion_mode(potion) == "safe_enemy" and enemies:
                         fallback_args["target_index"] = rng.choice(enemies).get("index")
                     return FlowAction("use_potion", fallback_args)
+                if not enemies:
+                    return FlowAction("proceed")
                 return FlowAction("end_turn")
 
             if safe.name == "play_card":
@@ -401,11 +480,15 @@ class HttpCliProtocol(FlowProtocol):
             if safe.name == "proceed":
                 if force_proceed or not enemies:
                     return FlowAction("proceed")
-                return _fallback_combat_action()
+                if playable or healing_potion_action is not None or player_potions:
+                    return _fallback_combat_action()
+                return FlowAction("end_turn")
 
             if safe.name == "end_turn":
                 if playable or player_potions:
                     return _fallback_combat_action()
+                if not enemies:
+                    return FlowAction("proceed")
                 return FlowAction("end_turn")
 
             return _fallback_combat_action()
@@ -433,7 +516,9 @@ class HttpCliProtocol(FlowProtocol):
             if safe.name == "skip_reward" and state.can_skip:
                 return safe
             if state.cards:
-                return FlowAction("choose_card_reward", {"card_index": rng.choice(state.cards).get("index", 0)})
+                picked = choose_card_reward(state.cards, list(state.player.get("deck") or []), state.can_skip)
+                if picked is not None:
+                    return FlowAction("choose_card_reward", {"card_index": picked.get("index", 0)})
             return FlowAction("skip_reward")
 
         if state.decision == "shop":
@@ -446,78 +531,84 @@ class HttpCliProtocol(FlowProtocol):
                 potion for potion in state.potions if isinstance(potion, dict) and potion.get("cost", 9999) <= state.gold
             ]
             affordable_potions = affordable_shop_potions if free_potion_slots > 0 else []
-            affordable_relics = [relic for relic in state.relics if isinstance(relic, dict) and relic.get("cost", 9999) <= state.gold]
+            affordable_relics = [
+                relic
+                for relic in state.relics
+                if isinstance(relic, dict) and relic.get("cost", 9999) <= state.gold and not _is_placeholder_shop_relic(relic)
+            ]
             deck = [card for card in (state.player.get("deck") or []) if isinstance(card, dict)]
-            purge_cost = int(state.raw.get("purge_cost") or 999999)
+            purge_cost = shop_purge_cost(state)
+            best_relic = best_shop_relic(affordable_relics, state.gold)
+            best_card = best_shop_card(affordable_cards, state.gold, deck)
+            best_potion = best_shop_potion(affordable_shop_potions, state.gold)
+            replacement_target = should_replace_potion(state.player.get("potions") or [], best_potion) if free_potion_slots <= 0 else None
+            purge_target = choose_purge_target(deck)
             if safe.name == "leave_shop":
+                if replacement_target is not None:
+                    return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
                 if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
                     return healing_potion_action
-                if state.gold >= 250 and affordable_relics:
-                    relic = min(affordable_relics, key=lambda item: int(item.get("cost") or 999999))
-                    return FlowAction("buy_relic", {"relic_index": relic.get("index", 0)})
-                if state.gold >= purge_cost and deck:
-                    purge_target = next((card for card in deck if str(card.get("name") or "").lower() in {"strike", "打击", "defend", "防御"}), None)
-                    if purge_target is not None:
-                        return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
+                if state.gold >= 150 and best_relic is not None:
+                    return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
+                if state.gold >= purge_cost and purge_target is not None:
+                    return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
+                if best_card is not None:
+                    return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
                 return FlowAction("leave_shop")
             if safe.name == "buy_card":
                 valid = {card.get("index") for card in affordable_cards}
                 if safe.args.get("card_index") in valid:
+                    if best_relic is not None:
+                        return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
+                    if best_card is not None:
+                        return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
                     return safe
             if safe.name == "buy_potion":
+                if replacement_target is not None:
+                    return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
                 if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
                     return healing_potion_action
                 valid = {potion.get("index") for potion in affordable_potions}
                 if safe.args.get("potion_index") in valid:
+                    if best_relic is not None:
+                        return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
+                    if best_card is not None and bool(best_card.get("on_sale")):
+                        return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
+                    if best_potion is not None:
+                        return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
                     return safe
             if safe.name == "buy_relic":
                 valid = {relic.get("index") for relic in affordable_relics}
                 if safe.args.get("relic_index") in valid:
+                    if best_relic is not None:
+                        return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
                     return safe
             if safe.name == "purge_card":
                 valid = {card.get("index") for card in deck if state.gold >= purge_cost}
                 if safe.args.get("card_index") in valid:
+                    if purge_target is not None:
+                        return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
                     return safe
-            shop_candidates: list[FlowAction] = []
+            if safe.name == "discard_potion":
+                discardable = worst_owned_potion(state.player.get("potions") or [])
+                if replacement_target is not None and discardable is not None and safe.args.get("potion_index") == discardable.get("index"):
+                    return safe
+                if replacement_target is not None:
+                    return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
             if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
-                shop_candidates.append(healing_potion_action)
-            if state.gold >= 250:
-                shop_candidates.extend(
-                    FlowAction("buy_relic", {"relic_index": relic.get("index", 0)})
-                    for relic in affordable_relics
-                    if relic.get("index") is not None
-                )
-                shop_candidates.extend(
-                    FlowAction("buy_relic", {"relic_index": relic.get("index", 0)})
-                    for relic in affordable_relics
-                    if relic.get("index") is not None
-                )
-            shop_candidates.extend(
-                FlowAction("buy_relic", {"relic_index": relic.get("index", 0)})
-                for relic in affordable_relics
-                if relic.get("index") is not None
-            )
-            shop_candidates.extend(
-                FlowAction("buy_card", {"card_index": card.get("index", 0)})
-                for card in affordable_cards
-                if card.get("index") is not None
-            )
-            shop_candidates.extend(
-                FlowAction("buy_potion", {"potion_index": potion.get("index", 0)})
-                for potion in affordable_potions
-                if potion.get("index") is not None and state.gold >= 150
-            )
-            if state.gold >= purge_cost:
-                preferred_purge = [
-                    card for card in deck
-                    if card.get("index") is not None and str(card.get("name") or "").lower() in {"strike", "打击", "defend", "防御"}
-                ]
-                purge_pool = preferred_purge or [card for card in deck if card.get("index") is not None]
-                shop_candidates.extend(FlowAction("purge_card", {"card_index": card.get("index", 0)}) for card in purge_pool)
-            if state.gold < 100 and safe.name not in {"buy_relic", "buy_card", "buy_potion", "purge_card"}:
+                return healing_potion_action
+            if replacement_target is not None:
+                return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
+            if state.gold < 150 and safe.name not in {"buy_relic", "buy_card", "buy_potion", "purge_card"}:
                 return FlowAction("leave_shop")
-            if safe.name != "leave_shop" and shop_candidates:
-                return rng.choice(shop_candidates)
+            if best_relic is not None:
+                return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
+            if state.gold >= purge_cost and purge_target is not None:
+                return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
+            if best_card is not None:
+                return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
+            if state.gold >= 250 and best_potion is not None:
+                return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
             return FlowAction("leave_shop")
 
         if state.decision in ("event", "event_choice"):
@@ -555,10 +646,25 @@ class HttpCliProtocol(FlowProtocol):
                 raw_indices = str(safe.args.get("indices", ""))
                 picks = [item.strip() for item in raw_indices.split(",") if item.strip()]
                 if picks and all(item in valid for item in picks) and state.min_select <= len(picks) <= state.max_select:
+                    if is_shop_context(state):
+                        purge_target = choose_purge_target(state.cards)
+                        if purge_target is not None:
+                            return FlowAction("select_cards", {"indices": str(purge_target.get("index", 0))})
+                    upgrade_target = choose_upgrade_target(state.cards)
+                    if upgrade_target is not None:
+                        return FlowAction("select_cards", {"indices": str(upgrade_target.get("index", 0))})
                     return safe
             if not state.cards:
                 return FlowAction("skip_select")
+            if is_shop_context(state):
+                purge_target = choose_purge_target(state.cards)
+                if purge_target is not None:
+                    return FlowAction("select_cards", {"indices": str(purge_target.get("index", 0))})
+            upgrade_target = choose_upgrade_target(state.cards)
+            if upgrade_target is not None:
+                return FlowAction("select_cards", {"indices": str(upgrade_target.get("index", 0))})
             indices = [str(card.get("index", index)) for index, card in enumerate(state.cards)]
             return FlowAction("select_cards", {"indices": ",".join(indices[: max(1, state.min_select)])})
 
         return safe
+

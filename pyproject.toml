@@ -15,6 +15,7 @@ dependencies = [
     "flask>=3.0.0",
     "pygame>=2.5.0",
     "pillow>=10.0.0",
+    "tensorboard>=2.20.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +29,7 @@ rl = [
     "pyyaml>=6.0",
     "stable-baselines3>=2.2.0",
     "shimmy>=0.4.0",
+    "tensorboard>=2.20.0",
 ]
 
 [tool.setuptools.packages.find]

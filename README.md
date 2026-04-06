@@ -1,12 +1,8 @@
 # sts2-rl
 
-基于本地 `sts2-cli` fork 的 Slay the Spire 2 强化学习项目。当前主线是通过 `sts2-cli` 提供的 HTTP 服务做回归测试、并发训练和训练监控。
+Reinforcement learning and regression tooling for Slay the Spire 2, designed to run against a local sibling checkout of `sts2-cli`.
 
-## 项目关系
-
-- 本仓库负责训练、策略流程、奖励函数、dashboard 和运维脚本。
-- 运行时依赖另一个本地仓库 `sts2-cli`。
-- 推荐目录结构：
+Recommended layout:
 
 ```text
 workspace/
@@ -14,16 +10,14 @@ workspace/
   sts2-rl/
 ```
 
-- 如果你的 `sts2-cli` 不在相邻目录，设置 `STS2_CLI_ROOT` 即可。
-
-## 依赖
+## Requirements
 
 - Python 3.10+
-- [Slay the Spire 2](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/)
-- [.NET 9+ SDK](https://dotnet.microsoft.com/download)
-- 一个可运行 HTTP 服务的本地 `sts2-cli` fork
+- .NET 9 SDK
+- Slay the Spire 2 installed locally
+- A local checkout of `sts2-cli`
 
-安装：
+Install:
 
 ```powershell
 cd .\sts2-rl
@@ -31,165 +25,145 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-如果只想装训练扩展，也可以：
+If you only want the RL extras:
 
 ```powershell
 pip install -e ".[rl]"
 ```
 
-## 配置
+## Privacy-Safe Runtime Config
 
-运行栈配置在 `configs/runtime_stack.json`。
+Tracked config lives in:
 
-- `projects.sts2_cli_root` 默认指向相邻目录 `..\sts2-cli`
-- `projects.game_dir` 默认留空，优先读取环境变量 `STS2_GAME_DIR`
-- 所有路径都改成了相对路径，方便迁移到别的机器
+- `configs/runtime_stack.json`
 
-推荐先设置游戏目录：
+This file is a safe template and should stay machine-agnostic.
+
+Local overrides belong in:
+
+- `configs/runtime_stack.local.json`
+
+This file is Git-ignored, so it is safe to put your local paths there.
+
+Starter example:
+
+- `configs/runtime_stack.local.example.json`
+
+Typical local file:
+
+```json
+{
+  "python_executable": "D:\\venvs\\sts2\\Scripts\\python.exe",
+  "projects": {
+    "game_dir": "D:\\game\\SlayTheSpire2"
+  },
+  "client": {
+    "enabled": true,
+    "args": ["--experiment-name", "baseline_reward_v1"]
+  }
+}
+```
+
+Runtime loading order is:
+
+1. `runtime_stack.json`
+2. `runtime_stack.local.json` overrides it when present
+
+The following scripts support this automatically:
+
+- `scripts/start_stack.ps1`
+- `scripts/training_dashboard.py`
+- `scripts/training_watchdog.py`
+- `scripts/training_session_supervisor.py`
+
+You can also avoid storing the game path in a file and set it via env var:
 
 ```powershell
 $env:STS2_GAME_DIR="C:\path\to\SlayTheSpire2"
 ```
 
-如果 `sts2-cli` 不在相邻目录，再补一个：
+If `sts2-cli` is not in a sibling directory, set:
 
 ```powershell
 $env:STS2_CLI_ROOT="C:\path\to\sts2-cli"
 ```
 
-## 使用方式
+## Quick Start
 
-启动 service + dashboard：
+1. Prepare `sts2-cli`.
 
 ```powershell
-cd .\sts2-rl
+cd ..\sts2-cli
+pip install -r requirements.txt
+```
+
+2. Create your local runtime override.
+
+```powershell
+copy .\configs\runtime_stack.local.example.json .\configs\runtime_stack.local.json
+```
+
+Then edit `configs/runtime_stack.local.json` with your local Python path and game directory.
+
+3. Start the service and dashboard.
+
+```powershell
+cd ..\sts2-rl
 .\scripts\start_stack.ps1
 ```
 
-如果也要一起拉起训练 client：
+If you also want to launch the training client:
 
 ```powershell
 .\scripts\start_stack.ps1 -IncludeClient
 ```
 
-手工启动 `sts2-cli` HTTP 服务：
-
-```powershell
-cd ..\sts2-cli
-python .\python\http_game_service.py
-```
-
-健康检查：
-
-```powershell
-Invoke-RestMethod http://localhost:5000/health
-```
-
-## 快速开始
-
-1. 准备相邻目录中的两个仓库：
-
-```text
-workspace/
-  sts2-cli/
-  sts2-rl/
-```
-
-2. 在 `sts2-cli` 中完成初始化：
-
-```powershell
-cd ..\sts2-cli
-pip install -r requirements.txt
-python .\python\play.py --lang en
-```
-
-3. 设置游戏目录并启动 HTTP 服务：
-
-```powershell
-$env:STS2_GAME_DIR="C:\path\to\SlayTheSpire2"
-python .\python\http_game_service.py
-```
-
-4. 回到 `sts2-rl` 安装并启动 dashboard：
-
-```powershell
-cd ..\sts2-rl
-pip install -r requirements.txt
-pip install -e .
-.\scripts\start_stack.ps1
-```
-
-5. 打开 dashboard：
+4. Open the dashboard:
 
 ```text
 http://127.0.0.1:8787
 ```
 
-## 回归测试
+## Manual Commands
 
-回归链路入口是 `examples/test_cli_game.py`：
+Start the HTTP service manually:
 
 ```powershell
-cd .\sts2-rl
+cd ..\sts2-cli
+python .\python\http_game_service.py
+```
+
+Health check:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:5000/health
+```
+
+Run a smoke test:
+
+```powershell
+cd ..\sts2-rl
 python .\examples\test_cli_game.py --workers 4 --rounds 50
 ```
 
-当前流程拆分为：
-
-- `src/st2rl/gameplay/config.py`
-- `src/st2rl/gameplay/types.py`
-- `src/st2rl/gameplay/policy.py`
-- `src/st2rl/gameplay/runner.py`
-- `src/st2rl/protocols/http_cli.py`
-
-## 正式训练
-
-训练入口是 `scripts/train_http_cli_rl.py`，默认配置在 `configs/train_http_cli_rl.yaml`。
-
-启动训练：
+Train PPO:
 
 ```powershell
-cd .\sts2-rl
-python .\scripts\train_http_cli_rl.py
+python .\scripts\train_http_cli_rl.py --experiment-name baseline_reward_v1
 ```
 
-命令行覆盖示例：
-
-```powershell
-python .\scripts\train_http_cli_rl.py --num-envs 4 --vec-env subproc --experiment-name baseline_reward_v1
-```
-
-如果你希望在启动脚本里顺带启动训练 client：
-
-```powershell
-.\scripts\start_stack.ps1 -IncludeClient
-```
-
-常见训练调参项：
-
-- `configs/train_http_cli_rl.yaml` 里的 `training.num_envs`
-- `configs/train_http_cli_rl.yaml` 里的 `training.total_timesteps`
-- `configs/train_http_cli_rl.yaml` 里的 `environment.reward_config`
-- 命令行参数 `--experiment-name`
-
-训练输出目录：
+Outputs are written under:
 
 ```text
 models/http_cli_rl/<experiment_name>/<run_id>/
 ```
 
-## Dashboard
+## Repo Hygiene
 
-启动 dashboard：
+These local/runtime files are intentionally not committed:
 
-```powershell
-cd .\sts2-rl
-python .\scripts\training_dashboard.py
-```
+- `configs/runtime_stack.local.json`
+- `logs/`
+- `models/`
 
-打开 [http://127.0.0.1:8787](http://127.0.0.1:8787) 查看训练进度、槽位状态、最近 episode 和 checkpoint。
-
-## 备注
-
-- `README_UNIFIED.md` 保留为旧架构草稿，当前以本 README 为准。
-- 当前正式训练链路已经不再依赖旧的 `STS2MCP` 工作流。
+That keeps machine-specific paths and large runtime artifacts out of Git history.

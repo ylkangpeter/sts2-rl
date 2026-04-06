@@ -7,7 +7,7 @@ import os
 import subprocess
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +19,10 @@ from flask import Flask, Response, jsonify, request, send_file
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS_ROOT = ROOT / "models" / "http_cli_rl"
-RUNTIME_CONFIG_PATH = ROOT / "configs" / "runtime_stack.json"
+RUNTIME_CONFIG_PATHS = [
+    ROOT / "configs" / "runtime_stack.json",
+    ROOT / "configs" / "runtime_stack.local.json",
+]
 ALL_TIME_SUMMARY_PATH = MODELS_ROOT / "all_time_summary.json"
 ALL_TIME_SUMMARY_TTL_SECONDS = 300
 LIVE_SESSION_CACHE_LIMIT = 100
@@ -40,6 +43,30 @@ HISTORICAL_BEST_CACHE: dict[str, Any] = {"generated_at": 0.0, "payload": None}
 SNAPSHOT_WORKER_THREAD: threading.Thread | None = None
 SNAPSHOT_WORKER_STARTED = False
 LAUNCHER_DIR = ROOT / "logs" / "launcher"
+WATCHDOG_INCIDENTS_DIR = ROOT / "logs" / "watchdog" / "incidents"
+SESSION_SUPERVISOR_INCIDENTS_DIR = ROOT / "logs" / "session_supervisor" / "incidents"
+WATCHDOG_STATUS_PATH = ROOT / "logs" / "watchdog" / "current_status.json"
+SESSION_SUPERVISOR_STATUS_PATH = ROOT / "logs" / "session_supervisor" / "current_status.json"
+TELEMETRY_LOCK = threading.Lock()
+TELEMETRY_STATE: dict[str, Any] = {
+    "bootstrapped": False,
+    "current_run_id": None,
+    "runs": {},
+    "historical_best": [],
+    "all_time_summary": {
+        "updated_at": None,
+        "run_count": 0,
+        "runs_seen": 0,
+        "runs_finished": 0,
+        "wins": 0,
+        "best_floor": 0,
+        "avg_reward_finished": None,
+    },
+    "recent_incidents": [],
+    "watchdog_status": {},
+    "session_supervisor_status": {},
+    "launcher_logs": {},
+}
 
 app = Flask(__name__)
 
@@ -50,6 +77,11 @@ def add_no_cache_headers(response: Response) -> Response:
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
+
+def _invalidate_snapshot_cache() -> None:
+    with SNAPSHOT_CACHE_LOCK:
+        SNAPSHOT_CACHE["generated_at"] = 0.0
 
 
 def _read_json(path: Path) -> dict[str, Any] | list[Any]:
@@ -65,7 +97,21 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    max_lines = 400
+    max_bytes = 512 * 1024
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            file_size = handle.tell()
+            read_size = min(file_size, max_bytes)
+            handle.seek(max(0, file_size - read_size))
+            chunk = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = chunk.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -94,8 +140,22 @@ def _now_iso() -> str:
 
 
 def _load_runtime_config() -> dict[str, Any]:
-    data = _read_json(RUNTIME_CONFIG_PATH)
-    return data if isinstance(data, dict) else {}
+    merged: dict[str, Any] = {}
+    for path in RUNTIME_CONFIG_PATHS:
+        data = _read_json(path)
+        if isinstance(data, dict):
+            merged = _deep_merge_dicts(merged, data)
+    return merged
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _service_base_url() -> str:
@@ -224,30 +284,111 @@ def _training_payload(run_dir: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _active_run_dir() -> Path | None:
-    for run_dir in _all_run_dirs():
-        training = _training_payload(run_dir)
-        status = str(training.get("status") or "").lower()
-        updated_at = training.get("updated_at")
-        updated_age_seconds = None
-        if updated_at:
+def _iso_to_timestamp(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
+def _seconds_since(value: Any) -> float | None:
+    ts = _iso_to_timestamp(value)
+    if ts is None:
+        return None
+    return max(time.time() - ts, 0.0)
+
+
+def _run_activity_snapshot(run_dir: Path) -> dict[str, Any]:
+    dashboard_dir = run_dir / "dashboard"
+    slots_dir = dashboard_dir / "slots"
+    training_path = dashboard_dir / "training_status.json"
+    training = _training_payload(run_dir)
+    status = str(training.get("status") or "").lower()
+    training_updated_ts = _iso_to_timestamp(training.get("updated_at"))
+    active_slot_count = 0
+    latest_slot_ts: float | None = None
+    latest_slot_updated_ts: float | None = None
+
+    if slots_dir.exists():
+        for slot_file in slots_dir.glob("slot_*.json"):
             try:
-                updated_age_seconds = max(0.0, datetime.now().timestamp() - datetime.fromisoformat(str(updated_at)).timestamp())
-            except ValueError:
-                updated_age_seconds = None
-        if status in {"running", "paused", "stopping"} and (
-            updated_age_seconds is None or updated_age_seconds <= ACTIVE_RUN_STATUS_TTL_SECONDS
-        ):
-            return run_dir
-    return None
+                slot_stat_ts = slot_file.stat().st_mtime
+            except OSError:
+                slot_stat_ts = None
+            if slot_stat_ts is not None:
+                latest_slot_ts = max(latest_slot_ts or slot_stat_ts, slot_stat_ts)
+            row = _read_json(slot_file)
+            if not isinstance(row, dict) or not row:
+                continue
+            if bool(row.get("active", False)):
+                active_slot_count += 1
+            row_updated_ts = _iso_to_timestamp(row.get("updated_at"))
+            if row_updated_ts is not None:
+                latest_slot_updated_ts = max(latest_slot_updated_ts or row_updated_ts, row_updated_ts)
+
+    latest_file_ts: float | None = None
+    if training_path.exists():
+        try:
+            latest_file_ts = max(latest_file_ts or 0.0, training_path.stat().st_mtime)
+        except OSError:
+            pass
+    if latest_slot_ts is not None:
+        latest_file_ts = max(latest_file_ts or 0.0, latest_slot_ts)
+
+    freshness_candidates = [ts for ts in [latest_file_ts, training_updated_ts, latest_slot_updated_ts] if ts is not None]
+    freshest_ts = max(freshness_candidates) if freshness_candidates else run_dir.stat().st_mtime
+    freshness_age_seconds = max(0.0, datetime.now().timestamp() - freshest_ts)
+    training_recent = training_updated_ts is not None and max(0.0, datetime.now().timestamp() - training_updated_ts) <= ACTIVE_RUN_STATUS_TTL_SECONDS
+    slots_recent = latest_slot_updated_ts is not None and max(0.0, datetime.now().timestamp() - latest_slot_updated_ts) <= ACTIVE_RUN_STATUS_TTL_SECONDS
+    latest_file_recent = latest_file_ts is not None and max(0.0, datetime.now().timestamp() - latest_file_ts) <= ACTIVE_RUN_STATUS_TTL_SECONDS
+    active = (
+        (status in {"running", "paused", "stopping"} and training_recent)
+        or (active_slot_count > 0 and (slots_recent or latest_file_recent))
+    )
+    return {
+        "run_dir": run_dir,
+        "training": training,
+        "status": status,
+        "active_slot_count": active_slot_count,
+        "freshest_ts": freshest_ts,
+        "freshness_age_seconds": freshness_age_seconds,
+        "active": active,
+    }
+
+
+def _select_run_dir(*, require_active: bool = False) -> Path | None:
+    with TELEMETRY_LOCK:
+        memory_run = _telemetry_current_run(require_active=require_active)
+        if memory_run is not None and memory_run.get("run_dir"):
+            return Path(str(memory_run["run_dir"]))
+    candidates: list[dict[str, Any]] = []
+    for run_dir in _all_run_dirs():
+        activity = _run_activity_snapshot(run_dir)
+        if require_active and not activity.get("active"):
+            continue
+        candidates.append(activity)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            1 if item.get("active") else 0,
+            int(item.get("active_slot_count") or 0),
+            float(item.get("freshest_ts") or 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]["run_dir"]
+
+
+def _active_run_dir() -> Path | None:
+    return _select_run_dir(require_active=True)
 
 
 def _latest_run_dir() -> Path | None:
-    active = _active_run_dir()
-    if active is not None:
-        return active
-    runs = _all_run_dirs()
-    return runs[0] if runs else None
+    return _select_run_dir(require_active=False)
 
 
 def _read_session_details(run_dir: Path, game_id: str) -> dict[str, Any]:
@@ -685,6 +826,209 @@ def _score(item: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _telemetry_empty_run(run_id: str, run_dir: str, experiment_name: str) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "experiment_name": experiment_name,
+        "training": {},
+        "active_slots": {},
+        "slot_histories": {},
+        "top_sessions": [],
+        "session_details": {},
+        "finished_game_ids": set(),
+        "seen_game_ids": set(),
+    }
+
+
+def _telemetry_get_run(payload: dict[str, Any], *, create: bool = True) -> dict[str, Any] | None:
+    run_id = str(payload.get("run_id") or "").strip()
+    run_dir = str(payload.get("run_dir") or "").strip()
+    experiment_name = str(payload.get("experiment_name") or "").strip()
+    if not run_id and run_dir:
+        run_id = Path(run_dir).name
+    if not run_dir and run_id and experiment_name:
+        run_dir = str(MODELS_ROOT / experiment_name / run_id)
+    if not run_id:
+        return None
+    runs = TELEMETRY_STATE.setdefault("runs", {})
+    run = runs.get(run_id)
+    if run is None and create:
+        run = _telemetry_empty_run(run_id, run_dir, experiment_name)
+        runs[run_id] = run
+    if run is None:
+        return None
+    if run_dir:
+        run["run_dir"] = run_dir
+    if experiment_name:
+        run["experiment_name"] = experiment_name
+    return run
+
+
+def _telemetry_mark_run_idle(*, run_id: str = "", run_dir: str = "", clear_slots: bool = True) -> None:
+    with TELEMETRY_LOCK:
+        runs = TELEMETRY_STATE.get("runs") or {}
+        target_run = runs.get(run_id) if run_id else None
+        if target_run is None and run_dir:
+            for candidate in runs.values():
+                if str(candidate.get("run_dir") or "") == run_dir:
+                    target_run = candidate
+                    break
+        if target_run is None:
+            return
+        training = dict(target_run.get("training") or {})
+        training["status"] = "idle"
+        training["updated_at"] = _now_iso()
+        target_run["training"] = training
+        if clear_slots:
+            target_run["active_slots"] = {}
+    _invalidate_snapshot_cache()
+
+
+def _telemetry_sort_top(rows: list[dict[str, Any]], *, limit: int = 50) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("game_id") or f"{row.get('slot')}:{row.get('episode_index')}")
+        if not key:
+            continue
+        existing = deduped.get(key)
+        if existing is None or _score(row) > _score(existing):
+            deduped[key] = dict(row)
+    return sorted(deduped.values(), key=_score, reverse=True)[:limit]
+
+
+def _telemetry_update_historical_best(summary: dict[str, Any], run: dict[str, Any]) -> None:
+    if not summary.get("game_id"):
+        return
+    entry = dict(summary)
+    entry["run_id"] = run.get("run_id")
+    entry["run_dir"] = run.get("run_dir")
+    entry["experiment_name"] = run.get("experiment_name")
+    historical = [row for row in (TELEMETRY_STATE.get("historical_best") or []) if row.get("game_id") != entry.get("game_id")]
+    historical.append(entry)
+    TELEMETRY_STATE["historical_best"] = _telemetry_sort_top(historical, limit=50)
+
+
+def _telemetry_update_all_time(summary: dict[str, Any], run: dict[str, Any]) -> None:
+    all_time = dict(TELEMETRY_STATE.get("all_time_summary") or {})
+    seen_key = str(summary.get("game_id") or "")
+    finished_ids = run.setdefault("finished_game_ids", set())
+    seen_ids = run.setdefault("seen_game_ids", set())
+    if seen_key:
+        seen_ids.add(seen_key)
+    total_seen = sum(len(item.get("seen_game_ids") or set()) for item in (TELEMETRY_STATE.get("runs") or {}).values())
+    total_finished = sum(len(item.get("finished_game_ids") or set()) for item in (TELEMETRY_STATE.get("runs") or {}).values())
+    all_time["updated_at"] = _now_iso()
+    all_time["run_count"] = len(TELEMETRY_STATE.get("runs") or {})
+    all_time["runs_seen"] = total_seen
+    all_time["runs_finished"] = total_finished
+    all_time["best_floor"] = max(_safe_int(all_time.get("best_floor"), 0), _safe_int(summary.get("max_floor"), 0))
+    wins = _safe_int(all_time.get("wins"), 0)
+    if bool(summary.get("victory")) and seen_key and seen_key not in finished_ids:
+        wins += 1
+    all_time["wins"] = wins
+    TELEMETRY_STATE["all_time_summary"] = all_time
+
+
+def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
+    active_slots = [_annotate_health(dict(row)) for row in run.get("active_slots", {}).values() if bool(row.get("active", False))]
+    active_slots.sort(key=lambda item: str(item.get("slot") or ""))
+    top_sessions = [_annotate_health(dict(row)) for row in run.get("top_sessions") or []]
+    suspicious_completed = [row for row in top_sessions if row.get("suspicious")]
+    overlong_active = [row for row in active_slots if "overlong_active" in (row.get("health_flags") or [])]
+    recent_incidents = deepcopy(TELEMETRY_STATE.get("recent_incidents") or [])
+    active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
+    problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
+    detailed_ids = set((run.get("session_details") or {}).keys())
+    for item in active_slots:
+        item["details_available"] = bool(item.get("details_available") or item.get("game_id") in detailed_ids)
+    for item in top_sessions:
+        item["details_available"] = bool(item.get("details_available") or item.get("game_id") in detailed_ids)
+    return {
+        "updated_at": (run.get("training") or {}).get("updated_at"),
+        "run_dir": run.get("run_dir"),
+        "training": deepcopy(run.get("training") or {}),
+        "active_slots": active_slots,
+        "top_sessions": top_sessions,
+        "slot_histories": deepcopy(run.get("slot_histories") or {}),
+        "checkpoints": [],
+        "seen_sessions": len(run.get("seen_game_ids") or set()),
+        "completed_sessions": len(run.get("finished_game_ids") or set()),
+        "monitoring": {
+            "resume_model_path": (run.get("training") or {}).get("resume_model_path"),
+            "resume_load_status": (run.get("training") or {}).get("resume_load_status"),
+            "resume_failure_reason": (run.get("training") or {}).get("resume_failure_reason"),
+            "overlong_active_count": len(overlong_active),
+            "overlong_active": overlong_active[:10],
+            "suspicious_completed_count": len(suspicious_completed),
+            "suspicious_completed": suspicious_completed[:10],
+            "recent_incidents_count": len(recent_incidents),
+            "recent_incidents": recent_incidents,
+            "problem_list": problem_list,
+            "watchdog_status": deepcopy(TELEMETRY_STATE.get("watchdog_status") or {}),
+            "session_supervisor_status": deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {}),
+        },
+    }
+
+
+def _telemetry_current_run(require_active: bool = False) -> dict[str, Any] | None:
+    runs = TELEMETRY_STATE.get("runs") or {}
+    if not runs:
+        return None
+    current_run_id = str(TELEMETRY_STATE.get("current_run_id") or "")
+    current = runs.get(current_run_id) if current_run_id else None
+    if current is not None:
+        training_status = str((current.get("training") or {}).get("status") or "").lower()
+        active_slots = [row for row in (current.get("active_slots") or {}).values() if bool(row.get("active", False))]
+        if not require_active or training_status in {"running", "paused", "stopping"} or active_slots:
+            return current
+    scored: list[tuple[Any, dict[str, Any]]] = []
+    for run in runs.values():
+        training = run.get("training") or {}
+        training_status = str(training.get("status") or "").lower()
+        updated_ts = _iso_to_timestamp(training.get("updated_at")) or 0.0
+        active_slots = [row for row in (run.get("active_slots") or {}).values() if bool(row.get("active", False))]
+        if require_active and training_status not in {"running", "paused", "stopping"} and not active_slots:
+            continue
+        score = (
+            1 if training_status in {"running", "paused", "stopping"} or active_slots else 0,
+            len(active_slots),
+            updated_ts,
+        )
+        scored.append((score, run))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def _sanitize_incident_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    row = dict(payload)
+    for key in (
+        "session",
+        "details",
+        "trace",
+        "nodes",
+        "maps",
+        "initial_state",
+        "final_state",
+        "session_snapshot",
+        "close_result",
+        "cleanup_result",
+        "stack_stop",
+    ):
+        row.pop(key, None)
+    recent_errors = row.get("recent_errors")
+    if isinstance(recent_errors, list):
+        row["recent_errors"] = [str(item)[:240] for item in recent_errors[:3]]
+    reason = str(row.get("reason") or "")
+    if len(reason) > 400:
+        row["reason"] = reason[:400] + "..."
+    return row
+
+
 def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     dashboard_dir = run_dir / "dashboard"
     training = _training_payload(run_dir)
@@ -733,7 +1077,8 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         history_by_job[key] = merged
 
     computed_top_sessions = sorted(history_by_job.values(), key=_score, reverse=True)[:50]
-    top_sessions = persisted_leaderboard[:50] if persisted_leaderboard else computed_top_sessions
+    merged_leaderboard_rows = [row for row in persisted_leaderboard if isinstance(row, dict)] + computed_top_sessions
+    top_sessions = _telemetry_sort_top(merged_leaderboard_rows, limit=50)
     top_sessions = _enrich_rows_with_boss(run_dir, top_sessions)
     active_slots = _enrich_active_slots_with_live_boss(_enrich_rows_with_boss(run_dir, active_slots))
     active_slots = [_annotate_health(item) for item in active_slots]
@@ -776,6 +1121,9 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     )
     suspicious_completed = [item for item in suspicious_completed if item.get("suspicious")]
     overlong_active = [item for item in active_slots if "overlong_active" in (item.get("health_flags") or [])]
+    recent_incidents = _collect_recent_runtime_incidents()
+    active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
+    problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
 
     return {
         "updated_at": training.get("updated_at"),
@@ -795,11 +1143,18 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             "overlong_active": overlong_active[:10],
             "suspicious_completed_count": len(suspicious_completed),
             "suspicious_completed": suspicious_completed[:10],
+            "recent_incidents_count": len(recent_incidents),
+            "recent_incidents": recent_incidents,
+            "problem_list": problem_list,
+            "watchdog_status": _read_json(WATCHDOG_STATUS_PATH),
+            "session_supervisor_status": _read_json(SESSION_SUPERVISOR_STATUS_PATH),
         },
     }
 
 
 def _collect_historical_best() -> list[dict[str, Any]]:
+    if TELEMETRY_STATE.get("bootstrapped"):
+        return deepcopy(TELEMETRY_STATE.get("historical_best") or [])
     cached_payload = HISTORICAL_BEST_CACHE.get("payload")
     cached_at = float(HISTORICAL_BEST_CACHE.get("generated_at") or 0.0)
     now = time.time()
@@ -820,6 +1175,7 @@ def _collect_historical_best() -> list[dict[str, Any]]:
                 entry = dict(row)
                 entry["run_id"] = run_dir.name
                 entry["experiment_name"] = run_dir.parent.name
+                entry["run_dir"] = str(run_dir)
                 if not entry.get("boss_name"):
                     entry["boss_name"] = _extract_boss_name_from_session(_read_session_details(run_dir, str(entry.get("game_id") or "")))
                 merged[key] = entry
@@ -901,6 +1257,8 @@ def _all_time_summary_is_stale(path: Path) -> bool:
 
 
 def _get_all_time_summary() -> dict[str, Any]:
+    if TELEMETRY_STATE.get("bootstrapped"):
+        return deepcopy(TELEMETRY_STATE.get("all_time_summary") or {})
     if _all_time_summary_is_stale(ALL_TIME_SUMMARY_PATH):
         MODELS_ROOT.mkdir(parents=True, exist_ok=True)
         payload = _compute_all_time_summary()
@@ -936,6 +1294,14 @@ def _python_executable() -> str:
     return str(_load_runtime_config().get("python_executable") or "python")
 
 
+def _node_python_executable(node: dict[str, Any] | None = None) -> str:
+    if isinstance(node, dict):
+        value = str(node.get("python_executable") or "").strip()
+        if value:
+            return value
+    return _python_executable()
+
+
 def _runtime_node(name: str) -> dict[str, Any]:
     node = _load_runtime_config().get(name) or {}
     return node if isinstance(node, dict) else {}
@@ -953,7 +1319,13 @@ def _shared_runtime_env() -> dict[str, str]:
     runtime = _load_runtime_config()
     projects = runtime.get("projects") or {}
     game_dir = str((projects or {}).get("game_dir") or "").strip()
-    env: dict[str, str] = {}
+    env: dict[str, str] = {"PYTHONUNBUFFERED": "1"}
+    src_dir = str((ROOT / "src").resolve())
+    existing_pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    if existing_pythonpath:
+        env["PYTHONPATH"] = os.pathsep.join([src_dir, existing_pythonpath])
+    else:
+        env["PYTHONPATH"] = src_dir
     if game_dir:
         env["STS2_GAME_DIR"] = game_dir
     return env
@@ -980,8 +1352,21 @@ def _service_config() -> dict[str, Any]:
     return _runtime_node("service")
 
 
+def _watchdog_config() -> dict[str, Any]:
+    return _runtime_node("watchdog")
+
+
+def _session_supervisor_config() -> dict[str, Any]:
+    return _runtime_node("session_supervisor")
+
+
 def _support_node_names() -> list[str]:
-    return ["service"]
+    names = ["service"]
+    if bool(_watchdog_config().get("enabled", False)):
+        names.append("watchdog")
+    if bool(_session_supervisor_config().get("enabled", False)):
+        names.append("session_supervisor")
+    return names
 
 
 def _pid_file(name: str) -> Path:
@@ -1007,7 +1392,12 @@ def _process_exists(pid: int) -> bool:
         return False
     try:
         result = subprocess.run(
-            ["cmd", "/c", "tasklist", "/FI", f"PID eq {int(pid)}"],
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"$ErrorActionPreference='Stop'; Get-Process -Id {int(pid)} | Out-Null",
+            ],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
@@ -1016,8 +1406,7 @@ def _process_exists(pid: int) -> bool:
         )
     except Exception:
         return False
-    output = f"{result.stdout}\n{result.stderr}".lower()
-    return str(int(pid)) in output and "no tasks are running" not in output
+    return result.returncode == 0
 
 
 def _pid_from_file(name: str) -> int | None:
@@ -1040,7 +1429,20 @@ def _managed_process_ids(name: str) -> list[int]:
     if pid is not None:
         return [pid]
     node = _runtime_node(name)
-    return _find_python_process_ids(str(node.get("process_match") or ""))
+    candidates: list[int] = []
+    seen: set[int] = set()
+    patterns = [str(node.get("process_match") or "").strip()]
+    script_name = Path(str(node.get("script") or "")).name.strip()
+    if script_name:
+        patterns.append(script_name)
+    for pattern in patterns:
+        if not pattern:
+            continue
+        for current_pid in _find_python_process_ids(pattern):
+            if current_pid not in seen:
+                seen.add(current_pid)
+                candidates.append(current_pid)
+    return candidates
 
 
 def _find_python_process_ids(process_match: str) -> list[int]:
@@ -1162,7 +1564,7 @@ def _start_managed_process(name: str, node: dict[str, Any], *, default_root: Pat
     args = [str(script_path), *[str(item) for item in (node.get("args") or [])]]
     with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
         process = subprocess.Popen(
-            [_python_executable(), *args],
+            [_node_python_executable(node), *args],
             cwd=str(workdir),
             stdout=stdout_handle,
             stderr=stderr_handle,
@@ -1221,9 +1623,55 @@ def _ensure_service_ready() -> dict[str, Any]:
     }
 
 
+def _ensure_generic_process_ready(name: str, node: dict[str, Any], *, default_root: Path) -> dict[str, Any]:
+    if not bool(node.get("enabled", False)):
+        return {"ok": True, "enabled": False, "started": False}
+    existing_pids = _managed_process_ids(name)
+    if existing_pids:
+        return {"ok": True, "enabled": True, "started": False, "pids": existing_pids}
+    start_result = _start_managed_process(name, node, default_root=default_root)
+    if not start_result.get("ok"):
+        return {
+            "ok": False,
+            "enabled": True,
+            "started": False,
+            "message": str(start_result.get("message") or f"failed to start {name}"),
+            "start_result": start_result,
+        }
+    time.sleep(1.0)
+    current_pids = _managed_process_ids(name)
+    if current_pids:
+        return {"ok": True, "enabled": True, "started": True, "pids": current_pids}
+    return {
+        "ok": False,
+        "enabled": True,
+        "started": False,
+        "message": f"{name} did not stay running after start",
+        "start_result": start_result,
+    }
+
+
 def _ensure_support_processes_ready() -> dict[str, Any]:
     service_result = _ensure_service_ready()
-    return {"ok": bool(service_result.get("ok")), "nodes": {"service": service_result}}
+    results: dict[str, Any] = {"service": service_result}
+    if not service_result.get("ok"):
+        return {"ok": False, "nodes": results}
+
+    watchdog_result = _ensure_generic_process_ready("watchdog", _watchdog_config(), default_root=ROOT)
+    results["watchdog"] = watchdog_result
+
+    supervisor_result = _ensure_generic_process_ready(
+        "session_supervisor",
+        _session_supervisor_config(),
+        default_root=ROOT,
+    )
+    results["session_supervisor"] = supervisor_result
+    warnings: list[str] = []
+    if not watchdog_result.get("ok"):
+        warnings.append(str(watchdog_result.get("message") or "watchdog unavailable"))
+    if not supervisor_result.get("ok"):
+        warnings.append(str(supervisor_result.get("message") or "session supervisor unavailable"))
+    return {"ok": True, "nodes": results, "warnings": warnings}
 
 
 def _stop_support_stack() -> dict[str, Any]:
@@ -1233,7 +1681,7 @@ def _stop_support_stack() -> dict[str, Any]:
         cleanup_result = _cleanup_and_shutdown_service_workers()
     results["service_cleanup"] = cleanup_result
 
-    for name in ("service",):
+    for name in _support_node_names():
         pids = _managed_process_ids(name)
         terminated = _terminate_processes(pids) if pids else []
         remaining = _wait_for_process_exit(
@@ -1284,6 +1732,134 @@ def _collect_launcher_logs(max_lines: int = 30) -> dict[str, Any]:
     return payload
 
 
+def _collect_recent_runtime_incidents(max_items: int = 12) -> list[dict[str, Any]]:
+    if TELEMETRY_STATE.get("bootstrapped"):
+        return deepcopy((TELEMETRY_STATE.get("recent_incidents") or [])[:max_items])
+    rows: list[dict[str, Any]] = []
+    sources = (
+        ("watchdog", WATCHDOG_INCIDENTS_DIR),
+        ("session_supervisor", SESSION_SUPERVISOR_INCIDENTS_DIR),
+    )
+    for source_name, directory in sources:
+        if not directory.exists():
+            continue
+        files = sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:max_items]
+        for path in files:
+            payload = _read_json(path)
+            if not isinstance(payload, dict):
+                continue
+            row = _sanitize_incident_payload(payload)
+            row["source"] = source_name
+            row["path"] = str(path)
+            row["file_updated_at"] = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+            rows.append(row)
+    rows.sort(key=lambda item: str(item.get("recorded_at") or item.get("file_updated_at") or ""), reverse=True)
+    return rows[:max_items]
+
+
+def _incident_time(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(str(value)).isoformat(timespec="seconds")
+    except ValueError:
+        return str(value)
+
+
+def _build_problem_list(
+    recent_incidents: list[dict[str, Any]],
+    suspicious_completed: list[dict[str, Any]],
+    active_game_ids: set[str] | None = None,
+    runtime_healthy: bool = False,
+) -> list[dict[str, Any]]:
+    problems: dict[str, dict[str, Any]] = {}
+    active_game_ids = active_game_ids or set()
+
+    for row in recent_incidents:
+        seed = str(row.get("seed") or "")
+        game_id = str(row.get("game_id") or "")
+        key = game_id or seed or str(row.get("path") or "")
+        if not key:
+            continue
+        discovered_at = _incident_time(row.get("recorded_at") or row.get("file_updated_at"))
+        resolved = bool(row.get("resolution_status") or row.get("resolution_action"))
+        incident_type = str(row.get("type") or "")
+        if not resolved:
+            if game_id and game_id not in active_game_ids:
+                resolved = True
+            elif not game_id and runtime_healthy and incident_type in {
+                "dashboard_unavailable",
+                "service_unavailable",
+                "service_unhealthy",
+                "training_client_missing",
+            }:
+                resolved = True
+        resolved_at = discovered_at if resolved else ""
+        reason = str(row.get("reason") or row.get("flags_display") or row.get("type") or "")
+        current = problems.get(key) or {
+            "key": key,
+            "seed": seed,
+            "game_id": game_id,
+            "run_id": str(row.get("run_id") or ""),
+            "status": "resolved" if resolved else "open",
+            "discovered_at": discovered_at,
+            "resolved_at": resolved_at,
+            "reason": reason,
+            "sources": [],
+        }
+        current["seed"] = current.get("seed") or seed
+        current["game_id"] = current.get("game_id") or game_id
+        current["run_id"] = current.get("run_id") or str(row.get("run_id") or "")
+        current["reason"] = current.get("reason") or reason
+        if discovered_at and (not current.get("discovered_at") or discovered_at < str(current.get("discovered_at"))):
+            current["discovered_at"] = discovered_at
+        if resolved_at and (not current.get("resolved_at") or resolved_at > str(current.get("resolved_at"))):
+            current["resolved_at"] = resolved_at
+        if resolved:
+            current["status"] = "resolved"
+        current.setdefault("sources", []).append(
+            {
+                "source": str(row.get("source") or ""),
+                    "type": incident_type,
+                "reason": reason,
+                "recorded_at": discovered_at,
+                "resolution_status": str(row.get("resolution_status") or row.get("resolution_action") or ""),
+            }
+        )
+        problems[key] = current
+
+    for row in suspicious_completed:
+        seed = str(row.get("seed") or "")
+        game_id = str(row.get("game_id") or "")
+        key = game_id or seed
+        if not key or key in problems:
+            continue
+        discovered_at = _incident_time(row.get("finished_at") or row.get("updated_at") or row.get("started_at"))
+        problems[key] = {
+            "key": key,
+            "seed": seed,
+            "game_id": game_id,
+            "run_id": str(row.get("run_id") or ""),
+            "status": "resolved",
+            "discovered_at": discovered_at,
+            "resolved_at": discovered_at,
+            "reason": str(row.get("flags_display") or row.get("termination_reason") or "suspicious_completed"),
+            "sources": [
+                {
+                    "source": "dashboard",
+                    "type": "suspicious_completed",
+                    "reason": str(row.get("flags_display") or ""),
+                    "recorded_at": discovered_at,
+                    "resolution_status": "",
+                }
+            ],
+        }
+
+    payload = list(problems.values())
+    payload.sort(key=lambda item: str(item.get("discovered_at") or ""), reverse=True)
+    return payload[:20]
+
+
 def _parse_total_timesteps(raw: Any) -> int | None:
     if raw in (None, ""):
         return None
@@ -1307,8 +1883,12 @@ def _parse_num_envs(raw: Any) -> int | None:
 def _start_training_process(total_timesteps: int | None = None, num_envs: int | None = None) -> dict[str, Any]:
     active_run_dir = _active_run_dir()
     existing_pids = _find_training_process_ids()
-    if active_run_dir is not None:
+    live_service_games = _service_game_rows()
+    if active_run_dir is not None and (existing_pids or live_service_games):
         return {"ok": False, "message": "training already running", "run_dir": str(active_run_dir), "pids": existing_pids}
+    if active_run_dir is not None and not existing_pids and not live_service_games:
+        _force_training_status(active_run_dir, "stopped")
+        _telemetry_mark_run_idle(run_dir=str(active_run_dir), clear_slots=True)
     if existing_pids:
         status = _latest_training_status()
         if status in {"finished", "stopped", "idle", "error", ""}:
@@ -1334,6 +1914,25 @@ def _start_training_process(total_timesteps: int | None = None, num_envs: int | 
         }
 
     cleanup_result = _cleanup_service_games()
+    hard_cleanup_result: dict[str, Any] | None = None
+    health_after_cleanup = _service_request("/health", timeout=5.0) if _service_health_ok(timeout=2.0) else {}
+    if (
+        isinstance(health_after_cleanup, dict)
+        and _int_or_default(health_after_cleanup.get("active_games"), 0) == 0
+        and _int_or_default(health_after_cleanup.get("busy_workers"), 0) > 0
+    ):
+        hard_cleanup_result = _cleanup_and_shutdown_service_workers()
+        support_result = _ensure_support_processes_ready()
+        if not support_result.get("ok"):
+            return {
+                "ok": False,
+                "error_code": "runtime_unavailable",
+                "message": "runtime support processes unavailable after worker cleanup",
+                "runtime": support_result,
+                "service_cleanup": cleanup_result,
+                "hard_service_cleanup": hard_cleanup_result,
+                "launcher_logs": _collect_launcher_logs(),
+            }
 
     client = _client_config()
     workdir = Path(str(client.get("workdir") or ROOT))
@@ -1355,7 +1954,7 @@ def _start_training_process(total_timesteps: int | None = None, num_envs: int | 
     stderr_path = log_dir / "client.err.log"
     with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
         process = subprocess.Popen(
-            [_python_executable(), *args],
+            [_node_python_executable(client), *args],
             cwd=str(workdir),
             stdout=stdout_handle,
             stderr=stderr_handle,
@@ -1376,10 +1975,17 @@ def _start_training_process(total_timesteps: int | None = None, num_envs: int | 
                 "exit_code": exit_code,
                 "runtime": support_result,
                 "service_cleanup": cleanup_result,
+                "hard_service_cleanup": hard_cleanup_result,
                 "launcher_logs": _collect_launcher_logs(),
             }
         if _active_run_dir() is not None or process.pid in _find_training_process_ids():
-            return {"ok": True, "pid": process.pid, "runtime": support_result, "service_cleanup": cleanup_result}
+            return {
+                "ok": True,
+                "pid": process.pid,
+                "runtime": support_result,
+                "service_cleanup": cleanup_result,
+                "hard_service_cleanup": hard_cleanup_result,
+            }
         time.sleep(0.2)
     return {
         "ok": True,
@@ -1387,6 +1993,7 @@ def _start_training_process(total_timesteps: int | None = None, num_envs: int | 
         "message": "training process started; waiting for first status update",
         "runtime": support_result,
         "service_cleanup": cleanup_result,
+        "hard_service_cleanup": hard_cleanup_result,
     }
 
 
@@ -1415,6 +2022,10 @@ def _stop_training_process() -> dict[str, Any]:
     if not remaining:
         _clear_pid("client")
     stack_stop = _stop_support_stack()
+    idle_target = run_dir or _latest_run_dir()
+    if idle_target is not None:
+        _force_training_status(idle_target, "stopped")
+        _telemetry_mark_run_idle(run_dir=str(idle_target), clear_slots=True)
     stop_ok = not remaining and all(not item.get("remaining_pids") for item in stack_stop.values() if isinstance(item, dict) and "remaining_pids" in item)
     return {
         "ok": stop_ok,
@@ -1427,11 +2038,173 @@ def _stop_training_process() -> dict[str, Any]:
     }
 
 
+def _seed_run_state_from_snapshot(snapshot: dict[str, Any]) -> None:
+    run_dir = str(snapshot.get("run_dir") or "").strip()
+    training = dict(snapshot.get("training") or {})
+    run = _telemetry_get_run(
+        {
+            "run_id": str(training.get("run_id") or Path(run_dir).name if run_dir else ""),
+            "run_dir": run_dir,
+            "experiment_name": str(training.get("experiment_name") or (Path(run_dir).parent.name if run_dir else "")),
+        }
+    )
+    if run is None:
+        return
+    run["training"] = training
+    for row in snapshot.get("active_slots") or []:
+        if not isinstance(row, dict):
+            continue
+        run["active_slots"][str(row.get("slot") or "")] = dict(row)
+        if row.get("game_id"):
+            run["seen_game_ids"].add(str(row["game_id"]))
+    for slot_key, rows in (snapshot.get("slot_histories") or {}).items():
+        if isinstance(rows, list):
+            run["slot_histories"][str(slot_key)] = list(rows)[-50:]
+    top_sessions = [dict(row) for row in (snapshot.get("top_sessions") or []) if isinstance(row, dict)]
+    run["top_sessions"] = _telemetry_sort_top(top_sessions)
+    for row in top_sessions:
+        game_id = str(row.get("game_id") or "")
+        if game_id:
+            run["seen_game_ids"].add(game_id)
+            if not bool(row.get("active", False)):
+                run["finished_game_ids"].add(game_id)
+
+
+def _ensure_telemetry_bootstrapped() -> None:
+    with TELEMETRY_LOCK:
+        if TELEMETRY_STATE.get("bootstrapped"):
+            return
+        cached_all_time = _read_json(ALL_TIME_SUMMARY_PATH)
+        TELEMETRY_STATE["historical_best"] = _collect_historical_best()
+        TELEMETRY_STATE["all_time_summary"] = cached_all_time if isinstance(cached_all_time, dict) and cached_all_time else {
+            "updated_at": _now_iso(),
+            "run_count": 0,
+            "runs_seen": 0,
+            "runs_finished": 0,
+            "wins": 0,
+            "best_floor": 0,
+            "avg_reward_finished": None,
+        }
+        TELEMETRY_STATE["watchdog_status"] = _read_json(WATCHDOG_STATUS_PATH)
+        TELEMETRY_STATE["session_supervisor_status"] = _read_json(SESSION_SUPERVISOR_STATUS_PATH)
+        TELEMETRY_STATE["recent_incidents"] = _collect_recent_runtime_incidents()
+        TELEMETRY_STATE["launcher_logs"] = _collect_launcher_logs(max_lines=20)
+        current_run = _telemetry_current_run(require_active=False)
+        TELEMETRY_STATE["current_run_id"] = current_run.get("run_id") if current_run is not None else None
+        TELEMETRY_STATE["bootstrapped"] = True
+
+
+def _memory_launcher_logs() -> dict[str, Any]:
+    return deepcopy(TELEMETRY_STATE.get("launcher_logs") or {})
+
+
+def _telemetry_ingest_training(payload: dict[str, Any]) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        run = _telemetry_get_run(payload)
+        if run is None:
+            return
+        run["training"] = dict(payload)
+        TELEMETRY_STATE["current_run_id"] = run.get("run_id")
+    _invalidate_snapshot_cache()
+
+
+def _telemetry_ingest_slot_current(payload: dict[str, Any]) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        run = _telemetry_get_run(payload)
+        if run is None:
+            return
+        slot_key = str(payload.get("slot") or "")
+        run["active_slots"][slot_key] = dict(payload)
+        game_id = str(payload.get("game_id") or "")
+        if game_id:
+            run["seen_game_ids"].add(game_id)
+        TELEMETRY_STATE["current_run_id"] = run.get("run_id")
+    _invalidate_snapshot_cache()
+
+
+def _telemetry_ingest_slot_history(payload: dict[str, Any]) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        run = _telemetry_get_run(payload)
+        if run is None:
+            return
+        slot_key = str(payload.get("slot") or "")
+        history = deque(run["slot_histories"].get(slot_key) or [], maxlen=50)
+        history.append(dict(payload))
+        run["slot_histories"][slot_key] = list(history)
+        game_id = str(payload.get("game_id") or "")
+        if game_id:
+            run["seen_game_ids"].add(game_id)
+            run["finished_game_ids"].add(game_id)
+        run["active_slots"][slot_key] = dict(payload)
+        _telemetry_update_all_time(payload, run)
+    _invalidate_snapshot_cache()
+
+
+def _telemetry_ingest_session(payload: dict[str, Any]) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        run = _telemetry_get_run(payload)
+        if run is None:
+            return
+        summary = dict(payload.get("summary") or {})
+        details = dict(payload.get("details") or {})
+        leaderboard = dict(payload.get("leaderboard") or {})
+        game_id = str(summary.get("game_id") or "")
+        if game_id:
+            run["seen_game_ids"].add(game_id)
+            run["finished_game_ids"].add(game_id)
+            run["session_details"][game_id] = details
+            while len(run["session_details"]) > 200:
+                oldest_key = next(iter(run["session_details"].keys()))
+                run["session_details"].pop(oldest_key, None)
+        if leaderboard.get("ranked"):
+            summary["details_available"] = True
+        top_rows = [row for row in (run.get("top_sessions") or []) if row.get("game_id") != game_id]
+        top_rows.append(summary)
+        run["top_sessions"] = _telemetry_sort_top(top_rows)
+        _telemetry_update_historical_best(summary, run)
+        _telemetry_update_all_time(summary, run)
+        TELEMETRY_STATE["current_run_id"] = run.get("run_id")
+    _invalidate_snapshot_cache()
+
+
+def _telemetry_ingest_runtime_incident(payload: dict[str, Any], source: str) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        row = _sanitize_incident_payload(payload)
+        row["source"] = source
+        row["file_updated_at"] = row.get("recorded_at") or _now_iso()
+        recent = [item for item in (TELEMETRY_STATE.get("recent_incidents") or []) if item.get("path") != row.get("path")]
+        recent.insert(0, row)
+        TELEMETRY_STATE["recent_incidents"] = recent[:20]
+    _invalidate_snapshot_cache()
+
+
+def _telemetry_ingest_runtime_status(payload: dict[str, Any], source: str) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        if source == "watchdog":
+            TELEMETRY_STATE["watchdog_status"] = dict(payload)
+        elif source == "session_supervisor":
+            TELEMETRY_STATE["session_supervisor_status"] = dict(payload)
+    _invalidate_snapshot_cache()
+
+
 def _build_snapshot_payload() -> dict[str, Any]:
-    run_dir = _latest_run_dir()
-    all_time_summary = _get_all_time_summary()
-    launcher_logs = _collect_launcher_logs(max_lines=20)
-    if run_dir is None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        memory_run = _telemetry_current_run(require_active=False)
+        all_time_summary = deepcopy(TELEMETRY_STATE.get("all_time_summary") or {})
+        historical_best = deepcopy(TELEMETRY_STATE.get("historical_best") or [])
+        launcher_logs = _memory_launcher_logs()
+        recent_incidents = deepcopy(TELEMETRY_STATE.get("recent_incidents") or [])
+        watchdog_status = deepcopy(TELEMETRY_STATE.get("watchdog_status") or {})
+        session_supervisor_status = deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {})
+    if memory_run is None:
+        problem_list = _build_problem_list(recent_incidents, [], active_game_ids=set(), runtime_healthy=False)
         return {
             "updated_at": None,
             "run_dir": None,
@@ -1448,19 +2221,45 @@ def _build_snapshot_payload() -> dict[str, Any]:
                 "overlong_active": [],
                 "suspicious_completed_count": 0,
                 "suspicious_completed": [],
+                "recent_incidents_count": len(recent_incidents),
+                "recent_incidents": recent_incidents,
+                "problem_list": problem_list,
+                "watchdog_status": watchdog_status,
+                "session_supervisor_status": session_supervisor_status,
             },
             "all_time_summary": all_time_summary,
-            "historical_best": _collect_historical_best(),
+            "historical_best": historical_best,
             "launcher_logs": launcher_logs,
         }
 
-    snapshot = _collect_run_snapshot(run_dir)
-    if _active_run_dir() is None:
+    live_training_pids = _find_training_process_ids()
+    live_service_games = _service_game_rows()
+    memory_training = memory_run.get("training") or {}
+    memory_status = str(memory_training.get("status") or "").lower()
+    memory_updated_age = _seconds_since(memory_training.get("updated_at"))
+    if (
+        memory_status in {"running", "paused", "stopping"}
+        and not live_training_pids
+        and not live_service_games
+        and memory_updated_age is not None
+        and memory_updated_age >= 10
+    ):
+        _telemetry_mark_run_idle(
+            run_id=str(memory_run.get("run_id") or ""),
+            run_dir=str(memory_run.get("run_dir") or ""),
+            clear_slots=True,
+        )
+        with TELEMETRY_LOCK:
+            memory_run = _telemetry_current_run(require_active=False)
+
+    snapshot = _telemetry_snapshot_from_memory(memory_run)
+    training_status = str((snapshot.get("training") or {}).get("status") or "").lower()
+    if training_status not in {"running", "paused", "stopping"}:
         snapshot["training"] = dict(snapshot.get("training") or {})
         snapshot["training"]["status"] = "idle"
         snapshot["active_slots"] = []
     snapshot["all_time_summary"] = all_time_summary
-    snapshot["historical_best"] = _collect_historical_best()
+    snapshot["historical_best"] = historical_best
     snapshot["launcher_logs"] = launcher_logs
     return snapshot
 
@@ -1610,6 +2409,18 @@ HTML = """<!doctype html>
     .alert-tools { display:flex; justify-content:flex-end; margin-top:8px; }
     .alert-toggle { border:1px solid var(--line); background:var(--panel-strong); color:var(--text); border-radius:999px; padding:3px 10px; cursor:pointer; font-size:12px; }
     .alert-toggle:hover { border-color:var(--accent); color:var(--accent); }
+    .problem-shell { margin:12px 0 18px; display:flex; flex-direction:column; gap:10px; }
+    .problem-item { border:1px solid var(--line); border-radius:14px; background:var(--panel); }
+    .problem-item summary { cursor:pointer; list-style:none; padding:12px 14px; display:flex; justify-content:space-between; gap:12px; align-items:center; font-weight:700; }
+    .problem-item summary::-webkit-details-marker { display:none; }
+    .problem-item[open] summary { border-bottom:1px solid var(--line-soft); }
+    .problem-title { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    .problem-meta { color:var(--muted); font-size:12px; white-space:nowrap; }
+    .problem-body { padding:12px 14px 14px; display:grid; gap:10px; }
+    .problem-grid { display:grid; grid-template-columns:160px 1fr; gap:8px 12px; }
+    .problem-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0.08em; }
+    .problem-value { color:var(--text); word-break:break-word; }
+    .problem-source-list { margin:0; padding-left:18px; color:var(--muted); }
     @media (max-width: 1100px) {
       .grid { grid-template-columns:repeat(2,1fr); }
       .detail-grid { grid-template-columns:1fr; }
@@ -1631,6 +2442,7 @@ HTML = """<!doctype html>
     <h1>STS2 RL Dashboard</h1>
     <div class="meta" id="meta">loading...</div>
     <div class="alerts" id="alerts"></div>
+    <div id="problemList"></div>
     <div class="control-row" id="controls"></div>
     <div class="grid" id="cards"></div>
     <h2>Active Slots</h2>
@@ -1646,6 +2458,15 @@ HTML = """<!doctype html>
     <table id="historyTable"></table>
   </div>
   <script>
+    window.onerror = function(message, source, lineno, colno) {
+      const meta = document.getElementById('meta');
+      if (meta) meta.textContent = `JS error: ${message} @${lineno}:${colno}`;
+    };
+    window.onunhandledrejection = function(event) {
+      const meta = document.getElementById('meta');
+      const reason = event && event.reason ? (event.reason.message || String(event.reason)) : 'unknown rejection';
+      if (meta) meta.textContent = `Promise error: ${reason}`;
+    };
     function fmt(v) { return v === null || v === undefined || v === '' ? '-' : v; }
     function pct(v) { return (v ?? 0).toFixed(2) + '%'; }
     function formatDateTime(value) {
@@ -1743,7 +2564,7 @@ HTML = """<!doctype html>
           ${item.details ? `
             <div class="alert-tools">
               <button class="alert-toggle" type="button" data-alert-id="${escapeHtml(item.id)}">
-                ${item.expanded ? '收起日志' : '展开日志'}
+                ${item.expanded ? 'Hide logs' : 'Show logs'}
               </button>
             </div>
             ${item.expanded ? `<pre>${escapeHtml(item.details)}</pre>` : ''}
@@ -1798,7 +2619,7 @@ HTML = """<!doctype html>
       const payload = err?.payload || {};
       const details = extractLogTail(payload);
       pushAlert(
-        `${actionLabel}失败`,
+        `${actionLabel} failed`,
         payload?.message || err?.message || 'unknown error',
         'danger',
         details,
@@ -1811,8 +2632,8 @@ HTML = """<!doctype html>
       const timestepsValue = positiveIntegerText(training?.total_timesteps, 1000000);
       const numEnvsValue = positiveIntegerText(training?.num_envs, 4);
       const mainButton = (running || stopping)
-        ? `<button id="trainingMainAction" class="control-btn danger" ${stopping ? 'disabled' : ''}>结束</button>`
-        : `<button id="trainingMainAction" class="control-btn primary">开始</button>`;
+        ? `<button id="trainingMainAction" class="control-btn danger" ${stopping ? 'disabled' : ''}>Stop</button>`
+        : `<button id="trainingMainAction" class="control-btn primary">Start</button>`;
       return [
         `<label class="pill">steps <input id="totalTimestepsInput" type="number" min="1" step="1" value="${escapeHtml(timestepsValue)}" ${running || stopping ? 'disabled' : ''} style="width:120px;margin-left:8px;background:#18202a;color:#f6f8fb;border:1px solid #2b3540;border-radius:8px;padding:6px 8px;"></label>`,
         `<label class="pill">threads <input id="numEnvsInput" type="number" min="1" max="64" step="1" value="${escapeHtml(numEnvsValue)}" ${running || stopping ? 'disabled' : ''} style="width:72px;margin-left:8px;background:#18202a;color:#f6f8fb;border:1px solid #2b3540;border-radius:8px;padding:6px 8px;"></label>`,
@@ -1852,7 +2673,7 @@ HTML = """<!doctype html>
       totalTimestepsInput.disabled = busy;
       numEnvsInput.disabled = busy;
       statusPill.textContent = `status: ${status}`;
-      mainAction.textContent = busy ? '结束' : '开始';
+      mainAction.textContent = busy ? 'Stop' : 'Start';
       mainAction.disabled = stopping;
       mainAction.className = busy ? 'control-btn danger' : 'control-btn primary';
       mainAction.onclick = busy ? stopTraining : startTraining;
@@ -1873,10 +2694,10 @@ HTML = """<!doctype html>
         }
         const result = await postJson('/api/control/start', payload);
         if (result?.message) {
-          pushAlert('启动提示', result.message, 'info');
+          pushAlert('Start requested', result.message, 'info');
         }
       } catch (err) {
-        showRequestError('启动训练', err);
+        showRequestError('Start training', err);
       }
       await refresh();
     }
@@ -1885,7 +2706,7 @@ HTML = """<!doctype html>
       try {
         await postJson('/api/control/stop', {});
       } catch (err) {
-        showRequestError('结束训练', err);
+        showRequestError('Stop training', err);
       }
       await refresh();
     }
@@ -1895,7 +2716,7 @@ HTML = """<!doctype html>
       const monitoring = data?.monitoring || {};
       if ((training.status === 'idle' || training.status === 'error') && clientErr.tail) {
         pushAlert(
-          '最近一次训练错误日志',
+          'Training client error',
           `status=${training.status} | log_updated_at=${fmt(clientErr.updated_at)}`,
           training.status === 'error' ? 'danger' : 'warn',
           clientErr.tail,
@@ -1905,7 +2726,7 @@ HTML = """<!doctype html>
       const overlongActive = monitoring?.overlong_active || [];
       if (overlongActive.length) {
         pushAlert(
-          '发现超时活跃对局',
+          'Overlong active slots',
           overlongActive.map((item) => `slot=${fmt(item.slot)} seed=${fmt(item.seed)} uptime=${fmt(item.uptime_seconds)}s floor=${fmt(item.floor)} hp=${fmt(item.hp)}`).join('\\n'),
           'warn',
           '',
@@ -1915,13 +2736,63 @@ HTML = """<!doctype html>
       const suspiciousCompleted = monitoring?.suspicious_completed || [];
       if (suspiciousCompleted.length) {
         pushAlert(
-          '发现可疑终局',
+          'Suspicious completed runs',
           suspiciousCompleted.map((item) => `seed=${fmt(item.seed)} flags=${fmt(item.flags_display)} floor=${fmt(item.max_floor)} hp=${fmt(item.final_hp ?? item.hp)} truncated=${fmt(item.truncated)} victory=${fmt(item.victory)}`).join('\\n'),
           'danger',
           '',
           'state',
         );
       }
+      const recentIncidents = monitoring?.recent_incidents || [];
+      if (recentIncidents.length) {
+        pushAlert(
+          'Automation incidents',
+          recentIncidents.slice(0, 6).map((item) => `${fmt(item.source)} | ${fmt(item.type)} | seed=${fmt(item.seed)} | run=${fmt(item.run_id)} | resolution=${fmt(item.resolution_status || item.resolution_action || '-')}`).join('\\n'),
+          'warn',
+          '',
+          'state',
+        );
+      }
+    }
+    function renderProblemList(data) {
+      const shell = document.getElementById('problemList');
+      const problems = data?.monitoring?.problem_list || [];
+      if (!problems.length) {
+        shell.innerHTML = '';
+        return;
+      }
+      shell.innerHTML = `
+        <h2>Detected Issues</h2>
+        <div class="problem-shell">
+          ${problems.map((item, index) => `
+            <details class="problem-item" ${index === 0 ? 'open' : ''}>
+              <summary>
+                <span class="problem-title">
+                  <span>${escapeHtml(item.seed || item.game_id || 'unknown')}</span>
+                  <span class="pill">${escapeHtml(item.status || 'open')}</span>
+                </span>
+                <span class="problem-meta">${escapeHtml(item.run_id || '-')}</span>
+              </summary>
+              <div class="problem-body">
+                <div class="problem-grid">
+                  <div class="problem-label">Found At</div>
+                  <div class="problem-value">${escapeHtml(formatDateTime(item.discovered_at))}</div>
+                  <div class="problem-label">Resolved At</div>
+                  <div class="problem-value">${escapeHtml(formatDateTime(item.resolved_at))}</div>
+                  <div class="problem-label">Reason</div>
+                  <div class="problem-value">${escapeHtml(item.reason || '-')}</div>
+                </div>
+                <div>
+                  <div class="problem-label">Timeline</div>
+                  <ul class="problem-source-list">
+                    ${(item.sources || []).map((source) => `<li>${escapeHtml(source.source || '-')} | ${escapeHtml(source.type || '-')} | ${escapeHtml(formatDateTime(source.recorded_at))} | ${escapeHtml(source.reason || '-')} | ${escapeHtml(source.resolution_status || '-')}</li>`).join('')}
+                  </ul>
+                </div>
+              </div>
+            </details>
+          `).join('')}
+        </div>
+      `;
     }
     function renderCards(data) {
       const t = data.training || {};
@@ -1946,7 +2817,7 @@ HTML = """<!doctype html>
         ['All-Time Runs', kpi(allTime.runs_seen), `Finished ${kpi(allTime.runs_finished, 'metric-good')} | Best Floor ${kpi(allTime.best_floor, 'metric-good')}`],
         ['Reward', kpi(t.mean_reward_100, 'metric-warn'), `Mean length 100 ${kpi(t.mean_length_100)}`],
         ['Resume', kpi(resumeStatus, t.resume_load_status === 'fallback_fresh' ? 'metric-warn' : 'metric-good'), `${resumePath}${resumeFailure}`],
-        ['Health', kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), `Overlong active ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')}`],
+        ['Health', kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}`],
       ];
       return cards.map(([label,value,sub]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`).join('');
     }
@@ -2010,7 +2881,7 @@ HTML = """<!doctype html>
       if (normalized === 'Treasure') return 'T';
       if (normalized === 'Boss') return 'B';
       if (normalized === 'StartReward') return 'N';
-      return '·';
+      return '路';
     }
     function roomClass(roomType) {
       const normalized = normalizeRoomType(roomType);
@@ -2191,12 +3062,12 @@ HTML = """<!doctype html>
       }).join('');
       const legendItems = [
         'N Start',
-        'M 普通怪',
-        'E 精英',
-        '? 事件',
-        'T 宝箱',
-        '$ 商店',
-        'R 火堆',
+        'M Monster',
+        'E Elite',
+        '? Event',
+        'T Treasure',
+        '$ Shop',
+        'R Rest',
         'B Boss',
       ].map(text => `<span class="pill">${escapeHtml(text)}</span>`).join('');
       return `<div class="card map-card">
@@ -2337,12 +3208,13 @@ HTML = """<!doctype html>
         }
         data = await resp.json();
       } catch (err) {
-        pushAlert('刷新状态失败', err?.message || 'unable to fetch state', 'danger', '', 'state');
+        pushAlert('Failed to refresh state', err?.message || 'unable to fetch state', 'danger', '', 'state');
         return;
       }
-      clearStateAlerts();
-      renderStateAlerts(data);
-      const t = data.training || {};
+        clearStateAlerts();
+        renderStateAlerts(data);
+        renderProblemList(data);
+        const t = data.training || {};
       currentRunDir = data.run_dir;
       document.getElementById('meta').textContent = `updated: ${fmt(data.updated_at)} | experiment: ${fmt(t.experiment_name)} | run: ${fmt(t.run_id)} | dir: ${fmt(data.run_dir)}`;
       syncControls(t);
@@ -2482,8 +3354,14 @@ def api_state() -> Response:
 
 @app.route("/api/session/<game_id>")
 def api_session(game_id: str) -> Response:
+    _ensure_telemetry_bootstrapped()
     run_dir_arg = request.args.get("run_dir")
     run_dir = Path(run_dir_arg) if run_dir_arg else _latest_run_dir()
+    with TELEMETRY_LOCK:
+        for run in (TELEMETRY_STATE.get("runs") or {}).values():
+            details = (run.get("session_details") or {}).get(game_id)
+            if isinstance(details, dict) and details:
+                return jsonify(details)
     if run_dir is None:
         session = _build_service_only_session(game_id)
         if not session:
@@ -2497,6 +3375,62 @@ def api_session(game_id: str) -> Response:
     if not session:
         return jsonify({"error": "session not found"}), 404
     return jsonify(session)
+
+
+@app.route("/api/telemetry/training", methods=["POST"])
+def api_telemetry_training() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    _telemetry_ingest_training(payload)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/telemetry/slot/current", methods=["POST"])
+def api_telemetry_slot_current() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    _telemetry_ingest_slot_current(payload)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/telemetry/slot/history", methods=["POST"])
+def api_telemetry_slot_history() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    _telemetry_ingest_slot_history(payload)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/telemetry/session", methods=["POST"])
+def api_telemetry_session() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    _telemetry_ingest_session(payload)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/telemetry/runtime/incident", methods=["POST"])
+def api_telemetry_runtime_incident() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    source = str(payload.get("source") or "runtime")
+    _telemetry_ingest_runtime_incident(payload, source)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/telemetry/runtime/status", methods=["POST"])
+def api_telemetry_runtime_status() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    source = str(payload.get("source") or "runtime")
+    _telemetry_ingest_runtime_status(payload, source)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/control/start", methods=["POST"])

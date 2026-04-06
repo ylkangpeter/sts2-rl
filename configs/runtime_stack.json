@@ -2,7 +2,7 @@
   "python_executable": "python",
   "projects": {
     "st2rl_root": "..",
-    "sts2_cli_root": "..\\sts2-cli",
+    "sts2_cli_root": "..\\..\\sts2-cli",
     "game_dir": ""
   },
   "service": {
@@ -35,7 +35,7 @@
       "ST2RL_LOG_LEVEL": "WARNING"
     },
     "poll_seconds": 15,
-    "per_floor_timeout_seconds": 60,
+    "per_floor_timeout_seconds": 180,
     "stale_slot_seconds": 75,
     "stagnant_steps_threshold": 2,
     "restart_cooldown_seconds": 180,
@@ -51,14 +51,14 @@
       "ST2RL_LOG_LEVEL": "WARNING"
     },
     "poll_seconds": 15,
-    "floor_timeout_seconds": 60,
+    "floor_timeout_seconds": 180,
     "stale_slot_seconds": 75,
     "stagnant_steps_threshold": 2,
     "intervention_cooldown_seconds": 90,
     "uptime_grace_seconds": 60
   },
   "client": {
-    "enabled": true,
+    "enabled": false,
     "script": "scripts\\train_http_cli_rl.py",
     "workdir": ".",
     "process_match": "scripts\\\\train_http_cli_rl.py",

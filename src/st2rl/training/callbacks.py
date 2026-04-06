@@ -6,6 +6,7 @@ import time
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
+from st2rl.models.ppo_model import safe_save_sb3_model
 from st2rl.training.telemetry import TrainingControl, TrainingStatusWriter
 
 
@@ -67,7 +68,7 @@ class CheckpointCallback(BaseCallback):
             )
 
             # 保存模型
-            self.model.save(path)
+            safe_save_sb3_model(self.model, path)
 
             if self.verbose > 0:
                 print(f"Checkpoint saved: {path}")

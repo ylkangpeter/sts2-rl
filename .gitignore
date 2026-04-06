@@ -49,6 +49,7 @@ models/
 # Logs
 logs/
 *.log
+configs/runtime_stack.local.json
 
 # OS
 .DS_Store

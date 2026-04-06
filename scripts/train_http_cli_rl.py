@@ -2,6 +2,7 @@
 """Train PPO on the formal HTTP CLI reinforcement learning environment."""
 
 import argparse
+import zipfile
 from pathlib import Path
 
 import yaml
@@ -80,9 +81,16 @@ def resolve_resume_model_path(config: dict, explicit_model_path: str | None, fre
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
-    if not candidates:
-        return None
-    return str(candidates[0].with_suffix(""))
+    for candidate in candidates:
+        try:
+            if candidate.stat().st_size <= 0:
+                continue
+            with zipfile.ZipFile(candidate) as archive:
+                archive.testzip()
+            return str(candidate.with_suffix(""))
+        except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+            continue
+    return None
 
 
 def main() -> None:

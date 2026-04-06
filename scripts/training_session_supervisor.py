@@ -10,12 +10,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_CONFIG_PATH = ROOT / "configs" / "runtime_stack.json"
+RUNTIME_CONFIG_PATHS = [
+    ROOT / "configs" / "runtime_stack.json",
+    ROOT / "configs" / "runtime_stack.local.json",
+]
 SUPERVISOR_ROOT = ROOT / "logs" / "session_supervisor"
 INCIDENTS_DIR = SUPERVISOR_ROOT / "incidents"
 STATE_PATH = SUPERVISOR_ROOT / "state.json"
@@ -31,6 +34,7 @@ class SupervisorConfig:
     stagnant_steps_threshold: int = 2
     intervention_cooldown_seconds: int = 90
     uptime_grace_seconds: int = 60
+    max_uptime_seconds: int = 900
 
 
 def _now() -> datetime:
@@ -81,9 +85,46 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _dashboard_base_url() -> str:
+    runtime = _load_runtime_config()
+    dashboard = runtime.get("dashboard") or {}
+    host = str(dashboard.get("host") or "127.0.0.1")
+    port = _safe_int(dashboard.get("port"), 8787)
+    return f"http://{host}:{port}"
+
+
+def _post_dashboard(path: str, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{_dashboard_base_url()}{path}",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=1.0) as response:
+            response.read()
+    except (OSError, TimeoutError, URLError):
+        return
+
+
 def _load_runtime_config() -> dict[str, Any]:
-    data = _read_json(RUNTIME_CONFIG_PATH, {})
-    return data if isinstance(data, dict) else {}
+    merged: dict[str, Any] = {}
+    for path in RUNTIME_CONFIG_PATHS:
+        data = _read_json(path, {})
+        if isinstance(data, dict):
+            merged = _deep_merge_dicts(merged, data)
+    return merged
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _session_supervisor_config() -> SupervisorConfig:
@@ -98,6 +139,7 @@ def _session_supervisor_config() -> SupervisorConfig:
         stagnant_steps_threshold=max(1, _safe_int(payload.get("stagnant_steps_threshold"), 2)),
         intervention_cooldown_seconds=max(15, _safe_int(payload.get("intervention_cooldown_seconds"), 90)),
         uptime_grace_seconds=max(30, _safe_int(payload.get("uptime_grace_seconds"), 60)),
+        max_uptime_seconds=max(120, _safe_int(payload.get("max_uptime_seconds"), 900)),
     )
 
 
@@ -110,6 +152,26 @@ def _service_base_url(runtime: dict[str, Any]) -> str:
 
 def _dashboard_base_url() -> str:
     return "http://127.0.0.1:8787"
+
+
+def _service_request(
+    runtime: dict[str, Any],
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    data = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(f"{_service_base_url(runtime)}{path}", data=data, method=method, headers=headers)
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _json_request(
@@ -268,6 +330,7 @@ def _record_incident(payload: dict[str, Any], state: dict[str, Any]) -> None:
     enriched = dict(payload)
     enriched["recorded_at"] = _now_iso()
     _write_json(path, enriched)
+    _post_dashboard("/api/telemetry/runtime/incident", {**enriched, "source": "session_supervisor", "path": str(path)})
     state.setdefault("processed_incidents", []).append(key)
     print(
         f"[session-supervisor] incident recorded: type={payload.get('type')} seed={payload.get('seed')} action={payload.get('resolution_action')}",
@@ -305,6 +368,8 @@ def _active_issue(slot: dict[str, Any], config: SupervisorConfig, state: dict[st
         reasons.append(f"slot_update_stale>{config.stale_slot_seconds}s")
     if stagnant_steps >= config.stagnant_steps_threshold:
         reasons.append(f"stagnant_steps>={config.stagnant_steps_threshold}")
+    if elapsed_seconds is not None and elapsed_seconds > config.max_uptime_seconds:
+        reasons.append(f"uptime_exceeded>{config.max_uptime_seconds}s")
 
     if not reasons:
         return None
@@ -347,8 +412,38 @@ def _resolve_issue(issue: dict[str, Any], runtime: dict[str, Any], state: dict[s
     if session:
         issue["session_snapshot"] = session
 
-    issue["resolution_action"] = "investigate_required"
-    issue["resolution_status"] = "recorded"
+    close_result = None
+    try:
+        close_result = _service_request(runtime, f"/close/{quote(game_id, safe='')}", method="POST", payload={}, timeout=10.0)
+    except Exception as exc:
+        close_result = {"status": "error", "message": str(exc)}
+
+    issue["close_result"] = close_result
+    if str((close_result or {}).get("status") or "").lower() == "success":
+        issue["resolution_action"] = "close_game"
+        issue["resolution_status"] = "closed"
+    else:
+        cleanup_result = None
+        try:
+            games_payload = _service_request(runtime, "/games", timeout=6.0)
+            live_rows = [row for row in (games_payload.get("games") or []) if isinstance(row, dict)]
+            exclude_ids = [
+                str(row.get("game_id") or "")
+                for row in live_rows
+                if str(row.get("game_id") or "") and str(row.get("game_id") or "") != game_id
+            ]
+            cleanup_result = _service_request(
+                runtime,
+                "/admin/cleanup",
+                method="POST",
+                payload={"exclude_game_ids": exclude_ids},
+                timeout=15.0,
+            )
+        except Exception as exc:
+            cleanup_result = {"status": "error", "message": str(exc)}
+        issue["cleanup_result"] = cleanup_result
+        issue["resolution_action"] = "cleanup_others_preserved"
+        issue["resolution_status"] = "cleanup_requested"
     _mark_handled(game_id, state)
     return issue
 
@@ -362,6 +457,7 @@ def _write_status(snapshot: dict[str, Any] | None, incident_count: int, state: d
         "handled_games": len((state.get("handled_games") or {})),
     }
     _write_json(STATUS_PATH, payload)
+    _post_dashboard("/api/telemetry/runtime/status", {**payload, "source": "session_supervisor"})
 
 
 def main() -> None:

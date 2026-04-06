@@ -1,0 +1,13 @@
+{
+  "python_executable": "D:\\venvs\\sts2\\Scripts\\python.exe",
+  "projects": {
+    "game_dir": "D:\\game\\SlayTheSpire2"
+  },
+  "client": {
+    "enabled": true,
+    "args": [
+      "--experiment-name",
+      "baseline_reward_v1"
+    ]
+  }
+}

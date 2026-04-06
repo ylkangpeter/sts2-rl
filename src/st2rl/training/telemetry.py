@@ -2,13 +2,49 @@
 """Lightweight telemetry writers for training dashboards."""
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _dashboard_base_url() -> str:
+    return str(os.environ.get("ST2RL_DASHBOARD_URL") or "http://127.0.0.1:8787").rstrip("/")
+
+
+def _run_metadata(root: Path | None) -> dict[str, str]:
+    if root is None:
+        return {}
+    dashboard_dir = root
+    run_dir = dashboard_dir.parent
+    experiment_dir = run_dir.parent
+    return {
+        "dashboard_dir": str(dashboard_dir),
+        "run_dir": str(run_dir),
+        "run_id": run_dir.name,
+        "experiment_name": experiment_dir.name if experiment_dir.name else "",
+    }
+
+
+def _post_dashboard(path: str, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{_dashboard_base_url()}{path}",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=0.75) as response:
+            response.read()
+    except (OSError, TimeoutError, URLError):
+        return
 
 
 class SlotTelemetry:
@@ -19,6 +55,7 @@ class SlotTelemetry:
         self.slot_id = slot_id
         self.current_path = None
         self.history_path = None
+        self.run_meta = _run_metadata(self.root)
         if self.root:
             slots_dir = self.root / "slots"
             slots_dir.mkdir(parents=True, exist_ok=True)
@@ -29,16 +66,20 @@ class SlotTelemetry:
         if not self.current_path:
             return
         data = dict(payload)
+        data.update(self.run_meta)
         data["updated_at"] = _now_iso()
         self.current_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _post_dashboard("/api/telemetry/slot/current", data)
 
     def append_history(self, payload: dict[str, Any]) -> None:
         if not self.history_path:
             return
         data = dict(payload)
+        data.update(self.run_meta)
         data["recorded_at"] = _now_iso()
         with self.history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(data, ensure_ascii=False) + "\n")
+        _post_dashboard("/api/telemetry/slot/history", data)
 
 
 class SessionLeaderboardStore:
@@ -55,6 +96,7 @@ class SessionLeaderboardStore:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
             self.index_path = self.root / "session_leaderboard.json"
             self.best_path = self.root / "best_session.json"
+        self.run_meta = _run_metadata(self.root)
 
     def _read_index(self) -> list[dict[str, Any]]:
         if not self.index_path or not self.index_path.exists():
@@ -147,6 +189,19 @@ class SessionLeaderboardStore:
             if row.get("game_id") == summary.get("game_id"):
                 rank = index
                 break
+        _post_dashboard(
+            "/api/telemetry/session",
+            {
+                **self.run_meta,
+                "summary": dict(summary),
+                "details": dict(details),
+                "leaderboard": {
+                    "ranked": ranked,
+                    "rank": rank,
+                    "best": best,
+                },
+            },
+        )
         return {"ranked": ranked, "rank": rank, "best": best}
 
     def read_session(self, game_id: str) -> dict[str, Any]:
@@ -199,9 +254,11 @@ class TrainingStatusWriter:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "training_status.json"
         self.payload = dict(payload)
+        self.payload.update(_run_metadata(self.root))
 
     def write(self, updates: dict[str, Any]) -> None:
         data = dict(self.payload)
         data.update(updates)
         data["updated_at"] = _now_iso()
         self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _post_dashboard("/api/telemetry/training", data)

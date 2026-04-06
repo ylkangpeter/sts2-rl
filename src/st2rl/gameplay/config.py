@@ -10,7 +10,7 @@ class FlowPolicyConfig:
 
     card_reward_take_probability: float = 0.85
     shop_buy_probability: float = 0.35
-    shop_low_gold_threshold: int = 100
+    shop_low_gold_threshold: int = 150
     shop_high_gold_threshold: int = 250
     card_select_skip_probability: float = 0.2
     rest_heal_threshold: float = 0.5
