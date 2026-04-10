@@ -9,10 +9,15 @@ environment:
   base_url: http://localhost:5000
   game_dir:
   timeout_seconds: 30
+  step_delay_seconds: 0.0
+  recovery_delay_seconds: 0.01
+  initial_state_poll_interval_seconds: 0.05
   stuck_warn_threshold: 60
   stuck_abort_threshold: 140
   no_action_combat_abort_threshold: 12
   no_action_combat_proceed_threshold: 3
+  async_combat_poll_attempts: 4
+  async_combat_poll_interval_seconds: 0.05
   reward_config:
     hp_delta_weight: 0.08
     damage_penalty_weight: 0.8
@@ -46,8 +51,8 @@ training:
   total_timesteps: 1000000
   save_freq: 2048
   verbose: 1
-  num_envs: 4
-  vec_env: subproc
+  num_envs: 20
+  vec_env: threaded
 
 paths:
   save_dir: ./models/http_cli_rl

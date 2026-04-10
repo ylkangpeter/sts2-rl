@@ -3,11 +3,19 @@
 
 import os
 import time
+import threading
+from collections import deque
+
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from st2rl.models.ppo_model import safe_save_sb3_model
-from st2rl.training.telemetry import TrainingControl, TrainingStatusWriter
+from st2rl.training.telemetry import DashboardControlClient, TrainingStatusWriter
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 
 
 class TrainingCallback(BaseCallback):
@@ -15,8 +23,8 @@ class TrainingCallback(BaseCallback):
 
     def __init__(self, verbose: int = 1):
         super().__init__(verbose)
-        self.episode_rewards = []
-        self.episode_lengths = []
+        self.episode_rewards = deque(maxlen=100)
+        self.episode_lengths = deque(maxlen=100)
 
     def _on_step(self) -> bool:
         """每步调用"""
@@ -93,13 +101,14 @@ class TrainingStatusCallback(BaseCallback):
         self.num_envs = num_envs
         self.vec_env = vec_env
         self.start_time = time.time()
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.control = TrainingControl(str(status_writer.root))
+        self.episode_rewards = deque(maxlen=100)
+        self.episode_lengths = deque(maxlen=100)
+        self.episodes_finished = 0
+        self.control = DashboardControlClient(self.status_writer.payload.get("run_id"))
         self.current_status = "running"
+        self.process = psutil.Process(os.getpid()) if psutil else None
 
     def _on_training_start(self) -> None:
-        self.control.clear()
         self.current_status = "running"
         self.status_writer.write(
             {
@@ -111,15 +120,18 @@ class TrainingStatusCallback(BaseCallback):
                 "vec_env": self.vec_env,
                 "fps": 0.0,
                 "episodes_finished": 0,
-            }
+            },
+            force=True,
         )
 
     def _write_status(self, *, status: str) -> None:
         elapsed = max(0.001, time.time() - self.start_time)
         current_timesteps = int(self.num_timesteps)
-        recent_rewards = self.episode_rewards[-100:]
-        recent_lengths = self.episode_lengths[-100:]
+        recent_rewards = list(self.episode_rewards)
+        recent_lengths = list(self.episode_lengths)
+        force_write = status != self.current_status
         self.current_status = status
+        process_stats = self._process_stats()
         self.status_writer.write(
             {
                 "status": status,
@@ -129,11 +141,33 @@ class TrainingStatusCallback(BaseCallback):
                 "num_envs": self.num_envs,
                 "vec_env": self.vec_env,
                 "fps": round(current_timesteps / elapsed, 2),
-                "episodes_finished": len(self.episode_rewards),
+                "episodes_finished": self.episodes_finished,
                 "mean_reward_100": round(float(np.mean(recent_rewards)), 2) if recent_rewards else 0.0,
                 "mean_length_100": round(float(np.mean(recent_lengths)), 2) if recent_lengths else 0.0,
-            }
+                **process_stats,
+            },
+            force=force_write,
         )
+
+    def _process_stats(self) -> dict[str, float | int]:
+        payload: dict[str, float | int] = {
+            "process_pid": os.getpid(),
+            "process_count": 1,
+            "thread_count": threading.active_count(),
+        }
+        if self.process is None:
+            return payload
+        try:
+            mem = self.process.memory_info()
+            payload["memory_working_set_mb"] = round(float(getattr(mem, "rss", 0)) / (1024 * 1024), 1)
+            private_value = getattr(mem, "private", None)
+            if private_value is None:
+                private_value = getattr(mem, "vms", 0)
+            payload["memory_private_mb"] = round(float(private_value) / (1024 * 1024), 1)
+            payload["thread_count"] = int(self.process.num_threads())
+        except Exception:
+            return payload
+        return payload
 
     def _handle_control(self) -> bool:
         control = self.control.read()
@@ -152,6 +186,7 @@ class TrainingStatusCallback(BaseCallback):
             dones = []
         for index, done in enumerate(dones):
             if done and index < len(infos):
+                self.episodes_finished += 1
                 self.episode_rewards.append(infos[index].get("episode_reward", 0.0))
                 self.episode_lengths.append(infos[index].get("episode_steps", 0))
 
@@ -165,4 +200,3 @@ class TrainingStatusCallback(BaseCallback):
     def _on_training_end(self) -> None:
         final_status = "stopped" if self.current_status == "stopping" else "finished"
         self._write_status(status=final_status)
-        self.control.clear()

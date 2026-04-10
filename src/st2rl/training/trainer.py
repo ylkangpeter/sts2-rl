@@ -10,9 +10,9 @@ from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from st2rl.environments.factory import EnvironmentFactory
-from st2rl.models.ppo_model import UnifiedPPOModel
 from st2rl.training.callbacks import CheckpointCallback, TrainingCallback, TrainingStatusCallback
 from st2rl.training.telemetry import TrainingStatusWriter
+from st2rl.training.threaded_vec_env import ThreadedVecEnv
 
 
 class UnifiedTrainer:
@@ -79,7 +79,7 @@ class UnifiedTrainer:
         env_config = dict(self.config.get('environment', {}))
         training_config = self.config.get('training', {})
         num_envs = max(1, int(training_config.get('num_envs', 1)))
-        vec_env = str(training_config.get('vec_env', 'dummy')).lower()
+        vec_env = str(training_config.get('vec_env', 'threaded')).lower()
         env_config.setdefault("telemetry_dir", os.path.join(self.save_dir, "dashboard"))
 
         print(f"Creating {mode} environment...")
@@ -90,6 +90,8 @@ class UnifiedTrainer:
             if vec_env == 'subproc':
                 self._configure_windows_subproc_python()
                 self.env = SubprocVecEnv(env_fns)
+            elif vec_env == 'threaded':
+                self.env = ThreadedVecEnv(env_fns)
             else:
                 self.env = DummyVecEnv(env_fns)
             print(f"Using vectorized environment: type={vec_env} num_envs={num_envs}")
@@ -110,6 +112,8 @@ class UnifiedTrainer:
             raise ValueError("Environment not created. Call create_environment() first.")
 
         model_config = self.config.get('model', {})
+        from st2rl.models.ppo_model import UnifiedPPOModel
+
         if model_path and os.path.exists(model_path + ".zip"):
             # 加载已有模型继续训练
             print(f"Loading model from {model_path} for continued training...")
@@ -159,7 +163,7 @@ class UnifiedTrainer:
         training_config = self.config.get('training', {})
         timesteps = total_timesteps or training_config.get('total_timesteps', 100000)
         num_envs = max(1, int(training_config.get('num_envs', 1)))
-        vec_env = str(training_config.get('vec_env', 'dummy')).lower()
+        vec_env = str(training_config.get('vec_env', 'threaded')).lower()
 
         # 构建保存路径
         if save_path is None:

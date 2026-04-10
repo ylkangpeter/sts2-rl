@@ -15,12 +15,16 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from st2rl.core.runtime_config import (
+    deep_merge_dicts,
+    load_runtime_stack_config,
+    load_training_launch_defaults,
+    runtime_dashboard_base_url,
+    runtime_service_base_url,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_CONFIG_PATHS = [
-    ROOT / "configs" / "runtime_stack.json",
-    ROOT / "configs" / "runtime_stack.local.json",
-]
 WATCHDOG_ROOT = ROOT / "logs" / "watchdog"
 INCIDENTS_DIR = WATCHDOG_ROOT / "incidents"
 STATE_PATH = WATCHDOG_ROOT / "watchdog_state.json"
@@ -64,11 +68,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _dashboard_base_url() -> str:
-    runtime = _load_runtime_config()
-    dashboard = runtime.get("dashboard") or {}
-    host = str(dashboard.get("host") or "127.0.0.1")
-    port = _safe_int(dashboard.get("port"), 8787)
-    return f"http://{host}:{port}"
+    return runtime_dashboard_base_url(ROOT)
 
 
 def _post_dashboard(path: str, payload: dict[str, Any]) -> None:
@@ -112,27 +112,17 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _load_runtime_config() -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for path in RUNTIME_CONFIG_PATHS:
-        data = _read_json(path, {})
-        if isinstance(data, dict):
-            merged = _deep_merge_dicts(merged, data)
-    return merged
+    return load_runtime_stack_config(ROOT)
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    return deep_merge_dicts(base, override)
 
 
 def _watchdog_config() -> WatchdogConfig:
     runtime = _load_runtime_config()
     payload = runtime.get("watchdog") or {}
+    defaults = load_training_launch_defaults(ROOT)
     if not isinstance(payload, dict):
         return WatchdogConfig()
     return WatchdogConfig(
@@ -143,7 +133,7 @@ def _watchdog_config() -> WatchdogConfig:
         max_uptime_seconds=max(120, _safe_int(payload.get("max_uptime_seconds"), 900)),
         restart_cooldown_seconds=max(30, _safe_int(payload.get("restart_cooldown_seconds"), 180)),
         no_training_grace_seconds=max(10, _safe_int(payload.get("no_training_grace_seconds"), 45)),
-        total_timesteps=max(1, _safe_int(payload.get("total_timesteps"), 1_000_000)),
+        total_timesteps=max(1, _safe_int(payload.get("total_timesteps"), int(defaults.get("total_timesteps") or 1_000_000))),
     )
 
 
@@ -163,12 +153,13 @@ def _project_root(runtime: dict[str, Any], key: str, fallback: Path) -> Path:
 
 
 def _configured_num_envs(runtime: dict[str, Any]) -> int:
+    defaults = load_training_launch_defaults(ROOT)
     client = runtime.get("client") or {}
     args = [str(item) for item in (client.get("args") or [])]
     for index, value in enumerate(args):
         if value == "--num-envs" and index + 1 < len(args):
             return max(1, _safe_int(args[index + 1], 1))
-    return 1
+    return max(1, _safe_int(defaults.get("num_envs"), 1))
 
 
 def _recommended_num_envs(runtime: dict[str, Any], state: dict[str, Any], snapshot: dict[str, Any] | None = None) -> int:
@@ -216,14 +207,7 @@ def _recommended_num_envs(runtime: dict[str, Any], state: dict[str, Any], snapsh
 
 
 def _service_base_url(runtime: dict[str, Any]) -> str:
-    service = runtime.get("service") or {}
-    host = str(service.get("host") or "127.0.0.1")
-    port = _safe_int(service.get("port"), 5000)
-    return f"http://{host}:{port}"
-
-
-def _dashboard_base_url() -> str:
-    return "http://127.0.0.1:8787"
+    return runtime_service_base_url(ROOT)
 
 
 def _json_request(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: float = 5.0) -> dict[str, Any]:
@@ -853,7 +837,15 @@ def _detect_active_slot_incidents(snapshot: dict[str, Any], config: WatchdogConf
                     "restart_required": False,
                 }
             )
-        if elapsed_seconds is not None and elapsed_seconds > config.max_uptime_seconds:
+        if (
+            elapsed_seconds is not None
+            and elapsed_seconds > config.max_uptime_seconds
+            and (
+                stagnant_steps >= config.stagnant_steps_threshold
+                or (updated_age_seconds is not None and updated_age_seconds > config.stale_slot_seconds)
+                or (floor_age_seconds is not None and floor_age_seconds > timeout_seconds)
+            )
+        ):
             incidents.append(
                 {
                     **common,
@@ -1135,6 +1127,30 @@ def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | 
             state,
         )
         return
+
+    if not startup_grace_active:
+        active_game_ids = {
+            str(slot.get("game_id") or "")
+            for slot in active_slots
+            if isinstance(slot, dict) and str(slot.get("game_id") or "")
+        }
+        try:
+            live_games_payload = _service_request(runtime, "/games", timeout=5.0)
+        except Exception as exc:
+            print(f"[watchdog] failed to inspect live games for orphan cleanup: {exc}", flush=True)
+        else:
+            live_games = [row for row in (live_games_payload.get("games") or []) if isinstance(row, dict)]
+            for row in live_games:
+                game_id = str(row.get("game_id") or "")
+                uptime_seconds = float(row.get("uptime_seconds") or 0.0)
+                if not game_id or game_id in active_game_ids or uptime_seconds < 180:
+                    continue
+                try:
+                    result = _service_request(runtime, f"/close/{game_id}", method="POST", payload={}, timeout=10.0)
+                except Exception as exc:
+                    print(f"[watchdog] orphan close failed: game_id={game_id} error={exc}", flush=True)
+                    continue
+                print(f"[watchdog] orphan cleanup requested: game_id={game_id} result={result}", flush=True)
 
     session_supervisor = runtime.get("session_supervisor") or {}
     if not _is_managed_process_running(session_supervisor):

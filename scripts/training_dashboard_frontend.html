@@ -1,0 +1,1173 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STS2 RL Dashboard</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#171a1f;
+      --bg-2:#1d2127;
+      --panel:#23272f;
+      --panel-strong:#2a2f38;
+      --line:#3a414d;
+      --line-soft:#303641;
+      --text:#edf2f7;
+      --muted:#9aa5b4;
+      --accent:#7fb9ff;
+      --accent-soft:rgba(127,185,255,0.16);
+      --good:#6cc08b;
+      --warn:#e1b15a;
+      --danger:#de7373;
+      --shadow:0 14px 34px rgba(0,0,0,0.32);
+    }
+    body { margin:0; font:14px/1.4 "Segoe UI", "PingFang SC", sans-serif; background:linear-gradient(180deg,var(--bg),var(--bg-2)); color:var(--text); }
+    .wrap { max-width:1500px; margin:0 auto; padding:24px; }
+    h1 { margin:0 0 16px; font-size:30px; letter-spacing:.01em; }
+    h2 { margin:20px 0 10px; font-size:18px; color:var(--text); }
+    .meta { color:var(--muted); margin-bottom:16px; }
+    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
+    .card { background:linear-gradient(180deg,var(--panel-strong),var(--panel)); border:1px solid var(--line); border-radius:16px; padding:14px 16px; box-shadow:var(--shadow); }
+    .card.wide { grid-column:1 / -1; }
+    .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .value { font-size:28px; font-weight:800; margin-top:6px; color:var(--accent); }
+    .sub { color:var(--muted); margin-top:4px; }
+    .memory-lines { margin-top:8px; display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:8px; }
+    .memory-line { border:1px solid var(--line-soft); border-radius:10px; padding:8px 10px; background:rgba(255,255,255,0.03); }
+    .memory-line .k { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+    .memory-line .v { color:var(--text); margin-top:4px; font-weight:700; }
+    .muted { color:var(--muted); }
+    table { width:100%; border-collapse:collapse; background:linear-gradient(180deg,var(--panel-strong),var(--panel)); border:1px solid var(--line); border-radius:16px; overflow:hidden; box-shadow:var(--shadow); }
+    th, td { padding:10px 12px; border-bottom:1px solid var(--line-soft); text-align:left; white-space:nowrap; }
+    th { background:#262b33; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+    tr:last-child td { border-bottom:none; }
+    tr:hover td { background:rgba(127,185,255,0.08); }
+    .mono { font-family:Consolas, monospace; font-size:12px; }
+    .metric-strong { color:var(--accent); font-weight:800; }
+    .metric-good { color:var(--good); font-weight:700; }
+    .metric-warn { color:var(--warn); font-weight:700; }
+    .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-weight:700; }
+    .room { font-weight:700; color:#d6e6f8; }
+    .clickable-row { cursor:pointer; }
+    .detail-shell { margin-top:14px; }
+    .detail-grid { display:grid; grid-template-columns:1.1fr 1.5fr 1fr; gap:14px; align-items:start; }
+    .summary-list { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px 14px; margin-top:10px; }
+    .summary-item { padding:10px 12px; border:1px solid var(--line-soft); border-radius:12px; background:rgba(255,255,255,0.03); }
+    .summary-item strong { display:block; font-size:18px; color:var(--accent); margin-top:3px; }
+    .summary-item strong.compact-text { font-size:14px; line-height:1.35; word-break:break-all; }
+    .map-card { min-height:500px; }
+    .map-toolbar, .control-row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 12px; }
+    .map-tab, .control-btn { border:1px solid var(--line); background:var(--panel-strong); color:var(--text); border-radius:999px; padding:6px 12px; cursor:pointer; }
+    .map-tab.active, .control-btn.primary { background:var(--accent-soft); color:var(--accent); border-color:rgba(47,128,237,0.35); }
+    .control-btn.good { background:rgba(62,143,99,0.12); color:var(--good); border-color:rgba(62,143,99,0.3); }
+    .control-btn.warn { background:rgba(208,138,47,0.12); color:var(--warn); border-color:rgba(208,138,47,0.3); }
+    .control-btn.danger { background:rgba(199,81,81,0.12); color:var(--danger); border-color:rgba(199,81,81,0.3); }
+    .tree-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:16px; background:linear-gradient(180deg, #435979, #242930); padding:10px; }
+    .node-detail-empty { padding:24px; color:var(--muted); }
+    .node-button { cursor:pointer; }
+    .node-button text { pointer-events:none; font-weight:700; font-size:13px; }
+    .node-button.active { filter: drop-shadow(0 0 6px rgba(62,143,99,0.24)); }
+    .node-stats { margin-top:10px; display:grid; gap:10px; }
+    .node-block { border:1px solid var(--line-soft); border-radius:12px; padding:10px 12px; background:rgba(255,255,255,0.03); }
+    .action-log { max-height:260px; overflow:auto; margin-top:8px; border:1px solid var(--line-soft); border-radius:12px; background:rgba(0,0,0,0.12); }
+    .action-row { padding:8px 10px; border-bottom:1px solid var(--line-soft); }
+    .action-row:last-child { border-bottom:none; }
+    .reward-tag { display:inline-flex; margin:4px 6px 0 0; padding:4px 8px; border-radius:999px; background:rgba(127,185,255,0.12); color:var(--accent); }
+    .slot-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
+    .alerts { display:grid; gap:10px; margin-bottom:16px; }
+    .alert { border:1px solid var(--line); border-radius:14px; padding:12px 14px; box-shadow:var(--shadow); }
+    .alert.info { background:rgba(47,128,237,0.12); border-color:rgba(47,128,237,0.3); }
+    .alert.warn { background:rgba(208,138,47,0.12); border-color:rgba(208,138,47,0.3); }
+    .alert.danger { background:rgba(199,81,81,0.14); border-color:rgba(199,81,81,0.34); }
+    .alert-title { font-weight:800; margin-bottom:6px; }
+    .alert-body { white-space:pre-wrap; word-break:break-word; }
+    .alert pre { margin:10px 0 0; padding:10px 12px; background:rgba(0,0,0,0.18); border:1px solid var(--line-soft); border-radius:12px; overflow:auto; white-space:pre-wrap; }
+    .alert-tools { display:flex; justify-content:flex-end; margin-top:8px; }
+    .alert-toggle { border:1px solid var(--line); background:var(--panel-strong); color:var(--text); border-radius:999px; padding:3px 10px; cursor:pointer; font-size:12px; }
+    .alert-toggle:hover { border-color:var(--accent); color:var(--accent); }
+    .problem-shell { margin:12px 0 18px; display:flex; flex-direction:column; gap:10px; }
+    .problem-item { border:1px solid var(--line); border-radius:14px; background:var(--panel); }
+    .problem-item summary { cursor:pointer; list-style:none; padding:12px 14px; display:flex; justify-content:space-between; gap:12px; align-items:center; font-weight:700; }
+    .problem-item summary::-webkit-details-marker { display:none; }
+    .problem-item[open] summary { border-bottom:1px solid var(--line-soft); }
+    .problem-title { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    .problem-meta { color:var(--muted); font-size:12px; white-space:nowrap; }
+    .problem-body { padding:12px 14px 14px; display:grid; gap:10px; }
+    .problem-grid { display:grid; grid-template-columns:160px 1fr; gap:8px 12px; }
+    .problem-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0.08em; }
+    .problem-value { color:var(--text); word-break:break-word; }
+    .problem-source-list { margin:0; padding-left:18px; color:var(--muted); }
+    @media (max-width: 1100px) {
+      .grid { grid-template-columns:repeat(2,1fr); }
+      .detail-grid { grid-template-columns:1fr; }
+      .slot-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .memory-lines { grid-template-columns:repeat(2, minmax(0,1fr)); }
+    }
+    @media (max-width: 760px) {
+      .wrap { padding:16px; }
+      .grid { grid-template-columns:1fr; }
+      h1 { font-size:24px; }
+      .value { font-size:24px; }
+      table { display:block; overflow:auto; }
+      .slot-grid { grid-template-columns:1fr; }
+      .memory-lines { grid-template-columns:1fr; }
+    }
+    svg polyline { stroke-linecap:round; stroke-linejoin:round; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>STS2 RL Dashboard</h1>
+    <div class="meta" id="meta">loading...</div>
+    <div class="alerts" id="alerts"></div>
+    <div id="problemList"></div>
+    <div class="control-row" id="controls"></div>
+    <div class="grid" id="cards"></div>
+    <h2>Active Slots</h2>
+    <table id="activeTable"></table>
+    <h2>Slot History</h2>
+    <div id="slotCharts"></div>
+    <h2>Checkpoints</h2>
+    <table id="checkpointTable"></table>
+    <h2>Current Run Top 50</h2>
+    <table id="topTable"></table>
+    <div class="detail-shell" id="sessionDetail"></div>
+    <h2>Historical Best</h2>
+    <table id="historyTable"></table>
+  </div>
+  <script>
+    window.onerror = function(message, source, lineno, colno) {
+      const meta = document.getElementById('meta');
+      if (meta) meta.textContent = `JS error: ${message} @${lineno}:${colno}`;
+    };
+    window.onunhandledrejection = function(event) {
+      const meta = document.getElementById('meta');
+      const reason = event && event.reason ? (event.reason.message || String(event.reason)) : 'unknown rejection';
+      if (meta) meta.textContent = `Promise error: ${reason}`;
+    };
+    function fmt(v) { return v === null || v === undefined || v === '' ? '-' : v; }
+    function pct(v) { return (v ?? 0).toFixed(2) + '%'; }
+    function formatDateTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    }
+    function formatDuration(startedAt, finishedAt) {
+      if (!startedAt) return '-';
+      const start = new Date(startedAt);
+      const end = finishedAt ? new Date(finishedAt) : new Date();
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return '-';
+      const totalSeconds = Math.max(0, Math.round((end.getTime() - start.getTime()) / 1000));
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+    }
+    function inferEpisodeStart(row) {
+      if (row.started_at) return row.started_at;
+      const candidates = [row.game_id, row.seed];
+      for (const value of candidates) {
+        const text = String(value || '');
+        const match = text.match(/_(\d{13})(?:_|$)/) || text.match(/_(\d{10})(?:_|$)/);
+        if (!match) continue;
+        const raw = match[1];
+        const epochMs = raw.length === 13 ? Number(raw) : Number(raw) * 1000;
+        if (!Number.isFinite(epochMs)) continue;
+        return new Date(epochMs).toISOString();
+      }
+      return null;
+    }
+    function withTimeFields(rows) {
+      return (rows || []).map((row) => ({
+        ...row,
+        started_at_display: formatDateTime(row.started_at),
+        duration_display: formatDuration(row.started_at, row.finished_at),
+        final_hp_display: row.final_hp === null || row.final_hp === undefined
+          ? '-'
+          : `${row.final_hp} / ${fmt(row.max_hp)}`,
+        final_gold_display: fmt(row.final_gold),
+      }));
+    }
+    function escapeHtml(v) {
+      return String(v ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+    }
+    let currentSession = null;
+    let currentSessionGameId = null;
+    let currentAct = null;
+    let currentNodeId = null;
+    let currentNodeStageIndex = 0;
+    let currentRunDir = null;
+    let activeAlerts = [];
+    let alertCounter = 0;
+    let alertExpansionState = {};
+    let controlsInitialized = false;
+    function positiveIntegerText(value, fallbackValue) {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric > 0) {
+        return String(Math.trunc(numeric));
+      }
+      return String(fallbackValue);
+    }
+    function kpi(value, cls='metric-strong') {
+      return `<span class="${cls}">${fmt(value)}</span>`;
+    }
+    function pushAlert(title, body, level='danger', details='', source='request') {
+      const key = JSON.stringify([title || '', body || '', level || '', details || '', source || '']);
+      if (activeAlerts.some((item) => JSON.stringify([item.title || '', item.body || '', item.level || '', item.details || '', item.source || '']) === key)) {
+        return;
+      }
+      const expanded = Boolean(alertExpansionState[key]);
+      activeAlerts.push({ id: `alert-${alertCounter++}`, key, title, body, level, details, source, expanded });
+      renderAlerts();
+    }
+    function clearAlerts() {
+      activeAlerts = [];
+      renderAlerts();
+    }
+    function clearStateAlerts() {
+      activeAlerts = activeAlerts.filter((item) => item.source !== 'state');
+      renderAlerts();
+    }
+    function renderAlerts() {
+      const shell = document.getElementById('alerts');
+      if (!activeAlerts.length) {
+        shell.innerHTML = '';
+        return;
+      }
+      shell.innerHTML = activeAlerts.map((item) => `
+        <div class="alert ${escapeHtml(item.level || 'danger')}">
+          <div class="alert-title">${escapeHtml(item.title || 'Error')}</div>
+          <div class="alert-body">${escapeHtml(item.body || '')}</div>
+          ${item.details ? `
+            <div class="alert-tools">
+              <button class="alert-toggle" type="button" data-alert-id="${escapeHtml(item.id)}">
+                ${item.expanded ? 'Hide logs' : 'Show logs'}
+              </button>
+            </div>
+            ${item.expanded ? `<pre>${escapeHtml(item.details)}</pre>` : ''}
+          ` : ''}
+        </div>
+      `).join('');
+      Array.from(document.querySelectorAll('.alert-toggle')).forEach((button) => {
+        button.addEventListener('click', () => {
+          const alertId = button.dataset.alertId;
+          activeAlerts = activeAlerts.map((item) => {
+            if (item.id !== alertId) return item;
+            const expanded = !item.expanded;
+            if (item.key) {
+              alertExpansionState[item.key] = expanded;
+            }
+            return { ...item, expanded };
+          });
+          renderAlerts();
+        });
+      });
+    }
+    function buildErrorFromResponse(status, payload) {
+      const error = new Error(payload?.message || `Request failed: HTTP ${status}`);
+      error.status = status;
+      error.payload = payload || {};
+      return error;
+    }
+    async function postJson(url, payload) {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload || {}),
+      });
+      let data = {};
+      try {
+        data = await resp.json();
+      } catch (_err) {
+        data = {};
+      }
+      if (!resp.ok || data?.ok === false) {
+        throw buildErrorFromResponse(resp.status, data);
+      }
+      return data;
+    }
+    function extractLogTail(payload) {
+      return payload?.launcher_logs?.client_stderr?.tail
+        || payload?.launcher_logs?.dashboard_stderr?.tail
+        || payload?.stderr_tail
+        || '';
+    }
+    function showRequestError(actionLabel, err) {
+      const payload = err?.payload || {};
+      const details = extractLogTail(payload);
+      pushAlert(
+        `${actionLabel} failed`,
+        payload?.message || err?.message || 'unknown error',
+        'danger',
+        details,
+      );
+    }
+    function renderControls(data) {
+      const training = data?.training || {};
+      const defaults = data?.defaults || {};
+      const status = training?.status || 'idle';
+      const running = status === 'running';
+      const stopping = status === 'stopping';
+      const timestepsValue = positiveIntegerText(training?.total_timesteps, defaults.total_timesteps || 1000000);
+      const numEnvsValue = positiveIntegerText(training?.num_envs, defaults.num_envs || 20);
+      const mainButton = (running || stopping)
+        ? `<button id="trainingMainAction" class="control-btn danger" ${stopping ? 'disabled' : ''}>Stop</button>`
+        : `<button id="trainingMainAction" class="control-btn primary">Start</button>`;
+      return [
+        `<label class="pill">steps <input id="totalTimestepsInput" type="number" min="1" step="1" value="${escapeHtml(timestepsValue)}" ${running || stopping ? 'disabled' : ''} style="width:120px;margin-left:8px;background:#18202a;color:#f6f8fb;border:1px solid #2b3540;border-radius:8px;padding:6px 8px;"></label>`,
+        `<label class="pill">threads <input id="numEnvsInput" type="number" min="1" max="64" step="1" value="${escapeHtml(numEnvsValue)}" ${running || stopping ? 'disabled' : ''} style="width:72px;margin-left:8px;background:#18202a;color:#f6f8fb;border:1px solid #2b3540;border-radius:8px;padding:6px 8px;"></label>`,
+        mainButton,
+        `<span id="trainingStatusPill" class="pill">status: ${escapeHtml(status)}</span>`,
+      ].join('');
+    }
+    function syncControls(data) {
+      const training = data?.training || {};
+      const defaults = data?.defaults || {};
+      const shell = document.getElementById('controls');
+      if (!controlsInitialized || !document.getElementById('trainingMainAction')) {
+        shell.innerHTML = renderControls(data);
+        controlsInitialized = true;
+      }
+      const status = training?.status || 'idle';
+      const running = status === 'running';
+      const stopping = status === 'stopping';
+      const busy = running || stopping;
+      const totalTimestepsInput = document.getElementById('totalTimestepsInput');
+      const numEnvsInput = document.getElementById('numEnvsInput');
+      const mainAction = document.getElementById('trainingMainAction');
+      const statusPill = document.getElementById('trainingStatusPill');
+      const serverTimesteps = positiveIntegerText(training?.total_timesteps, defaults.total_timesteps || 1000000);
+      const serverNumEnvs = positiveIntegerText(training?.num_envs, defaults.num_envs || 20);
+
+      if (busy) {
+        totalTimestepsInput.value = serverTimesteps;
+        numEnvsInput.value = serverNumEnvs;
+      } else {
+        if (!String(totalTimestepsInput.value || '').trim()) {
+          totalTimestepsInput.value = serverTimesteps;
+        }
+        if (!String(numEnvsInput.value || '').trim()) {
+          numEnvsInput.value = serverNumEnvs;
+        }
+      }
+
+      totalTimestepsInput.disabled = busy;
+      numEnvsInput.disabled = busy;
+      statusPill.textContent = `status: ${status}`;
+      mainAction.textContent = busy ? 'Stop' : 'Start';
+      mainAction.disabled = stopping;
+      mainAction.className = busy ? 'control-btn danger' : 'control-btn primary';
+      mainAction.onclick = busy ? stopTraining : startTraining;
+    }
+    async function startTraining() {
+      clearAlerts();
+      const stepInput = document.getElementById('totalTimestepsInput');
+      const envInput = document.getElementById('numEnvsInput');
+      const totalTimesteps = stepInput ? Number(stepInput.value || 0) : 0;
+      const numEnvs = envInput ? Number(envInput.value || 0) : 0;
+      try {
+        const payload = {};
+        if (Number.isFinite(totalTimesteps) && totalTimesteps > 0) {
+          payload.total_timesteps = Math.trunc(totalTimesteps);
+        }
+        if (Number.isFinite(numEnvs) && numEnvs > 0) {
+          payload.num_envs = Math.trunc(numEnvs);
+        }
+        payload.vec_env = 'threaded';
+        const result = await postJson('/api/control/start', payload);
+        if (result?.message) {
+          pushAlert('Start requested', result.message, 'info');
+        }
+      } catch (err) {
+        showRequestError('Start training', err);
+      }
+      await refresh();
+    }
+    async function stopTraining() {
+      clearAlerts();
+      try {
+        await postJson('/api/control/stop', {});
+      } catch (err) {
+        showRequestError('Stop training', err);
+      }
+      await refresh();
+    }
+    function renderStateAlerts(data) {
+      const clientErr = data?.launcher_logs?.client_stderr || {};
+      const training = data?.training || {};
+      const monitoring = data?.monitoring || {};
+      if ((training.status === 'idle' || training.status === 'error') && clientErr.tail) {
+        pushAlert(
+          'Training client error',
+          `status=${training.status} | log_updated_at=${fmt(clientErr.updated_at)}`,
+          training.status === 'error' ? 'danger' : 'warn',
+          clientErr.tail,
+          'state',
+        );
+      }
+      const overlongActive = monitoring?.overlong_active || [];
+      if (overlongActive.length) {
+        pushAlert(
+          'Overlong active slots',
+          overlongActive.map((item) => `slot=${fmt(item.slot)} seed=${fmt(item.seed)} uptime=${fmt(item.uptime_seconds)}s floor=${fmt(item.floor)} hp=${fmt(item.hp)}`).join('\\n'),
+          'warn',
+          '',
+          'state',
+        );
+      }
+      const suspiciousCompleted = monitoring?.suspicious_completed || [];
+      if (suspiciousCompleted.length) {
+        pushAlert(
+          'Suspicious completed runs',
+          suspiciousCompleted.map((item) => `seed=${fmt(item.seed)} flags=${fmt(item.flags_display)} floor=${fmt(item.max_floor)} hp=${fmt(item.final_hp ?? item.hp)} truncated=${fmt(item.truncated)} victory=${fmt(item.victory)}`).join('\\n'),
+          'danger',
+          '',
+          'state',
+        );
+      }
+      const recentIncidents = monitoring?.recent_incidents || [];
+      if (recentIncidents.length) {
+        pushAlert(
+          'Automation incidents',
+          recentIncidents.slice(0, 6).map((item) => `${fmt(item.source)} | ${fmt(item.type)} | seed=${fmt(item.seed)} | run=${fmt(item.run_id)} | resolution=${fmt(item.resolution_status || item.resolution_action || '-')}`).join('\\n'),
+          'warn',
+          '',
+          'state',
+        );
+      }
+      const trend = monitoring?.trend || {};
+      if (trend?.degrading) {
+        pushAlert(
+          'Training trend is degrading',
+          `recent floor ${fmt(trend.recent_floor_mean)} vs previous ${fmt(trend.previous_floor_mean)} | recent reward ${fmt(trend.recent_reward_mean)} vs previous ${fmt(trend.previous_reward_mean)}`,
+          trend?.recommend_discard_history ? 'danger' : 'warn',
+          trend?.recommend_discard_history ? `suggest discarding checkpoint history from ${fmt(trend.resume_model_path)}` : '',
+          'state',
+        );
+      }
+    }
+    function renderProblemList(data) {
+      const shell = document.getElementById('problemList');
+      const problems = data?.monitoring?.problem_list || [];
+      if (!problems.length) {
+        shell.innerHTML = '';
+        return;
+      }
+      shell.innerHTML = `
+        <h2>Detected Issues</h2>
+        <div class="problem-shell">
+          ${problems.map((item, index) => `
+            <details class="problem-item" ${index === 0 ? 'open' : ''}>
+              <summary>
+                <span class="problem-title">
+                  <span>${escapeHtml(item.seed || item.game_id || 'unknown')}</span>
+                  <span class="pill">${escapeHtml(item.status || 'open')}</span>
+                </span>
+                <span class="problem-meta">${escapeHtml(item.run_id || '-')}</span>
+              </summary>
+              <div class="problem-body">
+                <div class="problem-grid">
+                  <div class="problem-label">Found At</div>
+                  <div class="problem-value">${escapeHtml(formatDateTime(item.discovered_at))}</div>
+                  <div class="problem-label">Resolved At</div>
+                  <div class="problem-value">${escapeHtml(formatDateTime(item.resolved_at))}</div>
+                  <div class="problem-label">Reason</div>
+                  <div class="problem-value">${escapeHtml(item.reason || '-')}</div>
+                </div>
+                <div>
+                  <div class="problem-label">Timeline</div>
+                  <ul class="problem-source-list">
+                    ${(item.sources || []).map((source) => `<li>${escapeHtml(source.source || '-')} | ${escapeHtml(source.type || '-')} | ${escapeHtml(formatDateTime(source.recorded_at))} | ${escapeHtml(source.reason || '-')} | ${escapeHtml(source.resolution_status || '-')}</li>`).join('')}
+                  </ul>
+                </div>
+              </div>
+            </details>
+          `).join('')}
+        </div>
+      `;
+    }
+    function renderCards(data) {
+      const t = data.training || {};
+      const allTime = data.all_time_summary || {};
+      const monitoring = data.monitoring || {};
+      const resources = monitoring.resources || {};
+      const trend = monitoring.trend || {};
+      const resumeStateMap = {
+        resumed: 'Resume',
+        fresh: 'Fresh',
+        fallback_fresh: 'Fallback Fresh',
+      };
+      const resumeStatus = resumeStateMap[t.resume_load_status] || fmt(t.resume_load_status);
+      const resumePath = t.resume_model_path
+        ? `<span class="mono">${escapeHtml(t.resume_model_path)}</span>`
+        : 'No previous checkpoint';
+      const resumeFailure = t.resume_failure_reason
+        ? ` | ${escapeHtml(t.resume_failure_reason)}`
+        : '';
+      const fmtMb = (value) => (Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)} MB` : '-');
+      const memoryCardSub = `
+        <div class="memory-lines">
+          <div class="memory-line"><div class="k">Total (All)</div><div class="v">WS ${fmtMb(resources.total_working_set_mb)} | Private ${fmtMb(resources.total_private_mb)}</div></div>
+          <div class="memory-line"><div class="k">Dashboard</div><div class="v">WS ${fmtMb(resources.dashboard?.working_set_mb)} | Private ${fmtMb(resources.dashboard?.private_mb)}</div></div>
+          <div class="memory-line"><div class="k">Client</div><div class="v">WS ${fmtMb(resources.training?.working_set_mb)} | Private ${fmtMb(resources.training?.private_mb)}</div></div>
+          <div class="memory-line"><div class="k">Server</div><div class="v">WS ${fmtMb(resources.service?.working_set_mb)} | Private ${fmtMb(resources.service?.private_mb)}</div></div>
+          <div class="memory-line"><div class="k">Dotnet Workers (${fmt(resources.service_workers?.count)})</div><div class="v">WS ${fmtMb(resources.service_workers?.working_set_mb)} | Private ${fmtMb(resources.service_workers?.private_mb)}</div></div>
+        </div>
+      `;
+      const cards = [
+        { label: 'Total Timesteps', value: kpi(t.total_timesteps), sub: `Current ${kpi(t.current_timesteps)} | Progress ${kpi(pct(t.progress_pct || 0), 'metric-good')}` },
+        { label: 'Parallelism', value: kpi(t.num_envs), sub: `VecEnv <span class="pill">${fmt(t.vec_env)}</span> | FPS ${kpi(t.fps, 'metric-good')}` },
+        { label: 'Jobs Seen', value: kpi(data.seen_sessions), sub: `Completed ${kpi(data.completed_sessions, 'metric-good')} | Finished Episodes ${kpi(t.episodes_finished)}` },
+        { label: 'All-Time Runs', value: kpi(allTime.runs_seen), sub: `Finished ${kpi(allTime.runs_finished, 'metric-good')} | Best Floor ${kpi(allTime.best_floor, 'metric-good')}` },
+        { label: 'Reward', value: kpi(t.mean_reward_100, 'metric-warn'), sub: `Mean length 100 ${kpi(t.mean_length_100)}` },
+        { label: 'Trend', value: kpi(trend.recent_floor_mean ?? '-', trend.degrading ? 'metric-warn' : 'metric-good'), sub: `Prev floor ${kpi(trend.previous_floor_mean ?? '-')} | Delta ${kpi(trend.floor_delta ?? '-', trend.degrading ? 'metric-warn' : 'metric-good')}` },
+        { label: 'Resume', value: kpi(resumeStatus, t.resume_load_status === 'fallback_fresh' ? 'metric-warn' : 'metric-good'), sub: `${resumePath}${resumeFailure}` },
+        { label: 'Health', value: kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), sub: `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}` },
+        { label: 'Memory (All Processes)', value: kpi(fmtMb(resources.total_working_set_mb)), sub: memoryCardSub, className: 'wide' },
+      ];
+      return cards.map((card) => `<div class="card ${card.className || ''}"><div class="label">${card.label}</div><div class="value">${card.value}</div><div class="sub">${card.sub}</div></div>`).join('');
+    }
+    function renderTable(el, columns, rows) {
+      const head = `<tr>${columns.map(c => `<th>${c.label}</th>`).join('')}</tr>`;
+      const body = rows.map(row => `<tr>${columns.map(c => `<td class="${c.className || ''}">${fmt(row[c.key])}</td>`).join('')}</tr>`).join('');
+      el.innerHTML = `<thead>${head}</thead><tbody>${body}</tbody>`;
+    }
+    function sparkline(values, color) {
+      if (!values.length) return '';
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const range = Math.max(1, max - min);
+      const pts = values.map((v, i) => {
+        const x = (i / Math.max(1, values.length - 1)) * 220;
+        const y = 50 - ((v - min) / range) * 44;
+        return `${x},${y}`;
+      }).join(' ');
+      return `<svg width="220" height="54" viewBox="0 0 220 54"><polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" /></svg>`;
+    }
+    function renderSlotCharts(slotHistories) {
+      const keys = Object.keys(slotHistories || {}).sort();
+      if (!keys.length) return '<div class="muted">No completed episode history yet.</div>';
+      return `<div class="slot-grid">${keys.map(key => {
+        const rows = slotHistories[key] || [];
+        const rewards = rows.map(r => Number(r.episode_reward || 0));
+        const floors = rows.map(r => Number(r.floor || 0));
+        const steps = rows.map(r => Number(r.episode_steps || 0));
+        return `<div class="card" style="margin-bottom:12px">
+          <div class="label">${key}</div>
+          <div class="sub">recent episodes: ${rows.length}</div>
+          <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px">
+            <div><div class="label">Reward</div>${sparkline(rewards, '#d08a2f')}</div>
+            <div><div class="label">Floor</div>${sparkline(floors, '#3e8f63')}</div>
+            <div><div class="label">Steps</div>${sparkline(steps, '#2f80ed')}</div>
+          </div>
+        </div>`;
+      }).join('')}</div>`;
+    }
+    function normalizeRoomType(roomType) {
+      const value = String(roomType || '').toLowerCase();
+      if (!value) return 'Unknown';
+      if (value === 'unknown') return 'Event';
+      if (value.includes('elite')) return 'Elite';
+      if (value.includes('monster')) return 'Monster';
+      if (value.includes('event')) return 'Event';
+      if (value.includes('rest') || value.includes('campfire') || value.includes('smith')) return 'Rest';
+      if (value.includes('shop') || value.includes('merchant') || value.includes('store')) return 'Shop';
+      if (value.includes('treasure') || value.includes('chest')) return 'Treasure';
+      if (value.includes('boss')) return 'Boss';
+      if (value.includes('startreward') || value.includes('neow') || value.includes('map')) return 'StartReward';
+      return roomType || 'Unknown';
+    }
+    function roomGlyph(roomType) {
+      const normalized = normalizeRoomType(roomType);
+      if (normalized === 'Monster') return 'M';
+      if (normalized === 'Elite') return 'E';
+      if (normalized === 'Event') return '?';
+      if (normalized === 'Rest') return 'R';
+      if (normalized === 'Shop') return '$';
+      if (normalized === 'Treasure') return 'T';
+      if (normalized === 'Boss') return 'B';
+      if (normalized === 'StartReward') return 'N';
+      return '路';
+    }
+    function roomClass(roomType) {
+      const normalized = normalizeRoomType(roomType);
+      if (normalized === 'Monster') return { fill: '#f8fbff', stroke: '#6f7f8f', text: '#2c3c4c' };
+      if (normalized === 'Elite') return { fill: '#fff3e6', stroke: '#d08a2f', text: '#9a5e12' };
+      if (normalized === 'Event') return { fill: '#f7f2ff', stroke: '#8b78d8', text: '#6147b8' };
+      if (normalized === 'Rest') return { fill: '#edf8ef', stroke: '#4c9c68', text: '#2b6d45' };
+      if (normalized === 'Shop') return { fill: '#eef8fb', stroke: '#4b99b7', text: '#2d6f88' };
+      if (normalized === 'Treasure') return { fill: '#fff8e8', stroke: '#c69a2d', text: '#8a6612' };
+      if (normalized === 'Boss') return { fill: '#ffeceb', stroke: '#c75151', text: '#973737' };
+      if (normalized === 'StartReward') return { fill: '#edf3ff', stroke: '#2f80ed', text: '#245ca7' };
+      return { fill: '#f2f5f8', stroke: '#8e99a6', text: '#62707e' };
+    }
+    function escapeId(value) {
+      return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+    function buildVisitedEdgeSet(activeMap) {
+      const set = new Set();
+      const nodeLookup = new Map(
+        (activeMap.nodes || [])
+          .filter(node => node && node.id && node.col !== null && node.row !== null)
+          .map(node => [node.id, node])
+      );
+      const orderedVisited = [];
+      for (const nodeId of (activeMap.visited_node_ids || [])) {
+        const node = nodeLookup.get(nodeId);
+        if (!node) continue;
+        const last = orderedVisited[orderedVisited.length - 1];
+        if (last && last.id === node.id) continue;
+        orderedVisited.push(node);
+      }
+      for (let i = 1; i < orderedVisited.length; i += 1) {
+        const prev = orderedVisited[i - 1];
+        const next = orderedVisited[i];
+        set.add(`${prev.id}->${next.id}`);
+      }
+      return set;
+    }
+    function trimLine(x1, y1, x2, y2, startRadius, endRadius) {
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+      const ux = dx / distance;
+      const uy = dy / distance;
+      return {
+        x1: x1 + ux * startRadius,
+        y1: y1 + uy * startRadius,
+        x2: x2 - ux * endRadius,
+        y2: y2 - uy * endRadius,
+      };
+    }
+    function renderSummary(session) {
+      const s = session.summary || {};
+      const items = [
+        ['Character', s.character],
+        ['Boss', s.boss_name],
+        ['Seed', s.seed],
+        ['Act', s.act],
+        ['Max Floor', s.max_floor],
+        ['Final HP', `${fmt(s.final_hp)} / ${fmt(s.max_hp)}`],
+        ['Final Gold', s.final_gold],
+        ['Reward', s.episode_reward],
+        ['Steps', s.episode_steps],
+        ['Created At', formatDateTime(s.started_at)],
+        ['Duration', formatDuration(s.started_at, s.finished_at)],
+        ['Victory', s.victory],
+        ['Terminated', s.terminated],
+      ];
+      return `<div class="card">
+        <div class="label">Run Summary</div>
+        <div class="summary-list">
+          ${items.map(([label, value]) => {
+            const compactClass = label === 'Seed' ? 'compact-text' : '';
+            return `<div class="summary-item"><div class="label">${escapeHtml(label)}</div><strong class="${compactClass}">${escapeHtml(fmt(value))}</strong></div>`;
+          }).join('')}
+        </div>
+      </div>`;
+    }
+    function renderMap(session) {
+      const maps = session.maps || [];
+      if (!maps.length) return '<div class="card map-card"><div class="node-detail-empty">No map snapshot persisted for this run.</div></div>';
+      if (!currentAct || !maps.find(m => m.act === currentAct)) currentAct = maps[0].act;
+      const activeMap = maps.find(m => m.act === currentAct) || maps[0];
+      const activeBoss = activeMap.boss_info || activeMap.boss || {};
+      const activeBossName = activeBoss.name || activeBoss.boss_name || activeBoss.display_name || activeBoss.id || session.summary?.boss_name || '-';
+      const visitedIds = new Set(activeMap.visited_node_ids || []);
+      const visitedEdges = buildVisitedEdgeSet(activeMap);
+      const baseNodes = (activeMap.nodes || []).map(node => ({ ...node, room_type: normalizeRoomType(node.room_type) }));
+      const nodes = [...baseNodes];
+      const nodeLookup = Object.fromEntries(nodes.map(node => [node.id, node]));
+
+      const visitedDetailNodes = (session.nodes || []).filter(node => Number(node.act) === Number(activeMap.act));
+      visitedDetailNodes.forEach((detailNode) => {
+        if ((detailNode.col === null || detailNode.row === null) && detailNode.floor === 1) {
+          const startId = `a${activeMap.act}_start`;
+          if (!nodeLookup[startId]) {
+            const startNode = { id: startId, act: activeMap.act, col: 0, row: 0, room_type: 'StartReward', children: [] };
+            nodes.push(startNode);
+            nodeLookup[startId] = startNode;
+          }
+        }
+      });
+
+      let graphNodes = nodes.filter(node => node.col !== null && node.row !== null);
+      if (!graphNodes.length) {
+        graphNodes = visitedDetailNodes
+          .filter(node => node.col !== null && node.row !== null)
+          .map(node => ({
+            id: node.node_id,
+            act: node.act,
+            col: Number(node.col),
+            row: Number(node.row),
+            room_type: normalizeRoomType(node.room_type),
+            children: [],
+          }));
+      }
+      const allRows = graphNodes.map(n => Number(n.row ?? 0));
+      const allCols = graphNodes.map(n => Number(n.col ?? 0));
+      const maxRow = Math.max(1, ...allRows, 1);
+      const minRow = Math.min(0, ...allRows, 0);
+      const minCol = Math.min(0, ...allCols, 0);
+      const maxCol = Math.max(0, ...allCols, 0);
+      const colCount = Math.max(1, maxCol - minCol + 1);
+      const rowCount = Math.max(2, maxRow - minRow + 1);
+      const xStep = 68;
+      const yStep = 74;
+      const width = Math.max(520, colCount * xStep + 96);
+      const height = Math.max(420, rowCount * yStep + 88);
+      const xOf = (col) => 48 + (Number(col ?? 0) - minCol) * xStep;
+      const yOf = (row) => 44 + (maxRow - Number(row ?? 0)) * yStep;
+
+      const allEdges = [];
+      graphNodes.forEach((node) => {
+        (node.children || []).forEach((child) => {
+          const childId = `a${activeMap.act}_c${child.col}_r${child.row}`;
+          const childNode = nodeLookup[childId] || graphNodes.find(item => item.id === childId);
+          if (!childNode) return;
+          const fromX = xOf(node.col);
+          const fromY = yOf(node.row);
+          const toX = xOf(childNode.col);
+          const toY = yOf(childNode.row);
+          const trimmed = trimLine(fromX, fromY, toX, toY, visitedIds.has(node.id) ? 19 : 15, visitedIds.has(childId) ? 19 : 15);
+          allEdges.push({ from: node.id, to: childId, x1: trimmed.x1, y1: trimmed.y1, x2: trimmed.x2, y2: trimmed.y2 });
+        });
+      });
+
+      const lineMarkup = allEdges.map((edge) => {
+        const visited = visitedEdges.has(`${edge.from}->${edge.to}`);
+        const stroke = visited ? '#1f5fbf' : '#98a6b5';
+        const dash = visited ? '' : '4 4';
+        const width = visited ? '4.8' : '2.2';
+        const opacity = visited ? '1' : '0.92';
+        return `<line x1="${edge.x1}" y1="${edge.y1}" x2="${edge.x2}" y2="${edge.y2}" stroke="${stroke}" stroke-dasharray="${dash}" stroke-width="${width}" opacity="${opacity}" style="stroke:${stroke} !important;stroke-width:${width} !important;${dash ? `stroke-dasharray:${dash} !important;` : ''}opacity:${opacity} !important;"/>`;
+      }).join('');
+
+      const rowGuides = Array.from({ length: rowCount }, (_, index) => {
+        const rowValue = maxRow - index;
+        const y = yOf(rowValue);
+        return `<g><line x1="20" y1="${y}" x2="${width - 18}" y2="${y}" stroke="#e2e8ef" stroke-width="1"/><text x="6" y="${y + 4}" fill="#8a97a4" font-size="11">F${rowValue}</text></g>`;
+      }).join('');
+
+      const nodeMarkup = graphNodes.map(node => {
+        const x = xOf(node.col);
+        const y = yOf(node.row);
+        const active = currentNodeId === node.id ? 'active' : '';
+        const visited = visitedIds.has(node.id);
+        const colors = roomClass(node.room_type);
+        const isActive = currentNodeId === node.id;
+        const stroke = isActive ? '#3e8f63' : (visited ? '#2f80ed' : 'transparent');
+        const fill = '#34373d';
+        const textColor = '#f2f6fb';
+        const radius = visited ? 19 : 15;
+        const strokeWidth = isActive ? 4 : (visited ? 3.5 : 0);
+        return `<g class="node-button ${active}" data-node-id="${node.id}" transform="translate(${x},${y})">
+          <circle cx="0" cy="0" r="${radius}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" style="fill:${fill} !important;stroke:${stroke} !important;stroke-width:${strokeWidth} !important;"></circle>
+          <text x="0" y="4" text-anchor="middle" fill="${textColor}" style="fill:${textColor} !important;">${roomGlyph(node.room_type)}</text>
+        </g>`;
+      }).join('');
+      const legendItems = [
+        'N Start',
+        'M Monster',
+        'E Elite',
+        '? Event',
+        'T Treasure',
+        '$ Shop',
+        'R Rest',
+        'B Boss',
+      ].map(text => `<span class="pill">${escapeHtml(text)}</span>`).join('');
+      return `<div class="card map-card">
+        <div class="label">Act Map</div>
+        <div class="map-toolbar">${maps.map(map => `<button class="map-tab ${map.act === activeMap.act ? 'active' : ''}" data-act="${map.act}">Act ${map.act}</button>`).join('')}</div>
+        <div class="sub">Boss: <span class="metric-warn">${escapeHtml(activeBossName)}</span></div>
+        <div class="map-toolbar">${legendItems}</div>
+        <div class="tree-wrap">
+          <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" data-darkreader-ignore="true">
+            ${rowGuides}
+            ${lineMarkup}
+            ${nodeMarkup}
+          </svg>
+        </div>
+      </div>`;
+    }
+    function inventoryItemNames(items) {
+      return (items || []).map((item) => {
+        if (typeof item === 'string') return item;
+        return item?.name || item?.id || '?';
+      }).filter(Boolean);
+    }
+    function inventoryDiff(beforeItems, afterItems) {
+      const before = new Map();
+      const after = new Map();
+      (beforeItems || []).forEach((name) => before.set(name, (before.get(name) || 0) + 1));
+      (afterItems || []).forEach((name) => after.set(name, (after.get(name) || 0) + 1));
+      const added = [];
+      const removed = [];
+      const allNames = new Set([...before.keys(), ...after.keys()]);
+      allNames.forEach((name) => {
+        const delta = (after.get(name) || 0) - (before.get(name) || 0);
+        if (delta > 0) {
+          for (let i = 0; i < delta; i += 1) added.push(name);
+        } else if (delta < 0) {
+          for (let i = 0; i < Math.abs(delta); i += 1) removed.push(name);
+        }
+      });
+      return { added, removed };
+    }
+    function buildInventoryTimeline(session) {
+      const nodes = [...(session.nodes || [])].sort((left, right) => {
+        const actDelta = Number(left.act || 0) - Number(right.act || 0);
+        if (actDelta) return actDelta;
+        const floorDelta = Number(left.floor || 0) - Number(right.floor || 0);
+        if (floorDelta) return floorDelta;
+        return String(left.node_id || '').localeCompare(String(right.node_id || ''));
+      });
+      const relicRows = [];
+      const potionRows = [];
+      const relicActive = new Map();
+      const potionActive = new Map();
+      const queuePush = (bucket, name, payload) => {
+        if (!bucket.has(name)) bucket.set(name, []);
+        bucket.get(name).push(payload);
+      };
+      inventoryItemNames(session.initial_state?.relics).forEach((name) => {
+        const row = { name, obtained: ['Start'], lost: [] };
+        relicRows.push(row);
+        queuePush(relicActive, name, row);
+      });
+      inventoryItemNames(session.initial_state?.potions).forEach((name) => {
+        const row = { name, obtained: ['Start'], used: [], discarded: [], lost: [] };
+        potionRows.push(row);
+        queuePush(potionActive, name, row);
+      });
+      nodes.forEach((node) => {
+        const floor = Number(node.floor || 0);
+        const roomType = normalizeRoomType(node.room_type);
+        const entryRelics = inventoryItemNames(node.entry_state?.relics);
+        const exitRelics = inventoryItemNames(node.exit_state?.relics);
+        const entryPotions = inventoryItemNames(node.entry_state?.potions);
+        const exitPotions = inventoryItemNames(node.exit_state?.potions);
+        const relicDiff = inventoryDiff(entryRelics, exitRelics);
+        const potionDiff = inventoryDiff(entryPotions, exitPotions);
+        relicDiff.added.forEach((name) => {
+          const row = { name, obtained: [`F${floor}`], lost: [] };
+          relicRows.push(row);
+          queuePush(relicActive, name, row);
+        });
+        relicDiff.removed.forEach((name) => {
+          const queue = relicActive.get(name) || [];
+          const row = queue.shift();
+          if (row) row.lost.push(`F${floor}`);
+        });
+        potionDiff.added.forEach((name) => {
+          const row = { name, obtained: [`F${floor}`], used: [], discarded: [], lost: [] };
+          potionRows.push(row);
+          queuePush(potionActive, name, row);
+        });
+        const potionActions = (node.actions || []).filter((action) => ['use_potion', 'discard_potion'].includes(action?.action));
+        potionDiff.removed.forEach((name) => {
+          const queue = potionActive.get(name) || [];
+          const row = queue.shift();
+          if (!row) return;
+          const matchedAction = potionActions.find((action) => String(action.action_detail || '').includes(name));
+          const floorTag = `F${floor}`;
+          if (matchedAction?.action === 'use_potion') {
+            row.used.push(floorTag);
+          } else if (matchedAction?.action === 'discard_potion') {
+            row.discarded.push(floorTag);
+          } else {
+            row.lost.push(floorTag);
+          }
+        });
+        const rewardRelics = (node.rewards || []).filter((reward) => reward?.type === 'relic').map((reward) => reward?.name).filter(Boolean);
+        rewardRelics.forEach((name) => {
+          if (!relicDiff.added.includes(name) && !relicRows.some((row) => row.name === name && row.obtained.includes(`F${floor}`))) {
+            const row = { name, obtained: [`F${floor}`], lost: [] };
+            relicRows.push(row);
+            queuePush(relicActive, name, row);
+          }
+        });
+        const rewardPotions = (node.rewards || []).filter((reward) => reward?.type === 'potion').map((reward) => reward?.name).filter(Boolean);
+        rewardPotions.forEach((name) => {
+          if (!potionDiff.added.includes(name) && !potionRows.some((row) => row.name === name && row.obtained.includes(`F${floor}`))) {
+            const row = { name, obtained: [`F${floor}`], used: [], discarded: [], lost: [] };
+            potionRows.push(row);
+            queuePush(potionActive, name, row);
+          }
+        });
+      });
+      return { relics: relicRows, potions: potionRows };
+    }
+    function renderInventoryTimeline(session) {
+      const timeline = buildInventoryTimeline(session);
+      const relicRows = timeline.relics.length
+        ? timeline.relics.map((row) => `<div class="action-row">
+            <div><strong>${escapeHtml(row.name)}</strong></div>
+            <div class="muted">obtained: ${escapeHtml(row.obtained.join(', '))}${row.lost.length ? ` | lost: ${escapeHtml(row.lost.join(', '))}` : ''}</div>
+          </div>`).join('')
+        : '<div class="action-row muted">No relic timeline recorded.</div>';
+      const potionRows = timeline.potions.length
+        ? timeline.potions.map((row) => {
+            const parts = [`obtained: ${row.obtained.join(', ')}`];
+            if (row.used.length) parts.push(`used: ${row.used.join(', ')}`);
+            if (row.discarded.length) parts.push(`discarded: ${row.discarded.join(', ')}`);
+            if (row.lost.length) parts.push(`lost: ${row.lost.join(', ')}`);
+            return `<div class="action-row">
+              <div><strong>${escapeHtml(row.name)}</strong></div>
+              <div class="muted">${escapeHtml(parts.join(' | '))}</div>
+            </div>`;
+          }).join('')
+        : '<div class="action-row muted">No potion timeline recorded.</div>';
+      return `<div class="node-block">
+        <div class="label">Inventory Timeline</div>
+        <div class="action-log">${relicRows}${potionRows}</div>
+      </div>`;
+    }
+    function renderNodeDetail(session) {
+      const nodes = session.nodes || [];
+      if (!nodes.length) return '<div class="card"><div class="node-detail-empty">No node detail persisted.</div></div>';
+      if (!currentNodeId || !nodes.find(node => node.node_id === currentNodeId)) currentNodeId = nodes[0].node_id;
+      const selectedNode = nodes.find(item => item.node_id === currentNodeId) || nodes[0];
+      const stageNodes = nodes.filter((item) =>
+        Number(item.act) === Number(selectedNode.act) &&
+        Number(item.floor) === Number(selectedNode.floor) &&
+        normalizeRoomType(item.room_type) === normalizeRoomType(selectedNode.room_type)
+      );
+      const orderedStageNodes = stageNodes.length > 1
+        ? [...stageNodes].sort((left, right) => {
+            const leftActions = (left.actions || []).length;
+            const rightActions = (right.actions || []).length;
+            if (leftActions !== rightActions) return leftActions - rightActions;
+            return String(left.node_id || '').localeCompare(String(right.node_id || ''));
+          })
+        : [selectedNode];
+      if (currentNodeStageIndex >= orderedStageNodes.length) currentNodeStageIndex = 0;
+      const node = orderedStageNodes[currentNodeStageIndex] || selectedNode;
+      const rewards = (node.rewards || []).map(item => `<span class="reward-tag">${escapeHtml(item.type)}: ${escapeHtml(item.name ?? item.amount ?? '')}</span>`).join('');
+      const actions = (node.actions || []).map(item => `<div class="action-row">
+        <div><strong>#${escapeHtml(item.step)}</strong> ${escapeHtml(item.action)}</div>
+        <div>${escapeHtml(item.action_detail || item.action)}</div>
+        <div class="muted">before=${escapeHtml(item.decision_before)} after=${escapeHtml(item.decision_after)} reward=${escapeHtml(item.reward)}</div>
+      </div>`).join('');
+      const entryShopCards = node.entry_state?.cards || [];
+      const entryShopRelics = node.entry_state?.shop_relics || [];
+      const entryShopPotions = node.entry_state?.shop_potions || [];
+      const entryPurgeCost = node.entry_state?.purge_cost;
+      const purgeCandidates = node.entry_state?.deck || [];
+      const shopItemName = (item) => typeof item === 'string' ? item : (item?.name || item?.id || '?');
+      const shopDetails = normalizeRoomType(node.room_type) === 'Shop'
+        ? `<div class="node-block"><div class="label">Shop Stock</div><div>
+            <div>Cards: ${entryShopCards.length ? entryShopCards.map((item) => escapeHtml(shopItemName(item))).join(', ') : 'None'}</div>
+            <div>Relics: ${entryShopRelics.length ? entryShopRelics.map((item) => escapeHtml(shopItemName(item))).join(', ') : 'None'}</div>
+            <div>Potions: ${entryShopPotions.length ? entryShopPotions.map((item) => escapeHtml(shopItemName(item))).join(', ') : 'None'}</div>
+            <div>Purge: ${entryPurgeCost !== null && entryPurgeCost !== undefined ? `${escapeHtml(entryPurgeCost)} gold (${escapeHtml(purgeCandidates.length)} candidates)` : 'Unavailable'}</div>
+          </div></div>`
+        : '';
+      const stageTabs = orderedStageNodes.length > 1
+        ? `<div class="map-toolbar">${orderedStageNodes.map((item, index) => `
+            <button class="map-tab ${index === currentNodeStageIndex ? 'active' : ''}" data-stage-index="${index}">
+              Stage ${index + 1}
+            </button>
+          `).join('')}</div>`
+        : '';
+      return `<div class="card">
+        <div class="label">Node Detail</div>
+        <div class="sub">Act ${escapeHtml(node.act)} | Floor ${escapeHtml(node.floor)} | ${escapeHtml(normalizeRoomType(node.room_type))}</div>
+        ${stageTabs}
+        <div class="node-stats">
+          <div class="node-block"><div class="label">Monsters</div><div>${(node.monsters || []).length ? (node.monsters || []).map(escapeHtml).join(', ') : 'None recorded'}</div></div>
+          <div class="node-block"><div class="label">Entry</div><div>HP ${escapeHtml(node.entry_state?.hp)} / ${escapeHtml(node.entry_state?.max_hp)} | Gold ${escapeHtml(node.entry_state?.gold)} | Decision ${escapeHtml(node.entry_state?.decision)}</div></div>
+          <div class="node-block"><div class="label">Exit</div><div>HP ${escapeHtml(node.exit_state?.hp)} / ${escapeHtml(node.exit_state?.max_hp)} | Gold ${escapeHtml(node.exit_state?.gold)} | Decision ${escapeHtml(node.exit_state?.decision)}</div></div>
+          ${renderInventoryTimeline(session)}
+          ${shopDetails}
+          <div class="node-block"><div class="label">Rewards</div><div>${rewards || '<span class="muted">No explicit rewards captured.</span>'}</div></div>
+          <div class="node-block"><div class="label">Actions</div><div class="action-log">${actions || '<div class="action-row muted">No actions recorded.</div>'}</div></div>
+        </div>
+      </div>`;
+    }
+    function bindSessionInteractions() {
+      Array.from(document.querySelectorAll('.map-tab')).forEach((button) => {
+        if (button.dataset.act !== undefined) {
+          button.addEventListener('click', () => {
+            currentAct = Number(button.dataset.act);
+            currentNodeId = null;
+            currentNodeStageIndex = 0;
+            renderSessionDetail();
+          });
+          return;
+        }
+        if (button.dataset.stageIndex !== undefined) {
+          button.addEventListener('click', () => {
+            currentNodeStageIndex = Number(button.dataset.stageIndex) || 0;
+            renderSessionDetail();
+          });
+        }
+      });
+      Array.from(document.querySelectorAll('.node-button')).forEach((node) => {
+        node.addEventListener('click', () => {
+          currentNodeId = node.dataset.nodeId;
+          currentNodeStageIndex = 0;
+          renderSessionDetail();
+        });
+      });
+    }
+    function renderSessionDetail() {
+      const shell = document.getElementById('sessionDetail');
+      if (!currentSession) {
+        shell.innerHTML = '';
+        return;
+      }
+      shell.innerHTML = `<h2>Selected Job</h2><div class="detail-grid">
+        ${renderSummary(currentSession)}
+        ${renderMap(currentSession)}
+        ${renderNodeDetail(currentSession)}
+      </div>`;
+      bindSessionInteractions();
+    }
+    async function loadSession(gameId, runDir = null) {
+      currentSessionGameId = gameId;
+      const suffix = runDir ? `?run_dir=${encodeURIComponent(runDir)}` : '';
+      const resp = await fetch(`/api/session/${encodeURIComponent(gameId)}${suffix}`);
+      if (!resp.ok) {
+        currentSession = null;
+        renderSessionDetail();
+        return;
+      }
+        currentSession = await resp.json();
+        currentAct = null;
+        currentNodeId = null;
+        currentNodeStageIndex = 0;
+        renderSessionDetail();
+      }
+    async function refresh() {
+      let data = null;
+      try {
+        const resp = await fetch('/api/state');
+        if (!resp.ok) {
+          throw buildErrorFromResponse(resp.status, {});
+        }
+        data = await resp.json();
+      } catch (err) {
+        pushAlert('Failed to refresh state', err?.message || 'unable to fetch state', 'danger', '', 'state');
+        return;
+      }
+        clearStateAlerts();
+        renderStateAlerts(data);
+        renderProblemList(data);
+        const t = data.training || {};
+      currentRunDir = data.run_dir;
+      document.getElementById('meta').textContent = `updated: ${fmt(data.updated_at)} | experiment: ${fmt(t.experiment_name)} | run: ${fmt(t.run_id)} | dir: ${fmt(data.run_dir)}`;
+      syncControls(data);
+      document.getElementById('cards').innerHTML = renderCards(data);
+      const activeSlots = withTimeFields(data.active_slots || []).map((row) => ({
+        ...row,
+        uptime_display: formatDuration(inferEpisodeStart(row), null),
+      }));
+      renderTable(document.getElementById('activeTable'), [
+        {key:'slot',label:'Slot'},
+        {key:'episode_index',label:'Episode'},
+        {key:'floor',label:'Floor'},
+        {key:'act',label:'Act'},
+        {key:'boss_name',label:'Boss'},
+        {key:'room_type',label:'Room'},
+        {key:'decision',label:'Decision'},
+        {key:'hp',label:'HP'},
+        {key:'gold',label:'Gold'},
+        {key:'energy',label:'Energy'},
+        {key:'uptime_display',label:'Uptime'},
+        {key:'episode_steps',label:'Steps'},
+        {key:'episode_reward',label:'Reward'},
+        {key:'flags_display',label:'Flags'},
+        {key:'seed',label:'Seed', className:'mono'},
+      ], activeSlots);
+      Array.from(document.querySelectorAll('#activeTable tbody tr')).forEach((row) => {
+        const roomCell = row.children[5];
+        const floorCell = row.children[2];
+        const rewardCell = row.children[12];
+        if (roomCell) roomCell.classList.add('room');
+        if (floorCell) floorCell.classList.add('metric-strong');
+        if (rewardCell) rewardCell.classList.add('metric-warn');
+        const slot = activeSlots[row.rowIndex - 1];
+        if (slot && slot.game_id) {
+          row.classList.add('clickable-row');
+          row.addEventListener('click', () => loadSession(slot.game_id, data.run_dir));
+        }
+      });
+      document.getElementById('slotCharts').innerHTML = renderSlotCharts(data.slot_histories || {});
+      renderTable(document.getElementById('checkpointTable'), [
+        {key:'name',label:'File'},
+        {key:'size_mb',label:'Size(MB)'},
+        {key:'path',label:'Path', className:'mono'},
+      ], data.checkpoints || []);
+      const topSessions = withTimeFields(data.top_sessions || []);
+      renderTable(document.getElementById('topTable'), [
+        {key:'slot',label:'Slot'},
+        {key:'episode_index',label:'Episode'},
+        {key:'boss_name',label:'Boss'},
+        {key:'max_floor',label:'Max Floor'},
+        {key:'started_at_display',label:'Created At'},
+        {key:'duration_display',label:'Duration'},
+        {key:'final_hp_display',label:'Final HP'},
+        {key:'final_gold_display',label:'Final Gold'},
+        {key:'episode_steps',label:'Steps'},
+        {key:'episode_reward',label:'Reward'},
+        {key:'flags_display',label:'Flags'},
+        {key:'victory',label:'Victory'},
+        {key:'seed',label:'Seed', className:'mono'},
+      ], topSessions);
+      Array.from(document.querySelectorAll('#topTable tbody tr')).forEach((row) => {
+        row.classList.add('clickable-row');
+        const floorCell = row.children[3];
+        const hpCell = row.children[6];
+        const rewardCell = row.children[9];
+        const victoryCell = row.children[11];
+        if (floorCell) floorCell.classList.add('metric-good');
+        if (hpCell) hpCell.classList.add('metric-strong');
+        if (rewardCell) rewardCell.classList.add('metric-warn');
+        if (victoryCell && victoryCell.textContent === 'True') victoryCell.classList.add('metric-good');
+        const session = topSessions[row.rowIndex - 1];
+        if (session && session.game_id) {
+          row.addEventListener('click', () => loadSession(session.game_id, session.run_dir || data.run_dir));
+        }
+      });
+      const historicalBest = withTimeFields(data.historical_best || []);
+      renderTable(document.getElementById('historyTable'), [
+        {key:'experiment_name',label:'Experiment'},
+        {key:'run_id',label:'Run'},
+        {key:'boss_name',label:'Boss'},
+        {key:'max_floor',label:'Max Floor'},
+        {key:'started_at_display',label:'Created At'},
+        {key:'duration_display',label:'Duration'},
+        {key:'final_hp_display',label:'Final HP'},
+        {key:'final_gold_display',label:'Final Gold'},
+        {key:'episode_reward',label:'Reward'},
+        {key:'episode_steps',label:'Steps'},
+        {key:'flags_display',label:'Flags'},
+        {key:'victory',label:'Victory'},
+        {key:'seed',label:'Seed', className:'mono'},
+      ], historicalBest);
+      Array.from(document.querySelectorAll('#historyTable tbody tr')).forEach((row) => {
+        row.classList.add('clickable-row');
+        const floorCell = row.children[3];
+        const hpCell = row.children[6];
+        const rewardCell = row.children[8];
+        const victoryCell = row.children[11];
+        if (floorCell) floorCell.classList.add('metric-good');
+        if (hpCell) hpCell.classList.add('metric-strong');
+        if (rewardCell) rewardCell.classList.add('metric-warn');
+        if (victoryCell && victoryCell.textContent === 'True') victoryCell.classList.add('metric-good');
+          const session = historicalBest[row.rowIndex - 1];
+          if (session) {
+            const runDir = session.run_dir || '';
+            row.addEventListener('click', () => loadSession(session.game_id, runDir));
+          }
+      });
+    }
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

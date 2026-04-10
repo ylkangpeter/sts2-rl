@@ -56,20 +56,26 @@ class SlotTelemetry:
         self.current_path = None
         self.history_path = None
         self.run_meta = _run_metadata(self.root)
+        self._last_current_write_ts = 0.0
+        self._min_current_update_interval_seconds = 1.0
         if self.root:
             slots_dir = self.root / "slots"
             slots_dir.mkdir(parents=True, exist_ok=True)
             self.current_path = slots_dir / f"slot_{slot_id:02d}.json"
             self.history_path = slots_dir / f"slot_{slot_id:02d}.history.jsonl"
 
-    def write_current(self, payload: dict[str, Any]) -> None:
+    def write_current(self, payload: dict[str, Any], *, force: bool = False) -> None:
         if not self.current_path:
+            return
+        now_ts = datetime.now().timestamp()
+        if not force and (now_ts - self._last_current_write_ts) < self._min_current_update_interval_seconds:
             return
         data = dict(payload)
         data.update(self.run_meta)
         data["updated_at"] = _now_iso()
         self.current_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         _post_dashboard("/api/telemetry/slot/current", data)
+        self._last_current_write_ts = now_ts
 
     def append_history(self, payload: dict[str, Any]) -> None:
         if not self.history_path:
@@ -181,8 +187,11 @@ class SessionLeaderboardStore:
                         pass
 
         best = bool(leaderboard and leaderboard[0].get("game_id") == summary.get("game_id"))
-        if best and self.best_path and session_path and session_path.exists():
-            self.best_path.write_text(session_path.read_text(encoding="utf-8"), encoding="utf-8")
+        if best and self.best_path:
+            best_payload = dict(details)
+            if ranked:
+                best_payload["saved_at"] = _now_iso()
+            self.best_path.write_text(json.dumps(best_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         rank = None
         for index, row in enumerate(leaderboard, start=1):
@@ -246,6 +255,32 @@ class TrainingControl:
                 pass
 
 
+class DashboardControlClient:
+    """Fetch runtime control commands from the dashboard over HTTP."""
+
+    def __init__(self, run_id: str | None, *, poll_interval_seconds: float = 0.5):
+        self.run_id = str(run_id or "").strip()
+        self.poll_interval_seconds = max(0.1, float(poll_interval_seconds))
+        self._last_poll_ts = 0.0
+        self._cached: dict[str, Any] = {}
+
+    def read(self, *, force: bool = False) -> dict[str, Any]:
+        now_ts = datetime.now().timestamp()
+        if not force and self._cached and (now_ts - self._last_poll_ts) < self.poll_interval_seconds:
+            return dict(self._cached)
+        params = f"?run_id={self.run_id}" if self.run_id else ""
+        request = Request(f"{_dashboard_base_url()}/api/runtime/control{params}", method="GET")
+        try:
+            with urlopen(request, timeout=0.5) as response:
+                raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
+            self._cached = payload if isinstance(payload, dict) else {}
+            self._last_poll_ts = now_ts
+        except (OSError, TimeoutError, URLError, json.JSONDecodeError):
+            return dict(self._cached)
+        return dict(self._cached)
+
+
 class TrainingStatusWriter:
     """Writes compact training progress snapshots for dashboard use."""
 
@@ -255,10 +290,19 @@ class TrainingStatusWriter:
         self.path = self.root / "training_status.json"
         self.payload = dict(payload)
         self.payload.update(_run_metadata(self.root))
+        self._last_write_ts = 0.0
+        self._last_status = None
+        self._min_update_interval_seconds = 1.0
 
-    def write(self, updates: dict[str, Any]) -> None:
+    def write(self, updates: dict[str, Any], *, force: bool = False) -> None:
+        now_ts = datetime.now().timestamp()
         data = dict(self.payload)
         data.update(updates)
+        status = data.get("status")
+        if not force and status == self._last_status and (now_ts - self._last_write_ts) < self._min_update_interval_seconds:
+            return
         data["updated_at"] = _now_iso()
         self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         _post_dashboard("/api/telemetry/training", data)
+        self._last_write_ts = now_ts
+        self._last_status = status

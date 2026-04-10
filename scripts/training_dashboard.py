@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 """Live dashboard backed by compact telemetry files and training control APIs."""
 
 import json
@@ -17,12 +16,19 @@ from urllib.request import Request, urlopen
 
 from flask import Flask, Response, jsonify, request, send_file
 
+from st2rl.core.runtime_config import (
+    deep_merge_dicts,
+    load_runtime_stack_config,
+    load_training_launch_defaults,
+)
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
 ROOT = Path(__file__).resolve().parents[1]
 MODELS_ROOT = ROOT / "models" / "http_cli_rl"
-RUNTIME_CONFIG_PATHS = [
-    ROOT / "configs" / "runtime_stack.json",
-    ROOT / "configs" / "runtime_stack.local.json",
-]
 ALL_TIME_SUMMARY_PATH = MODELS_ROOT / "all_time_summary.json"
 ALL_TIME_SUMMARY_TTL_SECONDS = 300
 LIVE_SESSION_CACHE_LIMIT = 100
@@ -40,6 +46,9 @@ SNAPSHOT_CACHE: dict[str, Any] = {
     "last_error_at": None,
 }
 HISTORICAL_BEST_CACHE: dict[str, Any] = {"generated_at": 0.0, "payload": None}
+WINDOWS_PROCESS_CACHE_TTL_SECONDS = 2.0
+WINDOWS_PROCESS_CACHE_LOCK = threading.Lock()
+WINDOWS_PROCESS_CACHE: dict[str, Any] = {"generated_at": 0.0, "rows": []}
 SNAPSHOT_WORKER_THREAD: threading.Thread | None = None
 SNAPSHOT_WORKER_STARTED = False
 LAUNCHER_DIR = ROOT / "logs" / "launcher"
@@ -52,6 +61,7 @@ TELEMETRY_STATE: dict[str, Any] = {
     "bootstrapped": False,
     "current_run_id": None,
     "runs": {},
+    "control_requests": {},
     "historical_best": [],
     "all_time_summary": {
         "updated_at": None,
@@ -67,6 +77,7 @@ TELEMETRY_STATE: dict[str, Any] = {
     "session_supervisor_status": {},
     "launcher_logs": {},
 }
+SESSION_DETAILS_RECENT_LIMIT = 80
 
 app = Flask(__name__)
 
@@ -140,22 +151,15 @@ def _now_iso() -> str:
 
 
 def _load_runtime_config() -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for path in RUNTIME_CONFIG_PATHS:
-        data = _read_json(path)
-        if isinstance(data, dict):
-            merged = _deep_merge_dicts(merged, data)
-    return merged
+    return load_runtime_stack_config(ROOT)
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    return deep_merge_dicts(base, override)
+
+
+def _load_training_defaults() -> dict[str, Any]:
+    return load_training_launch_defaults(ROOT)
 
 
 def _service_base_url() -> str:
@@ -796,7 +800,10 @@ def _row_health_flags(row: dict[str, Any]) -> list[str]:
     elapsed_seconds = _safe_float(row.get("elapsed_seconds"))
     uptime_seconds = _safe_float(row.get("uptime_seconds"))
     duration_seconds = elapsed_seconds if elapsed_seconds is not None else uptime_seconds
-    if active and duration_seconds is not None and duration_seconds > 600:
+    updated_age_seconds = _seconds_since(row.get("updated_at"))
+    stagnant_steps = _safe_int(row.get("stagnant_steps"), 0)
+    active_stall_hint = stagnant_steps >= 2 or (updated_age_seconds is not None and updated_age_seconds > 75)
+    if active and duration_seconds is not None and duration_seconds > 600 and active_stall_hint:
         flags.append("overlong_active")
     elif not active and duration_seconds is not None and duration_seconds > 600:
         flags.append("overlong_episode")
@@ -911,6 +918,38 @@ def _telemetry_update_historical_best(summary: dict[str, Any], run: dict[str, An
     TELEMETRY_STATE["historical_best"] = _telemetry_sort_top(historical, limit=50)
 
 
+def _prune_session_details(run: dict[str, Any], *, recent_limit: int = SESSION_DETAILS_RECENT_LIMIT) -> None:
+    details = run.get("session_details")
+    if not isinstance(details, dict) or not details:
+        return
+    keep_ids: set[str] = set()
+    keep_ids.update(
+        str(row.get("game_id") or "")
+        for row in (run.get("top_sessions") or [])
+        if isinstance(row, dict) and str(row.get("game_id") or "")
+    )
+    keep_ids.update(
+        str(row.get("game_id") or "")
+        for row in (run.get("active_slots") or {}).values()
+        if isinstance(row, dict) and str(row.get("game_id") or "")
+    )
+    keys = list(details.keys())
+    if recent_limit > 0 and keys:
+        keep_ids.update(keys[-recent_limit:])
+    removable = [key for key in keys if key not in keep_ids]
+    for key in removable:
+        details.pop(key, None)
+
+
+def _compact_session_details_for_memory(details: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(details, dict):
+        return {}
+    compact = dict(details)
+    # Large per-step trace stays on disk evidence; dashboard runtime keeps map/node drill-down only.
+    compact.pop("trace", None)
+    return compact
+
+
 def _telemetry_update_all_time(summary: dict[str, Any], run: dict[str, Any]) -> None:
     all_time = dict(TELEMETRY_STATE.get("all_time_summary") or {})
     seen_key = str(summary.get("game_id") or "")
@@ -938,7 +977,7 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
     top_sessions = [_annotate_health(dict(row)) for row in run.get("top_sessions") or []]
     suspicious_completed = [row for row in top_sessions if row.get("suspicious")]
     overlong_active = [row for row in active_slots if "overlong_active" in (row.get("health_flags") or [])]
-    recent_incidents = deepcopy(TELEMETRY_STATE.get("recent_incidents") or [])
+    recent_incidents = _filter_incidents_for_run(TELEMETRY_STATE.get("recent_incidents") or [], run)
     active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
     detailed_ids = set((run.get("session_details") or {}).keys())
@@ -946,20 +985,24 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
         item["details_available"] = bool(item.get("details_available") or item.get("game_id") in detailed_ids)
     for item in top_sessions:
         item["details_available"] = bool(item.get("details_available") or item.get("game_id") in detailed_ids)
+    training = deepcopy(run.get("training") or {})
+    resources = _collect_resource_summary(training)
+    trend = _build_trend_summary(training, top_sessions)
     return {
-        "updated_at": (run.get("training") or {}).get("updated_at"),
+        "updated_at": training.get("updated_at"),
         "run_dir": run.get("run_dir"),
-        "training": deepcopy(run.get("training") or {}),
+        "training": training,
         "active_slots": active_slots,
         "top_sessions": top_sessions,
         "slot_histories": deepcopy(run.get("slot_histories") or {}),
         "checkpoints": [],
         "seen_sessions": len(run.get("seen_game_ids") or set()),
         "completed_sessions": len(run.get("finished_game_ids") or set()),
+        "defaults": _load_training_defaults(),
         "monitoring": {
-            "resume_model_path": (run.get("training") or {}).get("resume_model_path"),
-            "resume_load_status": (run.get("training") or {}).get("resume_load_status"),
-            "resume_failure_reason": (run.get("training") or {}).get("resume_failure_reason"),
+            "resume_model_path": training.get("resume_model_path"),
+            "resume_load_status": training.get("resume_load_status"),
+            "resume_failure_reason": training.get("resume_failure_reason"),
             "overlong_active_count": len(overlong_active),
             "overlong_active": overlong_active[:10],
             "suspicious_completed_count": len(suspicious_completed),
@@ -967,6 +1010,8 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
             "recent_incidents_count": len(recent_incidents),
             "recent_incidents": recent_incidents,
             "problem_list": problem_list,
+            "resources": resources,
+            "trend": trend,
             "watchdog_status": deepcopy(TELEMETRY_STATE.get("watchdog_status") or {}),
             "session_supervisor_status": deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {}),
         },
@@ -1121,9 +1166,14 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     )
     suspicious_completed = [item for item in suspicious_completed if item.get("suspicious")]
     overlong_active = [item for item in active_slots if "overlong_active" in (item.get("health_flags") or [])]
-    recent_incidents = _collect_recent_runtime_incidents()
+    recent_incidents = _filter_incidents_for_run(
+        _collect_recent_runtime_incidents(),
+        {"run_id": run_dir.name, "run_dir": str(run_dir), "training": training},
+    )
     active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
+    resources = _collect_resource_summary(training)
+    trend = _build_trend_summary(training, top_sessions)
 
     return {
         "updated_at": training.get("updated_at"),
@@ -1135,6 +1185,7 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         "checkpoints": checkpoints,
         "seen_sessions": len(history_by_job),
         "completed_sessions": sum(1 for item in history_by_job.values() if not item.get("active", False)),
+        "defaults": _load_training_defaults(),
         "monitoring": {
             "resume_model_path": training.get("resume_model_path"),
             "resume_load_status": training.get("resume_load_status"),
@@ -1146,6 +1197,8 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             "recent_incidents_count": len(recent_incidents),
             "recent_incidents": recent_incidents,
             "problem_list": problem_list,
+            "resources": resources,
+            "trend": trend,
             "watchdog_status": _read_json(WATCHDOG_STATUS_PATH),
             "session_supervisor_status": _read_json(SESSION_SUPERVISOR_STATUS_PATH),
         },
@@ -1272,13 +1325,37 @@ def _get_all_time_summary() -> dict[str, Any]:
     return payload
 
 
-def _control_path(run_dir: Path) -> Path:
-    return run_dir / "dashboard" / "control.json"
+def _set_runtime_control(run_id: str | None, command: str | None) -> None:
+    normalized_run_id = str(run_id or "").strip()
+    normalized_command = str(command or "").strip().lower()
+    with TELEMETRY_LOCK:
+        requests = dict(TELEMETRY_STATE.get("control_requests") or {})
+        if normalized_run_id:
+            if normalized_command:
+                requests[normalized_run_id] = {
+                    "run_id": normalized_run_id,
+                    "command": normalized_command,
+                    "updated_at": _now_iso(),
+                }
+            else:
+                requests.pop(normalized_run_id, None)
+        elif not normalized_command:
+            requests.clear()
+        TELEMETRY_STATE["control_requests"] = requests
 
 
-def _write_control(run_dir: Path, command: str) -> None:
-    payload = {"command": command}
-    _control_path(run_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def _get_runtime_control(run_id: str | None = None) -> dict[str, Any]:
+    normalized_run_id = str(run_id or "").strip()
+    with TELEMETRY_LOCK:
+        requests = TELEMETRY_STATE.get("control_requests") or {}
+        if normalized_run_id:
+            payload = requests.get(normalized_run_id) or {}
+            return deepcopy(payload) if isinstance(payload, dict) else {}
+        current_run_id = str(TELEMETRY_STATE.get("current_run_id") or "").strip()
+        if current_run_id:
+            payload = requests.get(current_run_id) or {}
+            return deepcopy(payload) if isinstance(payload, dict) else {}
+    return {}
 
 
 def _force_training_status(run_dir: Path, status: str) -> None:
@@ -1449,25 +1526,71 @@ def _find_python_process_ids(process_match: str) -> list[int]:
     needle = str(process_match or "").strip()
     if not needle:
         return []
-    escaped = needle.replace("\\", "\\\\").replace("'", "''")
+    normalized = needle.replace("\\", "/").lower()
+    if psutil is not None:
+        matches: list[int] = []
+        for process in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = str(process.info.get("name") or "").lower()
+                if name not in {"python.exe", "pythonw.exe"}:
+                    continue
+                cmdline = " ".join(str(part) for part in (process.info.get("cmdline") or []))
+                if normalized in cmdline.replace("\\", "/").lower():
+                    matches.append(int(process.info["pid"]))
+            except Exception:
+                continue
+        if matches:
+            return matches
+    matches: list[int] = []
+    for row in _windows_process_rows():
+        name = str(row.get("Name") or row.get("name") or "").lower()
+        if name not in {"python.exe", "pythonw.exe"}:
+            continue
+        command_line = str(row.get("CommandLine") or row.get("command_line") or "").replace("\\", "/").lower()
+        if normalized in command_line:
+            pid = _safe_int(row.get("ProcessId") or row.get("pid"), 0)
+            if pid > 0:
+                matches.append(pid)
+    return matches
+
+
+def _windows_process_rows(*, force_refresh: bool = False) -> list[dict[str, Any]]:
+    if not force_refresh:
+        with WINDOWS_PROCESS_CACHE_LOCK:
+            cached_rows = WINDOWS_PROCESS_CACHE.get("rows")
+            cached_at = float(WINDOWS_PROCESS_CACHE.get("generated_at") or 0.0)
+        if isinstance(cached_rows, list) and cached_rows and (time.time() - cached_at) < WINDOWS_PROCESS_CACHE_TTL_SECONDS:
+            return cached_rows
     try:
-        output = subprocess.check_output(
+        raw = subprocess.check_output(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" | "
-                f"Where-Object {{ $_.CommandLine -and $_.CommandLine -match '{escaped}' }} | "
-                "ForEach-Object { $_.ProcessId }",
+                "Get-CimInstance Win32_Process | "
+                "Select-Object ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize,PageFileUsage,ThreadCount | "
+                "ConvertTo-Json -Depth 3 -Compress",
             ],
             text=True,
             cwd=str(ROOT),
-            timeout=12,
+            timeout=15,
             **_windows_process_kwargs(),
         )
     except Exception:
         return []
-    return [int(line.strip()) for line in output.splitlines() if line.strip().isdigit()]
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        rows = [parsed]
+    elif isinstance(parsed, list):
+        rows = [row for row in parsed if isinstance(row, dict)]
+    with WINDOWS_PROCESS_CACHE_LOCK:
+        WINDOWS_PROCESS_CACHE["generated_at"] = time.time()
+        WINDOWS_PROCESS_CACHE["rows"] = rows
+    return rows
 
 
 def _find_training_process_ids() -> list[int]:
@@ -1482,7 +1605,21 @@ def _find_service_process_ids() -> list[int]:
     if pid is not None:
         return [pid]
     service = _service_config()
-    return _find_python_process_ids(str(service.get("process_match") or "http_game_service.py"))
+    candidates: list[int] = []
+    seen: set[int] = set()
+    patterns = [
+        str(service.get("process_match") or "").strip(),
+        Path(str(service.get("script") or "")).name.strip(),
+        "http_game_service.py",
+    ]
+    for pattern in patterns:
+        if not pattern:
+            continue
+        for current_pid in _find_python_process_ids(pattern):
+            if current_pid not in seen:
+                seen.add(current_pid)
+                candidates.append(current_pid)
+    return candidates
 
 
 def _terminate_processes(pids: list[int]) -> list[int]:
@@ -1722,14 +1859,185 @@ def _launcher_log_paths() -> dict[str, Path]:
 
 
 def _collect_launcher_logs(max_lines: int = 30) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for name, path in _launcher_log_paths().items():
-        payload[name] = {
-            "path": str(path),
-            "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else None,
-            "tail": _read_log_tail(path, max_lines=max_lines),
+    _ = max_lines
+    return deepcopy(TELEMETRY_STATE.get("launcher_logs") or {})
+
+
+def _process_resource_stats(pid: int, windows_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if pid <= 0:
+        return {}
+    if psutil is not None:
+        try:
+            process = psutil.Process(pid)
+            mem = process.memory_info()
+            private_value = getattr(mem, "private", None)
+            if private_value is None:
+                private_value = getattr(mem, "vms", 0)
+            return {
+                "pid": pid,
+                "name": process.name(),
+                "working_set_mb": round(float(getattr(mem, "rss", 0)) / (1024 * 1024), 1),
+                "private_mb": round(float(private_value) / (1024 * 1024), 1),
+                "threads": int(process.num_threads()),
+            }
+        except Exception:
+            pass
+    rows = windows_rows if isinstance(windows_rows, list) else _windows_process_rows()
+    for row in rows:
+        row_pid = _safe_int(row.get("ProcessId") or row.get("pid"), 0)
+        if row_pid != pid:
+            continue
+        working_set = float(_safe_int(row.get("WorkingSetSize"), 0)) / (1024 * 1024)
+        private_mb = float(_safe_int(row.get("PageFileUsage"), 0)) / 1024.0
+        return {
+            "pid": pid,
+            "name": str(row.get("Name") or row.get("name") or ""),
+            "working_set_mb": round(working_set, 1),
+            "private_mb": round(private_mb, 1),
+            "threads": _safe_int(row.get("ThreadCount"), 0),
         }
-    return payload
+    return {}
+
+
+def _collect_resource_summary(training: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "training": {},
+        "dashboard": {},
+        "service": {},
+        "service_workers": {},
+        "top_level_working_set_mb": 0.0,
+        "top_level_private_mb": 0.0,
+        "top_level_process_count": 0,
+        "total_working_set_mb": 0.0,
+        "total_private_mb": 0.0,
+    }
+
+    windows_rows = _windows_process_rows() if psutil is None else None
+
+    training_pid = _safe_int(training.get("process_pid"), 0)
+    if training_pid <= 0:
+        training_pids = _find_training_process_ids()
+        training_pid = training_pids[0] if training_pids else 0
+    training_stats = _process_resource_stats(training_pid, windows_rows=windows_rows)
+    if not training_stats:
+        fallback_training = {
+            "pid": _safe_int(training.get("process_pid"), 0),
+            "working_set_mb": float(training.get("memory_working_set_mb") or 0.0),
+            "private_mb": float(training.get("memory_private_mb") or 0.0),
+            "threads": _safe_int(training.get("thread_count"), 0),
+        }
+        if fallback_training["pid"] > 0 or fallback_training["working_set_mb"] > 0:
+            training_stats = fallback_training
+    if training_stats:
+        summary["training"] = training_stats
+
+    dashboard_pids = _managed_process_ids("dashboard")
+    dashboard_stats = _process_resource_stats(dashboard_pids[0], windows_rows=windows_rows) if dashboard_pids else {}
+    if dashboard_stats:
+        summary["dashboard"] = dashboard_stats
+
+    service_pids = _find_service_process_ids()
+    service_stats = _process_resource_stats(service_pids[0], windows_rows=windows_rows) if service_pids else {}
+    if service_stats:
+        summary["service"] = service_stats
+
+    worker_count = 0
+    worker_working_set = 0.0
+    worker_private = 0.0
+    if psutil and service_pids:
+        try:
+            service_process = psutil.Process(service_pids[0])
+            for child in service_process.children(recursive=True):
+                if child.name().lower() != "dotnet.exe":
+                    continue
+                worker_count += 1
+                mem = child.memory_info()
+                worker_working_set += float(getattr(mem, "rss", 0)) / (1024 * 1024)
+                private_value = getattr(mem, "private", None)
+                if private_value is None:
+                    private_value = getattr(mem, "vms", 0)
+                worker_private += float(private_value) / (1024 * 1024)
+        except Exception:
+            pass
+    elif service_pids:
+        rows = windows_rows if isinstance(windows_rows, list) else _windows_process_rows()
+        by_parent: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            parent_pid = _safe_int(row.get("ParentProcessId"), 0)
+            by_parent.setdefault(parent_pid, []).append(row)
+        pending = [service_pids[0]]
+        seen_pids: set[int] = set()
+        while pending:
+            parent_pid = pending.pop()
+            for row in by_parent.get(parent_pid, []):
+                child_pid = _safe_int(row.get("ProcessId"), 0)
+                if child_pid <= 0 or child_pid in seen_pids:
+                    continue
+                seen_pids.add(child_pid)
+                pending.append(child_pid)
+                name = str(row.get("Name") or "").lower()
+                if name != "dotnet.exe":
+                    continue
+                worker_count += 1
+                worker_working_set += float(_safe_int(row.get("WorkingSetSize"), 0)) / (1024 * 1024)
+                worker_private += float(_safe_int(row.get("PageFileUsage"), 0)) / 1024.0
+    summary["service_workers"] = {
+        "count": worker_count,
+        "working_set_mb": round(worker_working_set, 1),
+        "private_mb": round(worker_private, 1),
+    }
+
+    top_level_process_count = 0
+    for section in ("training", "dashboard", "service"):
+        stats = summary.get(section) or {}
+        if stats:
+            top_level_process_count += 1
+        summary["total_working_set_mb"] += float(stats.get("working_set_mb") or 0.0)
+        summary["total_private_mb"] += float(stats.get("private_mb") or 0.0)
+    summary["top_level_working_set_mb"] = round(summary["total_working_set_mb"], 1)
+    summary["top_level_private_mb"] = round(summary["total_private_mb"], 1)
+    summary["top_level_process_count"] = top_level_process_count
+    summary["total_working_set_mb"] = round(summary["total_working_set_mb"] + worker_working_set, 1)
+    summary["total_private_mb"] = round(summary["total_private_mb"] + worker_private, 1)
+    return summary
+
+
+def _trend_window(rows: list[dict[str, Any]], start: int, size: int) -> list[dict[str, Any]]:
+    return rows[start:start + size]
+
+
+def _trend_mean(rows: list[dict[str, Any]], key: str) -> float:
+    values = [_safe_float(item.get(key)) for item in rows]
+    clean = [value for value in values if value is not None]
+    return round(sum(clean) / len(clean), 2) if clean else 0.0
+
+
+def _build_trend_summary(training: dict[str, Any], top_sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [dict(item) for item in top_sessions if isinstance(item, dict)]
+    rows.sort(key=lambda item: str(item.get("finished_at") or item.get("recorded_at") or ""), reverse=True)
+    recent = _trend_window(rows, 0, 12)
+    previous = _trend_window(rows, 12, 12)
+    recent_floor = _trend_mean(recent, "max_floor")
+    previous_floor = _trend_mean(previous, "max_floor")
+    recent_reward = _trend_mean(recent, "episode_reward")
+    previous_reward = _trend_mean(previous, "episode_reward")
+    floor_delta = round(recent_floor - previous_floor, 2)
+    reward_delta = round(recent_reward - previous_reward, 2)
+    degrading = bool(previous and ((floor_delta <= -2.0) or (reward_delta <= -25.0)))
+    recommend_discard = degrading and str(training.get("resume_load_status") or "") == "resumed"
+    return {
+        "recent_count": len(recent),
+        "previous_count": len(previous),
+        "recent_floor_mean": recent_floor,
+        "previous_floor_mean": previous_floor,
+        "recent_reward_mean": recent_reward,
+        "previous_reward_mean": previous_reward,
+        "floor_delta": floor_delta,
+        "reward_delta": reward_delta,
+        "degrading": degrading,
+        "recommend_discard_history": recommend_discard,
+        "resume_model_path": training.get("resume_model_path"),
+    }
 
 
 def _collect_recent_runtime_incidents(max_items: int = 12) -> list[dict[str, Any]]:
@@ -1755,6 +2063,37 @@ def _collect_recent_runtime_incidents(max_items: int = 12) -> list[dict[str, Any
             rows.append(row)
     rows.sort(key=lambda item: str(item.get("recorded_at") or item.get("file_updated_at") or ""), reverse=True)
     return rows[:max_items]
+
+
+def _run_start_iso(run: dict[str, Any]) -> str:
+    training = run.get("training") or {}
+    run_id = str(training.get("run_id") or run.get("run_id") or "")
+    if run_id:
+        try:
+            return datetime.strptime(run_id, "%Y%m%d_%H%M%S").isoformat(timespec="seconds")
+        except ValueError:
+            pass
+    return str(training.get("updated_at") or run.get("updated_at") or "")
+
+
+def _filter_incidents_for_run(rows: list[dict[str, Any]], run: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(run, dict):
+        return [dict(item) for item in rows if isinstance(item, dict)]
+    training = run.get("training") or {}
+    run_id = str(training.get("run_id") or run.get("run_id") or "")
+    run_start_iso = _run_start_iso(run)
+    filtered: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        incident_run_id = str(item.get("run_id") or "")
+        recorded_at = str(item.get("recorded_at") or item.get("file_updated_at") or "")
+        if run_id and incident_run_id and incident_run_id != run_id:
+            continue
+        if run_start_iso and recorded_at and recorded_at < run_start_iso:
+            continue
+        filtered.append(dict(item))
+    return filtered
 
 
 def _incident_time(value: Any) -> str:
@@ -1880,15 +2219,34 @@ def _parse_num_envs(raw: Any) -> int | None:
     return value if 1 <= value <= 64 else None
 
 
-def _start_training_process(total_timesteps: int | None = None, num_envs: int | None = None) -> dict[str, Any]:
+def _parse_vec_env(raw: Any) -> str | None:
+    if raw in (None, ""):
+        return None
+    value = str(raw).strip().lower()
+    return value if value in {"dummy", "subproc", "threaded"} else None
+
+
+def _start_training_process(
+    total_timesteps: int | None = None,
+    num_envs: int | None = None,
+    vec_env: str | None = None,
+) -> dict[str, Any]:
+    defaults = _load_training_defaults()
+    if total_timesteps is None:
+        total_timesteps = _safe_int(defaults.get("total_timesteps"), 1_000_000)
+    if num_envs is None:
+        num_envs = _safe_int(defaults.get("num_envs"), 20)
+    if not vec_env:
+        vec_env = str(defaults.get("vec_env") or "threaded")
     active_run_dir = _active_run_dir()
     existing_pids = _find_training_process_ids()
     live_service_games = _service_game_rows()
-    if active_run_dir is not None and (existing_pids or live_service_games):
+    if active_run_dir is not None and existing_pids:
         return {"ok": False, "message": "training already running", "run_dir": str(active_run_dir), "pids": existing_pids}
-    if active_run_dir is not None and not existing_pids and not live_service_games:
+    if active_run_dir is not None and not existing_pids:
         _force_training_status(active_run_dir, "stopped")
         _telemetry_mark_run_idle(run_dir=str(active_run_dir), clear_slots=True)
+        _set_runtime_control(active_run_dir.name, None)
     if existing_pids:
         status = _latest_training_status()
         if status in {"finished", "stopped", "idle", "error", ""}:
@@ -1944,6 +2302,8 @@ def _start_training_process(total_timesteps: int | None = None, num_envs: int | 
         args.extend(["--timesteps", str(int(total_timesteps))])
     if num_envs is not None:
         args.extend(["--num-envs", str(int(num_envs))])
+    if vec_env:
+        args.extend(["--vec-env", vec_env])
     env = os.environ.copy()
     for key, value in (client.get("env") or {}).items():
         env[str(key)] = str(value)
@@ -1952,6 +2312,7 @@ def _start_training_process(total_timesteps: int | None = None, num_envs: int | 
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / "client.out.log"
     stderr_path = log_dir / "client.err.log"
+    _set_runtime_control(None, None)
     with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
         process = subprocess.Popen(
             [_node_python_executable(client), *args],
@@ -2006,11 +2367,12 @@ def _stop_training_process() -> dict[str, Any]:
         return {"ok": False, "message": "no active training"}
 
     if run_dir is not None:
-        _write_control(run_dir, "stop")
+        _set_runtime_control(run_dir.name, "stop")
     else:
         latest_run = _latest_run_dir()
         if latest_run is not None:
             _force_training_status(latest_run, "stopped")
+            _set_runtime_control(latest_run.name, None)
 
     remaining = _wait_for_training_exit(timeout_seconds=8.0, poll_interval_seconds=0.5)
     forced = False
@@ -2026,6 +2388,7 @@ def _stop_training_process() -> dict[str, Any]:
     if idle_target is not None:
         _force_training_status(idle_target, "stopped")
         _telemetry_mark_run_idle(run_dir=str(idle_target), clear_slots=True)
+        _set_runtime_control(idle_target.name, None)
     stop_ok = not remaining and all(not item.get("remaining_pids") for item in stack_stop.values() if isinstance(item, dict) and "remaining_pids" in item)
     return {
         "ok": stop_ok,
@@ -2075,7 +2438,15 @@ def _ensure_telemetry_bootstrapped() -> None:
         if TELEMETRY_STATE.get("bootstrapped"):
             return
         cached_all_time = _read_json(ALL_TIME_SUMMARY_PATH)
-        TELEMETRY_STATE["historical_best"] = _collect_historical_best()
+        historical_best: list[dict[str, Any]] = []
+        try:
+            # One-time bootstrap scan: load global historical best into memory.
+            loaded = _collect_historical_best()
+            if isinstance(loaded, list):
+                historical_best = [dict(row) for row in loaded if isinstance(row, dict)]
+        except Exception:
+            historical_best = []
+        TELEMETRY_STATE["historical_best"] = historical_best
         TELEMETRY_STATE["all_time_summary"] = cached_all_time if isinstance(cached_all_time, dict) and cached_all_time else {
             "updated_at": _now_iso(),
             "run_count": 0,
@@ -2085,10 +2456,10 @@ def _ensure_telemetry_bootstrapped() -> None:
             "best_floor": 0,
             "avg_reward_finished": None,
         }
-        TELEMETRY_STATE["watchdog_status"] = _read_json(WATCHDOG_STATUS_PATH)
-        TELEMETRY_STATE["session_supervisor_status"] = _read_json(SESSION_SUPERVISOR_STATUS_PATH)
-        TELEMETRY_STATE["recent_incidents"] = _collect_recent_runtime_incidents()
-        TELEMETRY_STATE["launcher_logs"] = _collect_launcher_logs(max_lines=20)
+        TELEMETRY_STATE["watchdog_status"] = {}
+        TELEMETRY_STATE["session_supervisor_status"] = {}
+        TELEMETRY_STATE["recent_incidents"] = []
+        TELEMETRY_STATE["launcher_logs"] = {}
         current_run = _telemetry_current_run(require_active=False)
         TELEMETRY_STATE["current_run_id"] = current_run.get("run_id") if current_run is not None else None
         TELEMETRY_STATE["bootstrapped"] = True
@@ -2150,21 +2521,19 @@ def _telemetry_ingest_session(payload: dict[str, Any]) -> None:
         if run is None:
             return
         summary = dict(payload.get("summary") or {})
-        details = dict(payload.get("details") or {})
+        details = _compact_session_details_for_memory(dict(payload.get("details") or {}))
         leaderboard = dict(payload.get("leaderboard") or {})
         game_id = str(summary.get("game_id") or "")
         if game_id:
             run["seen_game_ids"].add(game_id)
             run["finished_game_ids"].add(game_id)
             run["session_details"][game_id] = details
-            while len(run["session_details"]) > 200:
-                oldest_key = next(iter(run["session_details"].keys()))
-                run["session_details"].pop(oldest_key, None)
         if leaderboard.get("ranked"):
             summary["details_available"] = True
         top_rows = [row for row in (run.get("top_sessions") or []) if row.get("game_id") != game_id]
         top_rows.append(summary)
         run["top_sessions"] = _telemetry_sort_top(top_rows)
+        _prune_session_details(run)
         _telemetry_update_historical_best(summary, run)
         _telemetry_update_all_time(summary, run)
         TELEMETRY_STATE["current_run_id"] = run.get("run_id")
@@ -2193,6 +2562,21 @@ def _telemetry_ingest_runtime_status(payload: dict[str, Any], source: str) -> No
     _invalidate_snapshot_cache()
 
 
+def _telemetry_ingest_runtime_log(payload: dict[str, Any], source: str) -> None:
+    _ensure_telemetry_bootstrapped()
+    with TELEMETRY_LOCK:
+        logs = dict(TELEMETRY_STATE.get("launcher_logs") or {})
+        channel = str(payload.get("channel") or source or "runtime")
+        logs[channel] = {
+            "source": source,
+            "updated_at": str(payload.get("updated_at") or _now_iso()),
+            "tail": str(payload.get("tail") or ""),
+            "path": str(payload.get("path") or ""),
+        }
+        TELEMETRY_STATE["launcher_logs"] = logs
+    _invalidate_snapshot_cache()
+
+
 def _build_snapshot_payload() -> dict[str, Any]:
     _ensure_telemetry_bootstrapped()
     with TELEMETRY_LOCK:
@@ -2205,6 +2589,7 @@ def _build_snapshot_payload() -> dict[str, Any]:
         session_supervisor_status = deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {})
     if memory_run is None:
         problem_list = _build_problem_list(recent_incidents, [], active_game_ids=set(), runtime_healthy=False)
+        defaults = _load_training_defaults()
         return {
             "updated_at": None,
             "run_dir": None,
@@ -2213,6 +2598,7 @@ def _build_snapshot_payload() -> dict[str, Any]:
             "top_sessions": [],
             "seen_sessions": 0,
             "completed_sessions": 0,
+            "defaults": defaults,
             "monitoring": {
                 "resume_model_path": None,
                 "resume_load_status": None,
@@ -2224,6 +2610,8 @@ def _build_snapshot_payload() -> dict[str, Any]:
                 "recent_incidents_count": len(recent_incidents),
                 "recent_incidents": recent_incidents,
                 "problem_list": problem_list,
+                "resources": {},
+                "trend": {},
                 "watchdog_status": watchdog_status,
                 "session_supervisor_status": session_supervisor_status,
             },
@@ -2325,1009 +2713,11 @@ def collect_snapshot() -> dict[str, Any]:
     return _refresh_snapshot_cache_once()
 
 
-HTML = """<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>STS2 RL Dashboard</title>
-  <link rel="icon" href="/favicon.ico" sizes="any">
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg:#171a1f;
-      --bg-2:#1d2127;
-      --panel:#23272f;
-      --panel-strong:#2a2f38;
-      --line:#3a414d;
-      --line-soft:#303641;
-      --text:#edf2f7;
-      --muted:#9aa5b4;
-      --accent:#7fb9ff;
-      --accent-soft:rgba(127,185,255,0.16);
-      --good:#6cc08b;
-      --warn:#e1b15a;
-      --danger:#de7373;
-      --shadow:0 14px 34px rgba(0,0,0,0.32);
-    }
-    body { margin:0; font:14px/1.4 "Segoe UI", "PingFang SC", sans-serif; background:linear-gradient(180deg,var(--bg),var(--bg-2)); color:var(--text); }
-    .wrap { max-width:1500px; margin:0 auto; padding:24px; }
-    h1 { margin:0 0 16px; font-size:30px; letter-spacing:.01em; }
-    h2 { margin:20px 0 10px; font-size:18px; color:var(--text); }
-    .meta { color:var(--muted); margin-bottom:16px; }
-    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
-    .card { background:linear-gradient(180deg,var(--panel-strong),var(--panel)); border:1px solid var(--line); border-radius:16px; padding:14px 16px; box-shadow:var(--shadow); }
-    .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-    .value { font-size:28px; font-weight:800; margin-top:6px; color:var(--accent); }
-    .sub { color:var(--muted); margin-top:4px; }
-    .muted { color:var(--muted); }
-    table { width:100%; border-collapse:collapse; background:linear-gradient(180deg,var(--panel-strong),var(--panel)); border:1px solid var(--line); border-radius:16px; overflow:hidden; box-shadow:var(--shadow); }
-    th, td { padding:10px 12px; border-bottom:1px solid var(--line-soft); text-align:left; white-space:nowrap; }
-    th { background:#262b33; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
-    tr:last-child td { border-bottom:none; }
-    tr:hover td { background:rgba(127,185,255,0.08); }
-    .mono { font-family:Consolas, monospace; font-size:12px; }
-    .metric-strong { color:var(--accent); font-weight:800; }
-    .metric-good { color:var(--good); font-weight:700; }
-    .metric-warn { color:var(--warn); font-weight:700; }
-    .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-weight:700; }
-    .room { font-weight:700; color:#d6e6f8; }
-    .clickable-row { cursor:pointer; }
-    .detail-shell { margin-top:14px; }
-    .detail-grid { display:grid; grid-template-columns:1.1fr 1.5fr 1fr; gap:14px; align-items:start; }
-    .summary-list { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px 14px; margin-top:10px; }
-    .summary-item { padding:10px 12px; border:1px solid var(--line-soft); border-radius:12px; background:rgba(255,255,255,0.03); }
-    .summary-item strong { display:block; font-size:18px; color:var(--accent); margin-top:3px; }
-    .summary-item strong.compact-text { font-size:14px; line-height:1.35; word-break:break-all; }
-    .map-card { min-height:500px; }
-    .map-toolbar, .control-row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 12px; }
-    .map-tab, .control-btn { border:1px solid var(--line); background:var(--panel-strong); color:var(--text); border-radius:999px; padding:6px 12px; cursor:pointer; }
-    .map-tab.active, .control-btn.primary { background:var(--accent-soft); color:var(--accent); border-color:rgba(47,128,237,0.35); }
-    .control-btn.good { background:rgba(62,143,99,0.12); color:var(--good); border-color:rgba(62,143,99,0.3); }
-    .control-btn.warn { background:rgba(208,138,47,0.12); color:var(--warn); border-color:rgba(208,138,47,0.3); }
-    .control-btn.danger { background:rgba(199,81,81,0.12); color:var(--danger); border-color:rgba(199,81,81,0.3); }
-    .tree-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:16px; background:linear-gradient(180deg, #435979, #242930); padding:10px; }
-    .node-detail-empty { padding:24px; color:var(--muted); }
-    .node-button { cursor:pointer; }
-    .node-button text { pointer-events:none; font-weight:700; font-size:13px; }
-    .node-button.active { filter: drop-shadow(0 0 6px rgba(62,143,99,0.24)); }
-    .node-stats { margin-top:10px; display:grid; gap:10px; }
-    .node-block { border:1px solid var(--line-soft); border-radius:12px; padding:10px 12px; background:rgba(255,255,255,0.03); }
-    .action-log { max-height:260px; overflow:auto; margin-top:8px; border:1px solid var(--line-soft); border-radius:12px; background:rgba(0,0,0,0.12); }
-    .action-row { padding:8px 10px; border-bottom:1px solid var(--line-soft); }
-    .action-row:last-child { border-bottom:none; }
-    .reward-tag { display:inline-flex; margin:4px 6px 0 0; padding:4px 8px; border-radius:999px; background:rgba(127,185,255,0.12); color:var(--accent); }
-    .slot-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
-    .alerts { display:grid; gap:10px; margin-bottom:16px; }
-    .alert { border:1px solid var(--line); border-radius:14px; padding:12px 14px; box-shadow:var(--shadow); }
-    .alert.info { background:rgba(47,128,237,0.12); border-color:rgba(47,128,237,0.3); }
-    .alert.warn { background:rgba(208,138,47,0.12); border-color:rgba(208,138,47,0.3); }
-    .alert.danger { background:rgba(199,81,81,0.14); border-color:rgba(199,81,81,0.34); }
-    .alert-title { font-weight:800; margin-bottom:6px; }
-    .alert-body { white-space:pre-wrap; word-break:break-word; }
-    .alert pre { margin:10px 0 0; padding:10px 12px; background:rgba(0,0,0,0.18); border:1px solid var(--line-soft); border-radius:12px; overflow:auto; white-space:pre-wrap; }
-    .alert-tools { display:flex; justify-content:flex-end; margin-top:8px; }
-    .alert-toggle { border:1px solid var(--line); background:var(--panel-strong); color:var(--text); border-radius:999px; padding:3px 10px; cursor:pointer; font-size:12px; }
-    .alert-toggle:hover { border-color:var(--accent); color:var(--accent); }
-    .problem-shell { margin:12px 0 18px; display:flex; flex-direction:column; gap:10px; }
-    .problem-item { border:1px solid var(--line); border-radius:14px; background:var(--panel); }
-    .problem-item summary { cursor:pointer; list-style:none; padding:12px 14px; display:flex; justify-content:space-between; gap:12px; align-items:center; font-weight:700; }
-    .problem-item summary::-webkit-details-marker { display:none; }
-    .problem-item[open] summary { border-bottom:1px solid var(--line-soft); }
-    .problem-title { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-    .problem-meta { color:var(--muted); font-size:12px; white-space:nowrap; }
-    .problem-body { padding:12px 14px 14px; display:grid; gap:10px; }
-    .problem-grid { display:grid; grid-template-columns:160px 1fr; gap:8px 12px; }
-    .problem-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0.08em; }
-    .problem-value { color:var(--text); word-break:break-word; }
-    .problem-source-list { margin:0; padding-left:18px; color:var(--muted); }
-    @media (max-width: 1100px) {
-      .grid { grid-template-columns:repeat(2,1fr); }
-      .detail-grid { grid-template-columns:1fr; }
-      .slot-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 760px) {
-      .wrap { padding:16px; }
-      .grid { grid-template-columns:1fr; }
-      h1 { font-size:24px; }
-      .value { font-size:24px; }
-      table { display:block; overflow:auto; }
-      .slot-grid { grid-template-columns:1fr; }
-    }
-    svg polyline { stroke-linecap:round; stroke-linejoin:round; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>STS2 RL Dashboard</h1>
-    <div class="meta" id="meta">loading...</div>
-    <div class="alerts" id="alerts"></div>
-    <div id="problemList"></div>
-    <div class="control-row" id="controls"></div>
-    <div class="grid" id="cards"></div>
-    <h2>Active Slots</h2>
-    <table id="activeTable"></table>
-    <h2>Slot History</h2>
-    <div id="slotCharts"></div>
-    <h2>Checkpoints</h2>
-    <table id="checkpointTable"></table>
-    <h2>Current Run Top 50</h2>
-    <table id="topTable"></table>
-    <div class="detail-shell" id="sessionDetail"></div>
-    <h2>Historical Best</h2>
-    <table id="historyTable"></table>
-  </div>
-  <script>
-    window.onerror = function(message, source, lineno, colno) {
-      const meta = document.getElementById('meta');
-      if (meta) meta.textContent = `JS error: ${message} @${lineno}:${colno}`;
-    };
-    window.onunhandledrejection = function(event) {
-      const meta = document.getElementById('meta');
-      const reason = event && event.reason ? (event.reason.message || String(event.reason)) : 'unknown rejection';
-      if (meta) meta.textContent = `Promise error: ${reason}`;
-    };
-    function fmt(v) { return v === null || v === undefined || v === '' ? '-' : v; }
-    function pct(v) { return (v ?? 0).toFixed(2) + '%'; }
-    function formatDateTime(value) {
-      if (!value) return '-';
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return String(value);
-      const pad = (n) => String(n).padStart(2, '0');
-      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-    }
-    function formatDuration(startedAt, finishedAt) {
-      if (!startedAt) return '-';
-      const start = new Date(startedAt);
-      const end = finishedAt ? new Date(finishedAt) : new Date();
-      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return '-';
-      const totalSeconds = Math.max(0, Math.round((end.getTime() - start.getTime()) / 1000));
-      const minutes = Math.floor(totalSeconds / 60);
-      const seconds = totalSeconds % 60;
-      return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
-    }
-    function inferEpisodeStart(row) {
-      if (row.started_at) return row.started_at;
-      const candidates = [row.game_id, row.seed];
-      for (const value of candidates) {
-        const text = String(value || '');
-        const match = text.match(/_(\d{13})(?:_|$)/) || text.match(/_(\d{10})(?:_|$)/);
-        if (!match) continue;
-        const raw = match[1];
-        const epochMs = raw.length === 13 ? Number(raw) : Number(raw) * 1000;
-        if (!Number.isFinite(epochMs)) continue;
-        return new Date(epochMs).toISOString();
-      }
-      return null;
-    }
-    function withTimeFields(rows) {
-      return (rows || []).map((row) => ({
-        ...row,
-        started_at_display: formatDateTime(row.started_at),
-        duration_display: formatDuration(row.started_at, row.finished_at),
-        final_hp_display: row.final_hp === null || row.final_hp === undefined
-          ? '-'
-          : `${row.final_hp} / ${fmt(row.max_hp)}`,
-        final_gold_display: fmt(row.final_gold),
-      }));
-    }
-    function escapeHtml(v) {
-      return String(v ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
-    }
-    let currentSession = null;
-    let currentSessionGameId = null;
-    let currentAct = null;
-    let currentNodeId = null;
-    let currentNodeStageIndex = 0;
-    let currentRunDir = null;
-    let activeAlerts = [];
-    let alertCounter = 0;
-    let alertExpansionState = {};
-    let controlsInitialized = false;
-    function positiveIntegerText(value, fallbackValue) {
-      const numeric = Number(value);
-      if (Number.isFinite(numeric) && numeric > 0) {
-        return String(Math.trunc(numeric));
-      }
-      return String(fallbackValue);
-    }
-    function kpi(value, cls='metric-strong') {
-      return `<span class="${cls}">${fmt(value)}</span>`;
-    }
-    function pushAlert(title, body, level='danger', details='', source='request') {
-      const key = JSON.stringify([title || '', body || '', level || '', details || '', source || '']);
-      if (activeAlerts.some((item) => JSON.stringify([item.title || '', item.body || '', item.level || '', item.details || '', item.source || '']) === key)) {
-        return;
-      }
-      const expanded = Boolean(alertExpansionState[key]);
-      activeAlerts.push({ id: `alert-${alertCounter++}`, key, title, body, level, details, source, expanded });
-      renderAlerts();
-    }
-    function clearAlerts() {
-      activeAlerts = [];
-      renderAlerts();
-    }
-    function clearStateAlerts() {
-      activeAlerts = activeAlerts.filter((item) => item.source !== 'state');
-      renderAlerts();
-    }
-    function renderAlerts() {
-      const shell = document.getElementById('alerts');
-      if (!activeAlerts.length) {
-        shell.innerHTML = '';
-        return;
-      }
-      shell.innerHTML = activeAlerts.map((item) => `
-        <div class="alert ${escapeHtml(item.level || 'danger')}">
-          <div class="alert-title">${escapeHtml(item.title || 'Error')}</div>
-          <div class="alert-body">${escapeHtml(item.body || '')}</div>
-          ${item.details ? `
-            <div class="alert-tools">
-              <button class="alert-toggle" type="button" data-alert-id="${escapeHtml(item.id)}">
-                ${item.expanded ? 'Hide logs' : 'Show logs'}
-              </button>
-            </div>
-            ${item.expanded ? `<pre>${escapeHtml(item.details)}</pre>` : ''}
-          ` : ''}
-        </div>
-      `).join('');
-      Array.from(document.querySelectorAll('.alert-toggle')).forEach((button) => {
-        button.addEventListener('click', () => {
-          const alertId = button.dataset.alertId;
-          activeAlerts = activeAlerts.map((item) => {
-            if (item.id !== alertId) return item;
-            const expanded = !item.expanded;
-            if (item.key) {
-              alertExpansionState[item.key] = expanded;
-            }
-            return { ...item, expanded };
-          });
-          renderAlerts();
-        });
-      });
-    }
-    function buildErrorFromResponse(status, payload) {
-      const error = new Error(payload?.message || `Request failed: HTTP ${status}`);
-      error.status = status;
-      error.payload = payload || {};
-      return error;
-    }
-    async function postJson(url, payload) {
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload || {}),
-      });
-      let data = {};
-      try {
-        data = await resp.json();
-      } catch (_err) {
-        data = {};
-      }
-      if (!resp.ok || data?.ok === false) {
-        throw buildErrorFromResponse(resp.status, data);
-      }
-      return data;
-    }
-    function extractLogTail(payload) {
-      return payload?.launcher_logs?.client_stderr?.tail
-        || payload?.launcher_logs?.dashboard_stderr?.tail
-        || payload?.stderr_tail
-        || '';
-    }
-    function showRequestError(actionLabel, err) {
-      const payload = err?.payload || {};
-      const details = extractLogTail(payload);
-      pushAlert(
-        `${actionLabel} failed`,
-        payload?.message || err?.message || 'unknown error',
-        'danger',
-        details,
-      );
-    }
-    function renderControls(training) {
-      const status = training?.status || 'idle';
-      const running = status === 'running';
-      const stopping = status === 'stopping';
-      const timestepsValue = positiveIntegerText(training?.total_timesteps, 1000000);
-      const numEnvsValue = positiveIntegerText(training?.num_envs, 4);
-      const mainButton = (running || stopping)
-        ? `<button id="trainingMainAction" class="control-btn danger" ${stopping ? 'disabled' : ''}>Stop</button>`
-        : `<button id="trainingMainAction" class="control-btn primary">Start</button>`;
-      return [
-        `<label class="pill">steps <input id="totalTimestepsInput" type="number" min="1" step="1" value="${escapeHtml(timestepsValue)}" ${running || stopping ? 'disabled' : ''} style="width:120px;margin-left:8px;background:#18202a;color:#f6f8fb;border:1px solid #2b3540;border-radius:8px;padding:6px 8px;"></label>`,
-        `<label class="pill">threads <input id="numEnvsInput" type="number" min="1" max="64" step="1" value="${escapeHtml(numEnvsValue)}" ${running || stopping ? 'disabled' : ''} style="width:72px;margin-left:8px;background:#18202a;color:#f6f8fb;border:1px solid #2b3540;border-radius:8px;padding:6px 8px;"></label>`,
-        mainButton,
-        `<span id="trainingStatusPill" class="pill">status: ${escapeHtml(status)}</span>`,
-      ].join('');
-    }
-    function syncControls(training) {
-      const shell = document.getElementById('controls');
-      if (!controlsInitialized || !document.getElementById('trainingMainAction')) {
-        shell.innerHTML = renderControls(training);
-        controlsInitialized = true;
-      }
-      const status = training?.status || 'idle';
-      const running = status === 'running';
-      const stopping = status === 'stopping';
-      const busy = running || stopping;
-      const totalTimestepsInput = document.getElementById('totalTimestepsInput');
-      const numEnvsInput = document.getElementById('numEnvsInput');
-      const mainAction = document.getElementById('trainingMainAction');
-      const statusPill = document.getElementById('trainingStatusPill');
-      const serverTimesteps = positiveIntegerText(training?.total_timesteps, 1000000);
-      const serverNumEnvs = positiveIntegerText(training?.num_envs, 4);
+def _load_dashboard_html() -> str:
+    return (ROOT / "scripts" / "training_dashboard_frontend.html").read_text(encoding="utf-8")
 
-      if (busy) {
-        totalTimestepsInput.value = serverTimesteps;
-        numEnvsInput.value = serverNumEnvs;
-      } else {
-        if (!String(totalTimestepsInput.value || '').trim()) {
-          totalTimestepsInput.value = serverTimesteps;
-        }
-        if (!String(numEnvsInput.value || '').trim()) {
-          numEnvsInput.value = serverNumEnvs;
-        }
-      }
 
-      totalTimestepsInput.disabled = busy;
-      numEnvsInput.disabled = busy;
-      statusPill.textContent = `status: ${status}`;
-      mainAction.textContent = busy ? 'Stop' : 'Start';
-      mainAction.disabled = stopping;
-      mainAction.className = busy ? 'control-btn danger' : 'control-btn primary';
-      mainAction.onclick = busy ? stopTraining : startTraining;
-    }
-    async function startTraining() {
-      clearAlerts();
-      const stepInput = document.getElementById('totalTimestepsInput');
-      const envInput = document.getElementById('numEnvsInput');
-      const totalTimesteps = stepInput ? Number(stepInput.value || 0) : 0;
-      const numEnvs = envInput ? Number(envInput.value || 0) : 0;
-      try {
-        const payload = {};
-        if (Number.isFinite(totalTimesteps) && totalTimesteps > 0) {
-          payload.total_timesteps = Math.trunc(totalTimesteps);
-        }
-        if (Number.isFinite(numEnvs) && numEnvs > 0) {
-          payload.num_envs = Math.trunc(numEnvs);
-        }
-        const result = await postJson('/api/control/start', payload);
-        if (result?.message) {
-          pushAlert('Start requested', result.message, 'info');
-        }
-      } catch (err) {
-        showRequestError('Start training', err);
-      }
-      await refresh();
-    }
-    async function stopTraining() {
-      clearAlerts();
-      try {
-        await postJson('/api/control/stop', {});
-      } catch (err) {
-        showRequestError('Stop training', err);
-      }
-      await refresh();
-    }
-    function renderStateAlerts(data) {
-      const clientErr = data?.launcher_logs?.client_stderr || {};
-      const training = data?.training || {};
-      const monitoring = data?.monitoring || {};
-      if ((training.status === 'idle' || training.status === 'error') && clientErr.tail) {
-        pushAlert(
-          'Training client error',
-          `status=${training.status} | log_updated_at=${fmt(clientErr.updated_at)}`,
-          training.status === 'error' ? 'danger' : 'warn',
-          clientErr.tail,
-          'state',
-        );
-      }
-      const overlongActive = monitoring?.overlong_active || [];
-      if (overlongActive.length) {
-        pushAlert(
-          'Overlong active slots',
-          overlongActive.map((item) => `slot=${fmt(item.slot)} seed=${fmt(item.seed)} uptime=${fmt(item.uptime_seconds)}s floor=${fmt(item.floor)} hp=${fmt(item.hp)}`).join('\\n'),
-          'warn',
-          '',
-          'state',
-        );
-      }
-      const suspiciousCompleted = monitoring?.suspicious_completed || [];
-      if (suspiciousCompleted.length) {
-        pushAlert(
-          'Suspicious completed runs',
-          suspiciousCompleted.map((item) => `seed=${fmt(item.seed)} flags=${fmt(item.flags_display)} floor=${fmt(item.max_floor)} hp=${fmt(item.final_hp ?? item.hp)} truncated=${fmt(item.truncated)} victory=${fmt(item.victory)}`).join('\\n'),
-          'danger',
-          '',
-          'state',
-        );
-      }
-      const recentIncidents = monitoring?.recent_incidents || [];
-      if (recentIncidents.length) {
-        pushAlert(
-          'Automation incidents',
-          recentIncidents.slice(0, 6).map((item) => `${fmt(item.source)} | ${fmt(item.type)} | seed=${fmt(item.seed)} | run=${fmt(item.run_id)} | resolution=${fmt(item.resolution_status || item.resolution_action || '-')}`).join('\\n'),
-          'warn',
-          '',
-          'state',
-        );
-      }
-    }
-    function renderProblemList(data) {
-      const shell = document.getElementById('problemList');
-      const problems = data?.monitoring?.problem_list || [];
-      if (!problems.length) {
-        shell.innerHTML = '';
-        return;
-      }
-      shell.innerHTML = `
-        <h2>Detected Issues</h2>
-        <div class="problem-shell">
-          ${problems.map((item, index) => `
-            <details class="problem-item" ${index === 0 ? 'open' : ''}>
-              <summary>
-                <span class="problem-title">
-                  <span>${escapeHtml(item.seed || item.game_id || 'unknown')}</span>
-                  <span class="pill">${escapeHtml(item.status || 'open')}</span>
-                </span>
-                <span class="problem-meta">${escapeHtml(item.run_id || '-')}</span>
-              </summary>
-              <div class="problem-body">
-                <div class="problem-grid">
-                  <div class="problem-label">Found At</div>
-                  <div class="problem-value">${escapeHtml(formatDateTime(item.discovered_at))}</div>
-                  <div class="problem-label">Resolved At</div>
-                  <div class="problem-value">${escapeHtml(formatDateTime(item.resolved_at))}</div>
-                  <div class="problem-label">Reason</div>
-                  <div class="problem-value">${escapeHtml(item.reason || '-')}</div>
-                </div>
-                <div>
-                  <div class="problem-label">Timeline</div>
-                  <ul class="problem-source-list">
-                    ${(item.sources || []).map((source) => `<li>${escapeHtml(source.source || '-')} | ${escapeHtml(source.type || '-')} | ${escapeHtml(formatDateTime(source.recorded_at))} | ${escapeHtml(source.reason || '-')} | ${escapeHtml(source.resolution_status || '-')}</li>`).join('')}
-                  </ul>
-                </div>
-              </div>
-            </details>
-          `).join('')}
-        </div>
-      `;
-    }
-    function renderCards(data) {
-      const t = data.training || {};
-      const allTime = data.all_time_summary || {};
-      const monitoring = data.monitoring || {};
-      const resumeStateMap = {
-        resumed: 'Resume',
-        fresh: 'Fresh',
-        fallback_fresh: 'Fallback Fresh',
-      };
-      const resumeStatus = resumeStateMap[t.resume_load_status] || fmt(t.resume_load_status);
-      const resumePath = t.resume_model_path
-        ? `<span class="mono">${escapeHtml(t.resume_model_path)}</span>`
-        : 'No previous checkpoint';
-      const resumeFailure = t.resume_failure_reason
-        ? ` | ${escapeHtml(t.resume_failure_reason)}`
-        : '';
-      const cards = [
-        ['Total Timesteps', kpi(t.total_timesteps), `Current ${kpi(t.current_timesteps)} | Progress ${kpi(pct(t.progress_pct || 0), 'metric-good')}`],
-        ['Parallelism', kpi(t.num_envs), `VecEnv <span class="pill">${fmt(t.vec_env)}</span> | FPS ${kpi(t.fps, 'metric-good')}`],
-        ['Jobs Seen', kpi(data.seen_sessions), `Completed ${kpi(data.completed_sessions, 'metric-good')} | Finished Episodes ${kpi(t.episodes_finished)}`],
-        ['All-Time Runs', kpi(allTime.runs_seen), `Finished ${kpi(allTime.runs_finished, 'metric-good')} | Best Floor ${kpi(allTime.best_floor, 'metric-good')}`],
-        ['Reward', kpi(t.mean_reward_100, 'metric-warn'), `Mean length 100 ${kpi(t.mean_length_100)}`],
-        ['Resume', kpi(resumeStatus, t.resume_load_status === 'fallback_fresh' ? 'metric-warn' : 'metric-good'), `${resumePath}${resumeFailure}`],
-        ['Health', kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}`],
-      ];
-      return cards.map(([label,value,sub]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`).join('');
-    }
-    function renderTable(el, columns, rows) {
-      const head = `<tr>${columns.map(c => `<th>${c.label}</th>`).join('')}</tr>`;
-      const body = rows.map(row => `<tr>${columns.map(c => `<td class="${c.className || ''}">${fmt(row[c.key])}</td>`).join('')}</tr>`).join('');
-      el.innerHTML = `<thead>${head}</thead><tbody>${body}</tbody>`;
-    }
-    function sparkline(values, color) {
-      if (!values.length) return '';
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const range = Math.max(1, max - min);
-      const pts = values.map((v, i) => {
-        const x = (i / Math.max(1, values.length - 1)) * 220;
-        const y = 50 - ((v - min) / range) * 44;
-        return `${x},${y}`;
-      }).join(' ');
-      return `<svg width="220" height="54" viewBox="0 0 220 54"><polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" /></svg>`;
-    }
-    function renderSlotCharts(slotHistories) {
-      const keys = Object.keys(slotHistories || {}).sort();
-      if (!keys.length) return '<div class="muted">No completed episode history yet.</div>';
-      return `<div class="slot-grid">${keys.map(key => {
-        const rows = slotHistories[key] || [];
-        const rewards = rows.map(r => Number(r.episode_reward || 0));
-        const floors = rows.map(r => Number(r.floor || 0));
-        const steps = rows.map(r => Number(r.episode_steps || 0));
-        return `<div class="card" style="margin-bottom:12px">
-          <div class="label">${key}</div>
-          <div class="sub">recent episodes: ${rows.length}</div>
-          <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px">
-            <div><div class="label">Reward</div>${sparkline(rewards, '#d08a2f')}</div>
-            <div><div class="label">Floor</div>${sparkline(floors, '#3e8f63')}</div>
-            <div><div class="label">Steps</div>${sparkline(steps, '#2f80ed')}</div>
-          </div>
-        </div>`;
-      }).join('')}</div>`;
-    }
-    function normalizeRoomType(roomType) {
-      const value = String(roomType || '').toLowerCase();
-      if (!value) return 'Unknown';
-      if (value === 'unknown') return 'Event';
-      if (value.includes('elite')) return 'Elite';
-      if (value.includes('monster')) return 'Monster';
-      if (value.includes('event')) return 'Event';
-      if (value.includes('rest') || value.includes('campfire') || value.includes('smith')) return 'Rest';
-      if (value.includes('shop') || value.includes('merchant') || value.includes('store')) return 'Shop';
-      if (value.includes('treasure') || value.includes('chest')) return 'Treasure';
-      if (value.includes('boss')) return 'Boss';
-      if (value.includes('startreward') || value.includes('neow') || value.includes('map')) return 'StartReward';
-      return roomType || 'Unknown';
-    }
-    function roomGlyph(roomType) {
-      const normalized = normalizeRoomType(roomType);
-      if (normalized === 'Monster') return 'M';
-      if (normalized === 'Elite') return 'E';
-      if (normalized === 'Event') return '?';
-      if (normalized === 'Rest') return 'R';
-      if (normalized === 'Shop') return '$';
-      if (normalized === 'Treasure') return 'T';
-      if (normalized === 'Boss') return 'B';
-      if (normalized === 'StartReward') return 'N';
-      return '路';
-    }
-    function roomClass(roomType) {
-      const normalized = normalizeRoomType(roomType);
-      if (normalized === 'Monster') return { fill: '#f8fbff', stroke: '#6f7f8f', text: '#2c3c4c' };
-      if (normalized === 'Elite') return { fill: '#fff3e6', stroke: '#d08a2f', text: '#9a5e12' };
-      if (normalized === 'Event') return { fill: '#f7f2ff', stroke: '#8b78d8', text: '#6147b8' };
-      if (normalized === 'Rest') return { fill: '#edf8ef', stroke: '#4c9c68', text: '#2b6d45' };
-      if (normalized === 'Shop') return { fill: '#eef8fb', stroke: '#4b99b7', text: '#2d6f88' };
-      if (normalized === 'Treasure') return { fill: '#fff8e8', stroke: '#c69a2d', text: '#8a6612' };
-      if (normalized === 'Boss') return { fill: '#ffeceb', stroke: '#c75151', text: '#973737' };
-      if (normalized === 'StartReward') return { fill: '#edf3ff', stroke: '#2f80ed', text: '#245ca7' };
-      return { fill: '#f2f5f8', stroke: '#8e99a6', text: '#62707e' };
-    }
-    function escapeId(value) {
-      return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-    }
-    function buildVisitedEdgeSet(activeMap) {
-      const set = new Set();
-      const nodeLookup = new Map(
-        (activeMap.nodes || [])
-          .filter(node => node && node.id && node.col !== null && node.row !== null)
-          .map(node => [node.id, node])
-      );
-      const orderedVisited = [];
-      for (const nodeId of (activeMap.visited_node_ids || [])) {
-        const node = nodeLookup.get(nodeId);
-        if (!node) continue;
-        const last = orderedVisited[orderedVisited.length - 1];
-        if (last && last.id === node.id) continue;
-        orderedVisited.push(node);
-      }
-      for (let i = 1; i < orderedVisited.length; i += 1) {
-        const prev = orderedVisited[i - 1];
-        const next = orderedVisited[i];
-        set.add(`${prev.id}->${next.id}`);
-      }
-      return set;
-    }
-    function trimLine(x1, y1, x2, y2, startRadius, endRadius) {
-      const dx = x2 - x1;
-      const dy = y2 - y1;
-      const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-      const ux = dx / distance;
-      const uy = dy / distance;
-      return {
-        x1: x1 + ux * startRadius,
-        y1: y1 + uy * startRadius,
-        x2: x2 - ux * endRadius,
-        y2: y2 - uy * endRadius,
-      };
-    }
-    function renderSummary(session) {
-      const s = session.summary || {};
-      const items = [
-        ['Character', s.character],
-        ['Boss', s.boss_name],
-        ['Seed', s.seed],
-        ['Act', s.act],
-        ['Max Floor', s.max_floor],
-        ['Final HP', `${fmt(s.final_hp)} / ${fmt(s.max_hp)}`],
-        ['Final Gold', s.final_gold],
-        ['Reward', s.episode_reward],
-        ['Steps', s.episode_steps],
-        ['Created At', formatDateTime(s.started_at)],
-        ['Duration', formatDuration(s.started_at, s.finished_at)],
-        ['Victory', s.victory],
-        ['Terminated', s.terminated],
-      ];
-      return `<div class="card">
-        <div class="label">Run Summary</div>
-        <div class="summary-list">
-          ${items.map(([label, value]) => {
-            const compactClass = label === 'Seed' ? 'compact-text' : '';
-            return `<div class="summary-item"><div class="label">${escapeHtml(label)}</div><strong class="${compactClass}">${escapeHtml(fmt(value))}</strong></div>`;
-          }).join('')}
-        </div>
-      </div>`;
-    }
-    function renderMap(session) {
-      const maps = session.maps || [];
-      if (!maps.length) return '<div class="card map-card"><div class="node-detail-empty">No map snapshot persisted for this run.</div></div>';
-      if (!currentAct || !maps.find(m => m.act === currentAct)) currentAct = maps[0].act;
-      const activeMap = maps.find(m => m.act === currentAct) || maps[0];
-      const activeBoss = activeMap.boss_info || activeMap.boss || {};
-      const activeBossName = activeBoss.name || activeBoss.boss_name || activeBoss.display_name || activeBoss.id || session.summary?.boss_name || '-';
-      const visitedIds = new Set(activeMap.visited_node_ids || []);
-      const visitedEdges = buildVisitedEdgeSet(activeMap);
-      const baseNodes = (activeMap.nodes || []).map(node => ({ ...node, room_type: normalizeRoomType(node.room_type) }));
-      const nodes = [...baseNodes];
-      const nodeLookup = Object.fromEntries(nodes.map(node => [node.id, node]));
-
-      const visitedDetailNodes = (session.nodes || []).filter(node => Number(node.act) === Number(activeMap.act));
-      visitedDetailNodes.forEach((detailNode) => {
-        if ((detailNode.col === null || detailNode.row === null) && detailNode.floor === 1) {
-          const startId = `a${activeMap.act}_start`;
-          if (!nodeLookup[startId]) {
-            const startNode = { id: startId, act: activeMap.act, col: 0, row: 0, room_type: 'StartReward', children: [] };
-            nodes.push(startNode);
-            nodeLookup[startId] = startNode;
-          }
-        }
-      });
-
-      let graphNodes = nodes.filter(node => node.col !== null && node.row !== null);
-      if (!graphNodes.length) {
-        graphNodes = visitedDetailNodes
-          .filter(node => node.col !== null && node.row !== null)
-          .map(node => ({
-            id: node.node_id,
-            act: node.act,
-            col: Number(node.col),
-            row: Number(node.row),
-            room_type: normalizeRoomType(node.room_type),
-            children: [],
-          }));
-      }
-      const allRows = graphNodes.map(n => Number(n.row ?? 0));
-      const allCols = graphNodes.map(n => Number(n.col ?? 0));
-      const maxRow = Math.max(1, ...allRows, 1);
-      const minRow = Math.min(0, ...allRows, 0);
-      const minCol = Math.min(0, ...allCols, 0);
-      const maxCol = Math.max(0, ...allCols, 0);
-      const colCount = Math.max(1, maxCol - minCol + 1);
-      const rowCount = Math.max(2, maxRow - minRow + 1);
-      const xStep = 68;
-      const yStep = 74;
-      const width = Math.max(520, colCount * xStep + 96);
-      const height = Math.max(420, rowCount * yStep + 88);
-      const xOf = (col) => 48 + (Number(col ?? 0) - minCol) * xStep;
-      const yOf = (row) => 44 + (maxRow - Number(row ?? 0)) * yStep;
-
-      const allEdges = [];
-      graphNodes.forEach((node) => {
-        (node.children || []).forEach((child) => {
-          const childId = `a${activeMap.act}_c${child.col}_r${child.row}`;
-          const childNode = nodeLookup[childId] || graphNodes.find(item => item.id === childId);
-          if (!childNode) return;
-          const fromX = xOf(node.col);
-          const fromY = yOf(node.row);
-          const toX = xOf(childNode.col);
-          const toY = yOf(childNode.row);
-          const trimmed = trimLine(fromX, fromY, toX, toY, visitedIds.has(node.id) ? 19 : 15, visitedIds.has(childId) ? 19 : 15);
-          allEdges.push({ from: node.id, to: childId, x1: trimmed.x1, y1: trimmed.y1, x2: trimmed.x2, y2: trimmed.y2 });
-        });
-      });
-
-      const lineMarkup = allEdges.map((edge) => {
-        const visited = visitedEdges.has(`${edge.from}->${edge.to}`);
-        const stroke = visited ? '#1f5fbf' : '#98a6b5';
-        const dash = visited ? '' : '4 4';
-        const width = visited ? '4.8' : '2.2';
-        const opacity = visited ? '1' : '0.92';
-        return `<line x1="${edge.x1}" y1="${edge.y1}" x2="${edge.x2}" y2="${edge.y2}" stroke="${stroke}" stroke-dasharray="${dash}" stroke-width="${width}" opacity="${opacity}" style="stroke:${stroke} !important;stroke-width:${width} !important;${dash ? `stroke-dasharray:${dash} !important;` : ''}opacity:${opacity} !important;"/>`;
-      }).join('');
-
-      const rowGuides = Array.from({ length: rowCount }, (_, index) => {
-        const rowValue = maxRow - index;
-        const y = yOf(rowValue);
-        return `<g><line x1="20" y1="${y}" x2="${width - 18}" y2="${y}" stroke="#e2e8ef" stroke-width="1"/><text x="6" y="${y + 4}" fill="#8a97a4" font-size="11">F${rowValue}</text></g>`;
-      }).join('');
-
-      const nodeMarkup = graphNodes.map(node => {
-        const x = xOf(node.col);
-        const y = yOf(node.row);
-        const active = currentNodeId === node.id ? 'active' : '';
-        const visited = visitedIds.has(node.id);
-        const colors = roomClass(node.room_type);
-        const isActive = currentNodeId === node.id;
-        const stroke = isActive ? '#3e8f63' : (visited ? '#2f80ed' : 'transparent');
-        const fill = '#34373d';
-        const textColor = '#f2f6fb';
-        const radius = visited ? 19 : 15;
-        const strokeWidth = isActive ? 4 : (visited ? 3.5 : 0);
-        return `<g class="node-button ${active}" data-node-id="${node.id}" transform="translate(${x},${y})">
-          <circle cx="0" cy="0" r="${radius}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" style="fill:${fill} !important;stroke:${stroke} !important;stroke-width:${strokeWidth} !important;"></circle>
-          <text x="0" y="4" text-anchor="middle" fill="${textColor}" style="fill:${textColor} !important;">${roomGlyph(node.room_type)}</text>
-        </g>`;
-      }).join('');
-      const legendItems = [
-        'N Start',
-        'M Monster',
-        'E Elite',
-        '? Event',
-        'T Treasure',
-        '$ Shop',
-        'R Rest',
-        'B Boss',
-      ].map(text => `<span class="pill">${escapeHtml(text)}</span>`).join('');
-      return `<div class="card map-card">
-        <div class="label">Act Map</div>
-        <div class="map-toolbar">${maps.map(map => `<button class="map-tab ${map.act === activeMap.act ? 'active' : ''}" data-act="${map.act}">Act ${map.act}</button>`).join('')}</div>
-        <div class="sub">Boss: <span class="metric-warn">${escapeHtml(activeBossName)}</span></div>
-        <div class="map-toolbar">${legendItems}</div>
-        <div class="tree-wrap">
-          <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" data-darkreader-ignore="true">
-            ${rowGuides}
-            ${lineMarkup}
-            ${nodeMarkup}
-          </svg>
-        </div>
-      </div>`;
-    }
-    function renderNodeDetail(session) {
-      const nodes = session.nodes || [];
-      if (!nodes.length) return '<div class="card"><div class="node-detail-empty">No node detail persisted.</div></div>';
-      if (!currentNodeId || !nodes.find(node => node.node_id === currentNodeId)) currentNodeId = nodes[0].node_id;
-      const selectedNode = nodes.find(item => item.node_id === currentNodeId) || nodes[0];
-      const stageNodes = nodes.filter((item) =>
-        Number(item.act) === Number(selectedNode.act) &&
-        Number(item.floor) === Number(selectedNode.floor) &&
-        normalizeRoomType(item.room_type) === normalizeRoomType(selectedNode.room_type)
-      );
-      const orderedStageNodes = stageNodes.length > 1
-        ? [...stageNodes].sort((left, right) => {
-            const leftActions = (left.actions || []).length;
-            const rightActions = (right.actions || []).length;
-            if (leftActions !== rightActions) return leftActions - rightActions;
-            return String(left.node_id || '').localeCompare(String(right.node_id || ''));
-          })
-        : [selectedNode];
-      if (currentNodeStageIndex >= orderedStageNodes.length) currentNodeStageIndex = 0;
-      const node = orderedStageNodes[currentNodeStageIndex] || selectedNode;
-      const rewards = (node.rewards || []).map(item => `<span class="reward-tag">${escapeHtml(item.type)}: ${escapeHtml(item.name ?? item.amount ?? '')}</span>`).join('');
-      const actions = (node.actions || []).map(item => `<div class="action-row">
-        <div><strong>#${escapeHtml(item.step)}</strong> ${escapeHtml(item.action)}</div>
-        <div>${escapeHtml(item.action_detail || item.action)}</div>
-        <div class="muted">before=${escapeHtml(item.decision_before)} after=${escapeHtml(item.decision_after)} reward=${escapeHtml(item.reward)}</div>
-      </div>`).join('');
-      const entryShopCards = node.entry_state?.cards || [];
-      const entryShopRelics = node.entry_state?.shop_relics || [];
-      const entryShopPotions = node.entry_state?.shop_potions || [];
-      const entryPurgeCost = node.entry_state?.purge_cost;
-      const purgeCandidates = node.entry_state?.deck || [];
-      const shopItemName = (item) => typeof item === 'string' ? item : (item?.name || item?.id || '?');
-      const shopDetails = normalizeRoomType(node.room_type) === 'Shop'
-        ? `<div class="node-block"><div class="label">Shop Stock</div><div>
-            <div>Cards: ${entryShopCards.length ? entryShopCards.map((item) => escapeHtml(shopItemName(item))).join(', ') : 'None'}</div>
-            <div>Relics: ${entryShopRelics.length ? entryShopRelics.map((item) => escapeHtml(shopItemName(item))).join(', ') : 'None'}</div>
-            <div>Potions: ${entryShopPotions.length ? entryShopPotions.map((item) => escapeHtml(shopItemName(item))).join(', ') : 'None'}</div>
-            <div>Purge: ${entryPurgeCost !== null && entryPurgeCost !== undefined ? `${escapeHtml(entryPurgeCost)} gold (${escapeHtml(purgeCandidates.length)} candidates)` : 'Unavailable'}</div>
-          </div></div>`
-        : '';
-      const stageTabs = orderedStageNodes.length > 1
-        ? `<div class="map-toolbar">${orderedStageNodes.map((item, index) => `
-            <button class="map-tab ${index === currentNodeStageIndex ? 'active' : ''}" data-stage-index="${index}">
-              Stage ${index + 1}
-            </button>
-          `).join('')}</div>`
-        : '';
-      return `<div class="card">
-        <div class="label">Node Detail</div>
-        <div class="sub">Act ${escapeHtml(node.act)} | Floor ${escapeHtml(node.floor)} | ${escapeHtml(normalizeRoomType(node.room_type))}</div>
-        ${stageTabs}
-        <div class="node-stats">
-          <div class="node-block"><div class="label">Monsters</div><div>${(node.monsters || []).length ? (node.monsters || []).map(escapeHtml).join(', ') : 'None recorded'}</div></div>
-          <div class="node-block"><div class="label">Entry</div><div>HP ${escapeHtml(node.entry_state?.hp)} / ${escapeHtml(node.entry_state?.max_hp)} | Gold ${escapeHtml(node.entry_state?.gold)} | Decision ${escapeHtml(node.entry_state?.decision)}</div></div>
-          <div class="node-block"><div class="label">Exit</div><div>HP ${escapeHtml(node.exit_state?.hp)} / ${escapeHtml(node.exit_state?.max_hp)} | Gold ${escapeHtml(node.exit_state?.gold)} | Decision ${escapeHtml(node.exit_state?.decision)}</div></div>
-          ${shopDetails}
-          <div class="node-block"><div class="label">Rewards</div><div>${rewards || '<span class="muted">No explicit rewards captured.</span>'}</div></div>
-          <div class="node-block"><div class="label">Actions</div><div class="action-log">${actions || '<div class="action-row muted">No actions recorded.</div>'}</div></div>
-        </div>
-      </div>`;
-    }
-    function bindSessionInteractions() {
-      Array.from(document.querySelectorAll('.map-tab')).forEach((button) => {
-        if (button.dataset.act !== undefined) {
-          button.addEventListener('click', () => {
-            currentAct = Number(button.dataset.act);
-            currentNodeId = null;
-            currentNodeStageIndex = 0;
-            renderSessionDetail();
-          });
-          return;
-        }
-        if (button.dataset.stageIndex !== undefined) {
-          button.addEventListener('click', () => {
-            currentNodeStageIndex = Number(button.dataset.stageIndex) || 0;
-            renderSessionDetail();
-          });
-        }
-      });
-      Array.from(document.querySelectorAll('.node-button')).forEach((node) => {
-        node.addEventListener('click', () => {
-          currentNodeId = node.dataset.nodeId;
-          currentNodeStageIndex = 0;
-          renderSessionDetail();
-        });
-      });
-    }
-    function renderSessionDetail() {
-      const shell = document.getElementById('sessionDetail');
-      if (!currentSession) {
-        shell.innerHTML = '';
-        return;
-      }
-      shell.innerHTML = `<h2>Selected Job</h2><div class="detail-grid">
-        ${renderSummary(currentSession)}
-        ${renderMap(currentSession)}
-        ${renderNodeDetail(currentSession)}
-      </div>`;
-      bindSessionInteractions();
-    }
-    async function loadSession(gameId, runDir = null) {
-      currentSessionGameId = gameId;
-      const suffix = runDir ? `?run_dir=${encodeURIComponent(runDir)}` : '';
-      const resp = await fetch(`/api/session/${encodeURIComponent(gameId)}${suffix}`);
-      if (!resp.ok) {
-        currentSession = null;
-        renderSessionDetail();
-        return;
-      }
-        currentSession = await resp.json();
-        currentAct = null;
-        currentNodeId = null;
-        currentNodeStageIndex = 0;
-        renderSessionDetail();
-      }
-    async function refresh() {
-      let data = null;
-      try {
-        const resp = await fetch('/api/state');
-        if (!resp.ok) {
-          throw buildErrorFromResponse(resp.status, {});
-        }
-        data = await resp.json();
-      } catch (err) {
-        pushAlert('Failed to refresh state', err?.message || 'unable to fetch state', 'danger', '', 'state');
-        return;
-      }
-        clearStateAlerts();
-        renderStateAlerts(data);
-        renderProblemList(data);
-        const t = data.training || {};
-      currentRunDir = data.run_dir;
-      document.getElementById('meta').textContent = `updated: ${fmt(data.updated_at)} | experiment: ${fmt(t.experiment_name)} | run: ${fmt(t.run_id)} | dir: ${fmt(data.run_dir)}`;
-      syncControls(t);
-      document.getElementById('cards').innerHTML = renderCards(data);
-      const activeSlots = withTimeFields(data.active_slots || []).map((row) => ({
-        ...row,
-        uptime_display: formatDuration(inferEpisodeStart(row), null),
-      }));
-      renderTable(document.getElementById('activeTable'), [
-        {key:'slot',label:'Slot'},
-        {key:'episode_index',label:'Episode'},
-        {key:'floor',label:'Floor'},
-        {key:'act',label:'Act'},
-        {key:'boss_name',label:'Boss'},
-        {key:'room_type',label:'Room'},
-        {key:'decision',label:'Decision'},
-        {key:'hp',label:'HP'},
-        {key:'gold',label:'Gold'},
-        {key:'energy',label:'Energy'},
-        {key:'uptime_display',label:'Uptime'},
-        {key:'episode_steps',label:'Steps'},
-        {key:'episode_reward',label:'Reward'},
-        {key:'flags_display',label:'Flags'},
-        {key:'seed',label:'Seed', className:'mono'},
-      ], activeSlots);
-      Array.from(document.querySelectorAll('#activeTable tbody tr')).forEach((row) => {
-        const roomCell = row.children[5];
-        const floorCell = row.children[2];
-        const rewardCell = row.children[12];
-        if (roomCell) roomCell.classList.add('room');
-        if (floorCell) floorCell.classList.add('metric-strong');
-        if (rewardCell) rewardCell.classList.add('metric-warn');
-        const slot = activeSlots[row.rowIndex - 1];
-        if (slot && slot.details_available) {
-          row.classList.add('clickable-row');
-          row.addEventListener('click', () => loadSession(slot.game_id, data.run_dir));
-        }
-      });
-      document.getElementById('slotCharts').innerHTML = renderSlotCharts(data.slot_histories || {});
-      renderTable(document.getElementById('checkpointTable'), [
-        {key:'name',label:'File'},
-        {key:'size_mb',label:'Size(MB)'},
-        {key:'path',label:'Path', className:'mono'},
-      ], data.checkpoints || []);
-      const topSessions = withTimeFields(data.top_sessions || []);
-      renderTable(document.getElementById('topTable'), [
-        {key:'slot',label:'Slot'},
-        {key:'episode_index',label:'Episode'},
-        {key:'boss_name',label:'Boss'},
-        {key:'max_floor',label:'Max Floor'},
-        {key:'started_at_display',label:'Created At'},
-        {key:'duration_display',label:'Duration'},
-        {key:'final_hp_display',label:'Final HP'},
-        {key:'final_gold_display',label:'Final Gold'},
-        {key:'episode_steps',label:'Steps'},
-        {key:'episode_reward',label:'Reward'},
-        {key:'flags_display',label:'Flags'},
-        {key:'victory',label:'Victory'},
-        {key:'seed',label:'Seed', className:'mono'},
-      ], topSessions);
-      Array.from(document.querySelectorAll('#topTable tbody tr')).forEach((row) => {
-        row.classList.add('clickable-row');
-        const floorCell = row.children[3];
-        const hpCell = row.children[6];
-        const rewardCell = row.children[9];
-        const victoryCell = row.children[11];
-        if (floorCell) floorCell.classList.add('metric-good');
-        if (hpCell) hpCell.classList.add('metric-strong');
-        if (rewardCell) rewardCell.classList.add('metric-warn');
-        if (victoryCell && victoryCell.textContent === 'True') victoryCell.classList.add('metric-good');
-        const session = topSessions[row.rowIndex - 1];
-        if (session && session.details_available) {
-          row.addEventListener('click', () => loadSession(session.game_id, data.run_dir));
-        }
-      });
-      const historicalBest = withTimeFields(data.historical_best || []);
-      renderTable(document.getElementById('historyTable'), [
-        {key:'experiment_name',label:'Experiment'},
-        {key:'run_id',label:'Run'},
-        {key:'boss_name',label:'Boss'},
-        {key:'max_floor',label:'Max Floor'},
-        {key:'started_at_display',label:'Created At'},
-        {key:'duration_display',label:'Duration'},
-        {key:'final_hp_display',label:'Final HP'},
-        {key:'final_gold_display',label:'Final Gold'},
-        {key:'episode_reward',label:'Reward'},
-        {key:'episode_steps',label:'Steps'},
-        {key:'flags_display',label:'Flags'},
-        {key:'victory',label:'Victory'},
-        {key:'seed',label:'Seed', className:'mono'},
-      ], historicalBest);
-      Array.from(document.querySelectorAll('#historyTable tbody tr')).forEach((row) => {
-        row.classList.add('clickable-row');
-        const floorCell = row.children[3];
-        const hpCell = row.children[6];
-        const rewardCell = row.children[8];
-        const victoryCell = row.children[11];
-        if (floorCell) floorCell.classList.add('metric-good');
-        if (hpCell) hpCell.classList.add('metric-strong');
-        if (rewardCell) rewardCell.classList.add('metric-warn');
-        if (victoryCell && victoryCell.textContent === 'True') victoryCell.classList.add('metric-good');
-          const session = historicalBest[row.rowIndex - 1];
-          if (session) {
-            const runDir = session.run_dir || '';
-            row.addEventListener('click', () => loadSession(session.game_id, runDir));
-          }
-      });
-    }
-    refresh();
-    setInterval(refresh, 3000);
-  </script>
-</body>
-</html>"""
+HTML = _load_dashboard_html()
 
 
 @app.route("/")
@@ -3352,26 +2742,24 @@ def api_state() -> Response:
     return jsonify(payload)
 
 
+@app.route("/api/runtime/control")
+def api_runtime_control() -> Response:
+    run_id = request.args.get("run_id")
+    payload = _get_runtime_control(run_id)
+    if not payload:
+        payload = {"run_id": str(run_id or TELEMETRY_STATE.get("current_run_id") or ""), "command": None}
+    return jsonify(payload)
+
+
 @app.route("/api/session/<game_id>")
 def api_session(game_id: str) -> Response:
     _ensure_telemetry_bootstrapped()
-    run_dir_arg = request.args.get("run_dir")
-    run_dir = Path(run_dir_arg) if run_dir_arg else _latest_run_dir()
     with TELEMETRY_LOCK:
         for run in (TELEMETRY_STATE.get("runs") or {}).values():
             details = (run.get("session_details") or {}).get(game_id)
             if isinstance(details, dict) and details:
                 return jsonify(details)
-    if run_dir is None:
-        session = _build_service_only_session(game_id)
-        if not session:
-            return jsonify({"error": "run not found"}), 404
-        return jsonify(session)
-    session = _read_session_details(run_dir, game_id)
-    if not session:
-        session = _build_live_session(run_dir, game_id)
-    if not session:
-        session = _build_service_only_session(game_id)
+    session = _build_service_only_session(game_id)
     if not session:
         return jsonify({"error": "session not found"}), 404
     return jsonify(session)
@@ -3433,16 +2821,29 @@ def api_telemetry_runtime_status() -> Response:
     return jsonify({"ok": True})
 
 
+@app.route("/api/telemetry/runtime/log", methods=["POST"])
+def api_telemetry_runtime_log() -> Response:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "message": "invalid payload"}), 400
+    source = str(payload.get("source") or "runtime")
+    _telemetry_ingest_runtime_log(payload, source)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/control/start", methods=["POST"])
 def api_control_start() -> Response:
     payload = request.get_json(silent=True) or {}
     total_timesteps = _parse_total_timesteps(payload.get("total_timesteps"))
     num_envs = _parse_num_envs(payload.get("num_envs"))
+    vec_env = _parse_vec_env(payload.get("vec_env"))
     if payload.get("total_timesteps") not in (None, "") and total_timesteps is None:
         return jsonify({"ok": False, "message": "invalid total_timesteps"}), 400
     if payload.get("num_envs") not in (None, "") and num_envs is None:
         return jsonify({"ok": False, "message": "invalid num_envs"}), 400
-    result = _start_training_process(total_timesteps=total_timesteps, num_envs=num_envs)
+    if payload.get("vec_env") not in (None, "") and vec_env is None:
+        return jsonify({"ok": False, "message": "invalid vec_env"}), 400
+    result = _start_training_process(total_timesteps=total_timesteps, num_envs=num_envs, vec_env=vec_env)
     if result.get("ok"):
         status = 200
     elif result.get("error_code") == "process_exited":

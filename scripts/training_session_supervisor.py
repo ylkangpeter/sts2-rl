@@ -10,15 +10,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.request import Request, urlopen
 from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+from st2rl.core.runtime_config import (
+    deep_merge_dicts,
+    load_runtime_stack_config,
+    runtime_dashboard_base_url,
+    runtime_service_base_url,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_CONFIG_PATHS = [
-    ROOT / "configs" / "runtime_stack.json",
-    ROOT / "configs" / "runtime_stack.local.json",
-]
 SUPERVISOR_ROOT = ROOT / "logs" / "session_supervisor"
 INCIDENTS_DIR = SUPERVISOR_ROOT / "incidents"
 STATE_PATH = SUPERVISOR_ROOT / "state.json"
@@ -86,11 +89,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _dashboard_base_url() -> str:
-    runtime = _load_runtime_config()
-    dashboard = runtime.get("dashboard") or {}
-    host = str(dashboard.get("host") or "127.0.0.1")
-    port = _safe_int(dashboard.get("port"), 8787)
-    return f"http://{host}:{port}"
+    return runtime_dashboard_base_url(ROOT)
 
 
 def _post_dashboard(path: str, payload: dict[str, Any]) -> None:
@@ -109,22 +108,11 @@ def _post_dashboard(path: str, payload: dict[str, Any]) -> None:
 
 
 def _load_runtime_config() -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for path in RUNTIME_CONFIG_PATHS:
-        data = _read_json(path, {})
-        if isinstance(data, dict):
-            merged = _deep_merge_dicts(merged, data)
-    return merged
+    return load_runtime_stack_config(ROOT)
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    return deep_merge_dicts(base, override)
 
 
 def _session_supervisor_config() -> SupervisorConfig:
@@ -144,14 +132,7 @@ def _session_supervisor_config() -> SupervisorConfig:
 
 
 def _service_base_url(runtime: dict[str, Any]) -> str:
-    service = runtime.get("service") or {}
-    host = str(service.get("host") or "127.0.0.1")
-    port = _safe_int(service.get("port"), 5000)
-    return f"http://{host}:{port}"
-
-
-def _dashboard_base_url() -> str:
-    return "http://127.0.0.1:8787"
+    return runtime_service_base_url(ROOT)
 
 
 def _service_request(
@@ -368,7 +349,15 @@ def _active_issue(slot: dict[str, Any], config: SupervisorConfig, state: dict[st
         reasons.append(f"slot_update_stale>{config.stale_slot_seconds}s")
     if stagnant_steps >= config.stagnant_steps_threshold:
         reasons.append(f"stagnant_steps>={config.stagnant_steps_threshold}")
-    if elapsed_seconds is not None and elapsed_seconds > config.max_uptime_seconds:
+    if (
+        elapsed_seconds is not None
+        and elapsed_seconds > config.max_uptime_seconds
+        and (
+            (floor_age_seconds is not None and floor_age_seconds > config.floor_timeout_seconds)
+            or (updated_age_seconds is not None and updated_age_seconds > config.stale_slot_seconds)
+            or stagnant_steps >= config.stagnant_steps_threshold
+        )
+    ):
         reasons.append(f"uptime_exceeded>{config.max_uptime_seconds}s")
 
     if not reasons:

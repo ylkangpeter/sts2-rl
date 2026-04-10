@@ -36,16 +36,16 @@ class HttpCliEnvConfig:
     base_url: str = "http://localhost:5000"
     timeout_seconds: int = 30
     health_check_retries: int = 2
-    step_delay_seconds: float = 0.02
-    recovery_delay_seconds: float = 0.05
+    step_delay_seconds: float = 0.0
+    recovery_delay_seconds: float = 0.01
     initial_state_poll_attempts: int = 20
-    initial_state_poll_interval_seconds: float = 0.2
+    initial_state_poll_interval_seconds: float = 0.05
     stuck_warn_threshold: int = 60
     stuck_abort_threshold: int = 140
     no_action_combat_abort_threshold: int = 12
     no_action_combat_proceed_threshold: int = 3
-    async_combat_poll_attempts: int = 12
-    async_combat_poll_interval_seconds: float = 0.25
+    async_combat_poll_attempts: int = 4
+    async_combat_poll_interval_seconds: float = 0.05
     observation_max_hand: int = 10
     observation_max_enemies: int = 5
     seed_offset: int = 0
@@ -230,6 +230,13 @@ class HttpCliRlEnv(gym.Env):
             "id": card.get("id"),
             "name": card.get("name"),
             "cost": card.get("cost"),
+            "type": card.get("type"),
+            "rarity": card.get("rarity"),
+            "description": card.get("description"),
+            "stats": dict(card.get("stats") or {}) if isinstance(card.get("stats"), dict) else {},
+            "keywords": list(card.get("keywords") or []) if isinstance(card.get("keywords"), (list, tuple)) else [],
+            "after_upgrade": dict(card.get("after_upgrade") or {}) if isinstance(card.get("after_upgrade"), dict) else {},
+            "upgraded": bool(card.get("upgraded")),
             "target_type": card.get("target_type"),
             "can_play": bool(card.get("can_play")),
         }
@@ -247,6 +254,7 @@ class HttpCliRlEnv(gym.Env):
     def _compact_option(self, option: dict[str, Any]) -> dict[str, Any]:
         return {
             "index": option.get("index"),
+            "option_id": option.get("option_id"),
             "name": option.get("name") or option.get("label") or option.get("option_id"),
             "label": option.get("label"),
             "description": option.get("description"),
@@ -349,12 +357,28 @@ class HttpCliRlEnv(gym.Env):
             "hand_size": len(state.hand),
             "round": state.round,
             "turn": state.turn,
+            "can_skip": state.can_skip,
+            "min_select": state.min_select,
+            "max_select": state.max_select,
             "game_over": state.game_over,
             "victory": state.victory,
+            "player": {
+                "hp": state.hp,
+                "max_hp": state.max_hp,
+                "block": state.block,
+                "gold": state.gold,
+                "deck_size": state.deck_size,
+                "deck": [self._compact_card(card) for card in (state.player.get("deck") or []) if isinstance(card, dict)],
+                "relics": [dict(relic) for relic in player_relics if isinstance(relic, dict)],
+                "potions": [dict(potion) for potion in player_potions if isinstance(potion, dict)],
+            },
             "enemies": [self._compact_enemy(enemy) for enemy in state.enemies],
             "hand": [self._compact_card(card) for card in state.hand],
             "cards": [self._compact_card(card) for card in state.cards],
-            "options": [self._compact_option(option) for option in (state.options or state.choices)],
+            "options": [self._compact_option(option) for option in state.options],
+            "choices": [self._compact_option(option) for option in state.choices],
+            "map": [self._normalize_map_node(node) for node in state.map_nodes if isinstance(node, dict)],
+            "full_map": dict(state.full_map or {}),
             "relics": [relic.get("name") or relic.get("id") for relic in player_relics if isinstance(relic, dict)],
             "potions": [potion.get("name") or potion.get("id") for potion in player_potions if isinstance(potion, dict)],
             "shop_relics": [self._compact_shop_item(relic) for relic in state.relics if isinstance(relic, dict)],
@@ -701,8 +725,8 @@ class HttpCliRlEnv(gym.Env):
             "trace": self._episode_trace,
         }
 
-    def _write_current_slot(self, *, active: bool) -> None:
-        self.telemetry.write_current(self._slot_payload(active=active))
+    def _write_current_slot(self, *, active: bool, force: bool = False) -> None:
+        self.telemetry.write_current(self._slot_payload(active=active), force=force)
 
     def _record_episode_summary(self, *, terminated: bool, truncated: bool) -> None:
         payload = self._slot_payload(active=False)
@@ -1186,7 +1210,7 @@ class HttpCliRlEnv(gym.Env):
                 self._seed,
                 self._game_id,
             )
-        self._write_current_slot(active=False)
+        self._write_current_slot(active=False, force=True)
         self.close()
         return obs, reward, False, True, info
 
@@ -1239,7 +1263,7 @@ class HttpCliRlEnv(gym.Env):
                     "episode_reward": self._episode_reward,
                     "episode_steps": self._step_count,
                 }
-                self._write_current_slot(active=True)
+                self._write_current_slot(active=True, force=True)
                 return obs, info
             except Exception as exc:
                 last_exc = exc
@@ -1396,7 +1420,7 @@ class HttpCliRlEnv(gym.Env):
             }
             if termination_reason:
                 info["termination_reason"] = termination_reason
-            self._write_current_slot(active=not (terminated or truncated))
+            self._write_current_slot(active=not (terminated or truncated), force=bool(terminated or truncated))
             if terminated or truncated:
                 self._record_episode_summary(terminated=terminated, truncated=truncated)
             return obs, reward, terminated, truncated, info
@@ -1417,7 +1441,7 @@ class HttpCliRlEnv(gym.Env):
         )
 
     def close(self) -> None:
-        self._write_current_slot(active=False)
+        self._write_current_slot(active=False, force=True)
         if self._game_id:
             try:
                 self.protocol.close_game(self._game_id)

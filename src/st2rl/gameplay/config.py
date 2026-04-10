@@ -13,7 +13,7 @@ class FlowPolicyConfig:
     shop_low_gold_threshold: int = 150
     shop_high_gold_threshold: int = 250
     card_select_skip_probability: float = 0.2
-    rest_heal_threshold: float = 0.5
+    rest_heal_threshold: float = 0.62
 
 
 @dataclass(slots=True)
