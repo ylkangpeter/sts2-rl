@@ -18,10 +18,13 @@ from st2rl.gameplay.heuristics import (
     best_shop_potion,
     best_shop_relic,
     choose_card_reward,
+    choose_event_option,
+    choose_map_node_choice,
     choose_purge_target,
     choose_upgrade_target,
     is_shop_context,
     shop_purge_cost,
+    should_prioritize_shop_purge,
     should_replace_potion,
     worst_owned_potion,
 )
@@ -494,27 +497,12 @@ class HttpCliProtocol(FlowProtocol):
             return _fallback_combat_action()
 
         if state.decision in ("map_node", "map_select"):
-            valid = {(choice.get("col"), choice.get("row")) for choice in state.choices}
-            if safe.name == "select_map_node" and safe.args.get("choice_index") is not None and state.choices:
-                choice_index = int(safe.args.get("choice_index") or 0)
-                mapped_choice = state.choices[min(max(choice_index, 0), len(state.choices) - 1)]
-                return FlowAction("select_map_node", {"col": mapped_choice.get("col"), "row": mapped_choice.get("row")})
-            if safe.name != "select_map_node":
-                if state.choices:
-                    choice = rng.choice(state.choices)
-                    return FlowAction("select_map_node", {"col": choice.get("col"), "row": choice.get("row")})
-                return FlowAction("proceed")
-            if (safe.args.get("col"), safe.args.get("row")) not in valid and state.choices:
-                choice = rng.choice(state.choices)
+            if state.choices:
+                choice = choose_map_node_choice(state.choices, state) or state.choices[0]
                 return FlowAction("select_map_node", {"col": choice.get("col"), "row": choice.get("row")})
-            return safe
+            return FlowAction("proceed")
 
         if state.decision == "card_reward":
-            valid_cards = {card.get("index") for card in state.cards}
-            if safe.name == "choose_card_reward" and safe.args.get("card_index") in valid_cards:
-                return safe
-            if safe.name == "skip_reward" and state.can_skip:
-                return safe
             if state.cards:
                 picked = choose_card_reward(state.cards, list(state.player.get("deck") or []), state.can_skip)
                 if picked is not None:
@@ -543,52 +531,25 @@ class HttpCliProtocol(FlowProtocol):
             best_potion = best_shop_potion(affordable_shop_potions, state.gold)
             replacement_target = should_replace_potion(state.player.get("potions") or [], best_potion) if free_potion_slots <= 0 else None
             purge_target = choose_purge_target(deck)
+            prioritize_purge = should_prioritize_shop_purge(
+                deck,
+                state.gold,
+                purge_cost,
+                best_card=best_card,
+                best_relic=best_relic,
+            )
             if safe.name == "leave_shop":
                 if replacement_target is not None:
                     return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
                 if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
                     return healing_potion_action
+                if prioritize_purge and purge_target is not None:
+                    return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
                 if state.gold >= 150 and best_relic is not None:
                     return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
-                if state.gold >= purge_cost and purge_target is not None:
-                    return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
                 if best_card is not None:
                     return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
                 return FlowAction("leave_shop")
-            if safe.name == "buy_card":
-                valid = {card.get("index") for card in affordable_cards}
-                if safe.args.get("card_index") in valid:
-                    if best_relic is not None:
-                        return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
-                    if best_card is not None:
-                        return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
-                    return safe
-            if safe.name == "buy_potion":
-                if replacement_target is not None:
-                    return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
-                if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
-                    return healing_potion_action
-                valid = {potion.get("index") for potion in affordable_potions}
-                if safe.args.get("potion_index") in valid:
-                    if best_relic is not None:
-                        return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
-                    if best_card is not None and bool(best_card.get("on_sale")):
-                        return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
-                    if best_potion is not None:
-                        return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
-                    return safe
-            if safe.name == "buy_relic":
-                valid = {relic.get("index") for relic in affordable_relics}
-                if safe.args.get("relic_index") in valid:
-                    if best_relic is not None:
-                        return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
-                    return safe
-            if safe.name == "purge_card":
-                valid = {card.get("index") for card in deck if state.gold >= purge_cost}
-                if safe.args.get("card_index") in valid:
-                    if purge_target is not None:
-                        return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
-                    return safe
             if safe.name == "discard_potion":
                 discardable = worst_owned_potion(state.player.get("potions") or [])
                 if replacement_target is not None and discardable is not None and safe.args.get("potion_index") == discardable.get("index"):
@@ -599,35 +560,55 @@ class HttpCliProtocol(FlowProtocol):
                 return healing_potion_action
             if replacement_target is not None:
                 return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
+            if prioritize_purge and purge_target is not None:
+                return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
             if state.gold < 150 and safe.name not in {"buy_relic", "buy_card", "buy_potion", "purge_card"}:
                 return FlowAction("leave_shop")
             if best_relic is not None:
                 return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
-            if state.gold >= purge_cost and purge_target is not None:
-                return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
             if best_card is not None:
                 return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
+            if state.gold >= purge_cost and purge_target is not None:
+                return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
             if state.gold >= 250 and best_potion is not None:
                 return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
             return FlowAction("leave_shop")
 
         if state.decision in ("event", "event_choice"):
             options = state.options or state.choices
-            valid = {option.get("index") for option in options if not option.get("is_locked")}
-            if safe.name == "choose_option" and safe.args.get("option_index") in valid:
-                return safe
             unlocked = [option for option in options if not option.get("is_locked")]
             if unlocked:
-                return FlowAction("choose_option", {"option_index": rng.choice(unlocked).get("index", 0)})
+                pick = choose_event_option(unlocked, state) or unlocked[0]
+                return FlowAction("choose_option", {"option_index": pick.get("index", 0)})
             return FlowAction("proceed")
 
         if state.decision == "rest_site":
-            valid = {option.get("index") for option in state.options if option.get("is_enabled", True)}
-            if safe.name == "choose_option" and safe.args.get("option_index") in valid:
-                return safe
             enabled = [option for option in state.options if option.get("is_enabled", True)]
             if enabled:
-                return FlowAction("choose_option", {"option_index": rng.choice(enabled).get("index", 0)})
+                heal = next(
+                    (
+                        option
+                        for option in enabled
+                        if str(option.get("option_id") or option.get("name") or option.get("label") or "").lower() in {"heal", "rest"}
+                        or "heal" in str(option.get("name") or option.get("label") or "").lower()
+                        or "rest" in str(option.get("name") or option.get("label") or "").lower()
+                    ),
+                    None,
+                )
+                smith = next(
+                    (
+                        option
+                        for option in enabled
+                        if "smith" in str(option.get("option_id") or option.get("name") or option.get("label") or "").lower()
+                        or "upgrade" in str(option.get("option_id") or option.get("name") or option.get("label") or "").lower()
+                    ),
+                    None,
+                )
+                if state.hp / max(1, state.max_hp) < 0.5 and heal is not None:
+                    return FlowAction("choose_option", {"option_index": heal.get("index", 0)})
+                if smith is not None:
+                    return FlowAction("choose_option", {"option_index": smith.get("index", 0)})
+                return FlowAction("choose_option", {"option_index": enabled[0].get("index", 0)})
             return FlowAction("proceed")
 
         if state.decision == "bundle_select":

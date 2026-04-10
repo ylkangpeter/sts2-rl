@@ -10,10 +10,12 @@ from st2rl.gameplay.heuristics import (
     best_shop_relic,
     choose_card_reward,
     choose_event_option,
+    choose_map_node_choice,
     choose_purge_target,
     choose_upgrade_target,
     is_shop_context,
     shop_purge_cost,
+    should_prioritize_shop_purge,
 )
 from st2rl.gameplay.types import FlowAction, GameStateView, card_needs_enemy_target
 
@@ -52,24 +54,7 @@ class SimpleFlowPolicy:
                     break
         if not choices:
             return FlowAction("proceed")
-        hp_ratio = state.hp / max(1, state.max_hp)
-        weighted_choices: list[dict] = []
-        for choice in choices:
-            room_type = str(choice.get("room_type") or choice.get("type") or "").lower()
-            weight = 1.0
-            if "elite" in room_type:
-                weight = 2.6 if hp_ratio >= 0.6 else 0.55
-            elif "shop" in room_type:
-                if state.gold >= self.config.shop_high_gold_threshold:
-                    weight = 2.1
-                elif state.gold < self.config.shop_low_gold_threshold:
-                    weight = 0.15
-            elif "rest" in room_type:
-                weight = 1.8 if hp_ratio < self.config.rest_heal_threshold else 0.85
-            elif "treasure" in room_type:
-                weight = 1.4
-            weighted_choices.extend([choice] * max(1, int(round(weight * 4))))
-        pick = rng.choice(weighted_choices or choices)
+        pick = choose_map_node_choice(choices, state) or choices[0]
         return FlowAction("select_map_node", {"col": pick["col"], "row": pick["row"]})
 
     def _pick_combat_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
@@ -95,21 +80,22 @@ class SimpleFlowPolicy:
         return FlowAction("skip_reward")
 
     def _pick_shop_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
-        if state.gold < self.config.shop_low_gold_threshold:
-            return FlowAction("leave_shop")
-
+        purge_cost = shop_purge_cost(state)
+        deck = list(state.player.get("deck") or [])
         best_relic = best_shop_relic(state.relics, state.gold)
+        best_card = best_shop_card(state.cards, state.gold, deck)
+        purge_target = choose_purge_target(deck)
+        if should_prioritize_shop_purge(deck, state.gold, purge_cost, best_card=best_card, best_relic=best_relic):
+            return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
+
         if best_relic is not None:
             return FlowAction("buy_relic", {"relic_index": best_relic.get("index", 0)})
 
-        purge_cost = shop_purge_cost(state)
-        purge_target = choose_purge_target(list(state.player.get("deck") or []))
-        if state.gold >= purge_cost and purge_target is not None:
-            return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
-
-        best_card = best_shop_card(state.cards, state.gold, list(state.player.get("deck") or []))
         if best_card is not None:
             return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
+
+        if state.gold >= purge_cost and purge_target is not None:
+            return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
 
         best_potion = best_shop_potion(state.potions, state.gold)
         if best_potion is not None and state.gold >= self.config.shop_high_gold_threshold:
@@ -148,7 +134,7 @@ class SimpleFlowPolicy:
             ),
             None,
         )
-        if hp_ratio < self.config.rest_heal_threshold:
+        if hp_ratio < max(0.4, self.config.rest_heal_threshold - 0.12):
             heal = next(
                 (
                     option

@@ -2,11 +2,11 @@
 """Train PPO on the formal HTTP CLI reinforcement learning environment."""
 
 import argparse
+import json
 import zipfile
 from pathlib import Path
 
-import yaml
-
+from st2rl.core.runtime_config import default_train_config_path, load_train_config
 from st2rl.training.trainer import UnifiedTrainer
 
 
@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "configs" / "train_http_cli_rl.yaml",
+        default=default_train_config_path(Path(__file__).resolve().parents[1]),
         help="Path to YAML training config.",
     )
     parser.add_argument(
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--vec-env",
         type=str,
         default=None,
-        choices=["dummy", "subproc"],
+        choices=["dummy", "subproc", "threaded"],
         help="Optional override for vectorized environment type.",
     )
     parser.add_argument(
@@ -57,9 +57,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+def _iter_history_rows(run_dir: Path):
+    dashboard_slots = run_dir / "dashboard" / "slots"
+    if not dashboard_slots.exists():
+        return
+    for history_path in dashboard_slots.glob("slot_*.history.jsonl"):
+        try:
+            for line in history_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if isinstance(row, dict):
+                    yield row
+        except OSError:
+            continue
+        except json.JSONDecodeError:
+            continue
+
+
+def _run_quality_is_bad(run_dir: Path) -> bool:
+    finished = 0
+    anomaly_flags = 0
+    floor_sum = 0.0
+    for row in _iter_history_rows(run_dir):
+        if bool(row.get("active", False)):
+            continue
+        finished += 1
+        floor_sum += float(row.get("max_floor", row.get("floor", 0)) or 0.0)
+        flags = row.get("anomaly_flags") or []
+        if isinstance(flags, list) and flags:
+            anomaly_flags += 1
+    if finished <= 0:
+        return False
+    avg_floor = floor_sum / max(1, finished)
+    anomaly_ratio = anomaly_flags / max(1, finished)
+    return (finished >= 80 and avg_floor < 4.0) or anomaly_ratio > 0.45
 
 
 def resolve_resume_model_path(config: dict, explicit_model_path: str | None, fresh_start: bool) -> str | None:
@@ -82,6 +115,9 @@ def resolve_resume_model_path(config: dict, explicit_model_path: str | None, fre
         reverse=True,
     )
     for candidate in candidates:
+        run_dir = candidate.parent
+        if _run_quality_is_bad(run_dir):
+            continue
         try:
             if candidate.stat().st_size <= 0:
                 continue
@@ -95,7 +131,7 @@ def resolve_resume_model_path(config: dict, explicit_model_path: str | None, fre
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
+    config = load_train_config(args.config)
     if args.experiment_name:
         config.setdefault("paths", {})
         config["paths"]["experiment_name"] = args.experiment_name

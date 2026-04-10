@@ -29,7 +29,13 @@ The `training client` and `game server` may each manage their own internal worke
 
 - Live dashboard data should primarily come from in-memory state and client/server HTTP communication.
 - Disk should be used mainly for checkpoints, compact history, and incident evidence.
+- After process bootstrap and one-time startup loading complete, runtime code should treat disk as write-mostly.
+- Outside startup/bootstrap, processes should not repeatedly read disk to recover live state, poll peer status, rebuild operator views, or exchange control information.
+- Cross-process runtime data flow must use HTTP or another in-memory IPC channel. Do not implement read-after-write file loops between `dashboard`, `training client`, and `game server`.
 - Avoid repeated heavy filesystem scans and repeated full historical recomputation during refresh.
+- After runtime bootstrap completes, live status, trend, slot/session summaries, and operator control flow must not depend on reading files from disk.
+- Runtime disk usage should be write-oriented only: checkpoints, compact append-only history, crash evidence, and other forensics are allowed, but live state/statistics/control should be served from memory or HTTP APIs.
+- If one process needs data from another process during runtime, expose it over HTTP or another in-memory IPC path instead of implementing read-after-write file loops.
 
 ## Resume Semantics
 
@@ -58,6 +64,20 @@ Training is considered healthy only when all of the following hold:
 - Use concrete seeds / game IDs when investigating.
 - Prefer fixing root causes over masking problems with endless restarts.
 - Surface suspicious sessions explicitly in telemetry/dashboard output so operators do not need to infer them from raw logs.
+
+## Policy-Change Backtest Gate (Required)
+
+- Any change that affects gameplay decisions (card reward, shop, rest/campfire, event choice, map routing, combat fallback) must run deterministic seed backtests before restarting long training.
+- Backtest dataset must include three parts every time:
+  1. all historical seeds whose terminal floor is `>=17` at the moment the script runs,
+  2. a fixed curated seed set with broad floor distribution (at least floor bands around `5`, `10`, and `15`),
+  3. an additional random seed sample regenerated every run to reduce overfitting risk.
+- The fixed curated seeds should be versioned in-repo (default: `configs/backtest/seeds_regression_v1.txt`) and reused for before/after comparison unless explicitly replaced.
+- Acceptance rule:
+  1. none of the three datasets may regress on grouped core metrics (`avg_floor`, `ge10`, `ge15`, `ge17`),
+  2. overall merged metrics should improve over baseline.
+- Evaluation is distribution-level, not per-seed mandatory dominance. Do not require every single seed to outperform baseline.
+- If any dataset regresses, rollback or retune before resuming long training.
 
 ## Repository-Specific Notes
 
