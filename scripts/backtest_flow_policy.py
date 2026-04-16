@@ -13,7 +13,15 @@ from typing import Any
 from st2rl.gameplay.config import FlowPolicyConfig
 from st2rl.gameplay.policy import SimpleFlowPolicy
 from st2rl.gameplay.types import FlowAction, GameStateView
+from st2rl.protocols.base import ProtocolStepResult
 from st2rl.protocols.http_cli import HttpCliProtocol, HttpCliProtocolConfig
+from st2rl.training.backtest_cache import (
+    BacktestRolloutCache,
+    action_hash,
+    action_payload,
+    source_digest,
+    state_hash,
+)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -71,6 +79,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--character", type=str, default="Ironclad")
     parser.add_argument("--max-steps", type=int, default=1200)
     parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("logs/backtest_cache"),
+        help="Directory for exact deterministic rollout cache.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable exact rollout cache reads and writes.",
+    )
+    parser.add_argument(
+        "--cache-version",
+        type=str,
+        default=None,
+        help="Optional manual cache namespace suffix; defaults to source and engine digests.",
+    )
     parser.add_argument(
         "--worker-slot",
         type=int,
@@ -214,6 +239,58 @@ def _final_hp(state: GameStateView) -> int:
     return _safe_int(state.player.get("hp"), 0)
 
 
+def _replay_cached_seed(
+    protocol: HttpCliProtocol,
+    policy: SimpleFlowPolicy,
+    cached,
+    seed: str,
+    *,
+    max_steps: int,
+) -> dict[str, Any] | None:
+    rng = random.Random(seed)
+    state = protocol.adapt_state(cached.initial_state)
+    steps = 0
+    max_floor = _state_floor(state)
+    for entry in cached.transitions:
+        if steps >= max_steps:
+            return None
+        if state_hash(state.raw) != str(entry.get("state_hash") or ""):
+            return None
+        action = protocol.sanitize_action(state, policy.choose_action(state, rng), rng)
+        if action_hash(action) != str(entry.get("action_hash") or ""):
+            return None
+        result = ProtocolStepResult(
+            status=str(entry.get("status") or "error"),
+            state=entry.get("state"),
+            reward=float(entry.get("reward") or 0.0),
+            message=str(entry.get("message") or ""),
+            last_state=entry.get("last_state"),
+            raw=dict(entry.get("raw") or {}),
+        )
+        if result.status != "success" or not result.state:
+            return None
+        state = protocol.adapt_state(result.state)
+        max_floor = max(max_floor, _state_floor(state))
+        steps += 1
+        if state.game_over:
+            break
+    if not state.game_over:
+        return None
+    outcome = dict(cached.outcome)
+    outcome.update(
+        {
+            "success": True,
+            "victory": bool(state.victory),
+            "steps": steps,
+            "max_floor": max_floor,
+            "final_hp": _final_hp(state),
+            "error": "",
+            "cache_hit": True,
+        }
+    )
+    return outcome
+
+
 def _run_single_seed(
     protocol: HttpCliProtocol,
     policy: SimpleFlowPolicy,
@@ -222,12 +299,15 @@ def _run_single_seed(
     character: str,
     max_steps: int,
     worker_slot: int | None = None,
+    cache: BacktestRolloutCache | None = None,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     game_id = ""
     max_floor = 0
     steps = 0
     state: GameStateView | None = None
+    initial_state: dict[str, Any] | None = None
+    transitions: list[dict[str, Any]] = []
     outcome: dict[str, Any] = {
         "seed": seed,
         "success": False,
@@ -236,27 +316,52 @@ def _run_single_seed(
         "max_floor": 0,
         "final_hp": 0,
         "error": "",
+        "cache_hit": False,
     }
+    if cache is not None:
+        cached = cache.load(seed=seed, character=character)
+        if cached is not None:
+            replayed = _replay_cached_seed(protocol, policy, cached, seed, max_steps=max_steps)
+            if replayed is not None:
+                return replayed
+            cache.mismatches += 1
     try:
         start = protocol.start_game(character, seed, worker_slot=worker_slot)
         game_id = start.game_id
         raw_state = start.raw_state or protocol.get_state(game_id)
+        initial_state = raw_state
         state = protocol.adapt_state(raw_state)
         max_floor = max(max_floor, _state_floor(state))
         while steps < max_steps:
             if state.game_over:
                 break
             action = protocol.sanitize_action(state, policy.choose_action(state, rng), rng)
+            before_hash = state_hash(state.raw)
             result = protocol.step(game_id, action)
             if result.status != "success":
                 recover = protocol.recover_action_from_error(result.raw, state) or FlowAction("proceed")
-                retry = protocol.step(game_id, protocol.sanitize_action(state, recover, rng))
+                action = protocol.sanitize_action(state, recover, rng)
+                before_hash = state_hash(state.raw)
+                retry = protocol.step(game_id, action)
                 if retry.status != "success":
                     outcome["error"] = str(retry.message or result.message or "step_failed")
                     raw_state = result.last_state or state.raw
                     state = protocol.adapt_state(raw_state)
                     break
                 result = retry
+            transitions.append(
+                {
+                    "state_hash": before_hash,
+                    "action": action_payload(action),
+                    "action_hash": action_hash(action),
+                    "status": result.status,
+                    "state": result.state,
+                    "reward": result.reward,
+                    "message": result.message,
+                    "last_state": result.last_state,
+                    "raw": result.raw,
+                }
+            )
             raw_state = result.state or state.raw
             state = protocol.adapt_state(raw_state)
             max_floor = max(max_floor, _state_floor(state))
@@ -274,6 +379,14 @@ def _run_single_seed(
         if state is not None and steps >= max_steps and not state.game_over:
             outcome["error"] = f"max_steps_exceeded:{max_steps}"
             outcome["success"] = False
+        if cache is not None and initial_state is not None and outcome.get("success"):
+            cache.store(
+                seed=seed,
+                character=character,
+                initial_state=initial_state,
+                transitions=transitions,
+                outcome=outcome,
+            )
     except Exception as exc:  # pragma: no cover - network/runtime dependent
         outcome["error"] = str(exc)
     finally:
@@ -291,6 +404,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     success = len(done)
     floors = [int(row.get("max_floor") or 0) for row in done]
     victories = sum(1 for row in done if row.get("victory"))
+    cache_hits = sum(1 for row in rows if row.get("cache_hit"))
     return {
         "total": total,
         "success": success,
@@ -300,6 +414,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ge10": sum(1 for value in floors if value >= 10),
         "ge15": sum(1 for value in floors if value >= 15),
         "ge17": sum(1 for value in floors if value >= 17),
+        "cache_hits": cache_hits,
     }
 
 
@@ -311,6 +426,7 @@ def _run_dataset(
     character: str,
     max_steps: int,
     worker_slot: int | None = None,
+    cache: BacktestRolloutCache | None = None,
 ) -> dict[str, Any]:
     name = str(dataset.get("name") or "dataset")
     seeds = list(dataset.get("seeds") or [])
@@ -323,12 +439,14 @@ def _run_dataset(
             character=character,
             max_steps=max(100, max_steps),
             worker_slot=worker_slot,
+            cache=cache,
         )
         row["dataset"] = name
         rows.append(row)
         print(
             f"[{name} {index:03d}/{len(seeds):03d}] seed={seed} success={row['success']} "
-            f"victory={row['victory']} floor={row['max_floor']} steps={row['steps']} err={row['error']}"
+            f"victory={row['victory']} floor={row['max_floor']} steps={row['steps']} "
+            f"cache={bool(row.get('cache_hit'))} err={row['error']}"
         )
     return {
         "name": name,
@@ -347,6 +465,14 @@ def main() -> None:
     protocol = HttpCliProtocol(HttpCliProtocolConfig(timeout_seconds=args.timeout_seconds))
     policy = SimpleFlowPolicy(FlowPolicyConfig())
     protocol.health_check(retries=2)
+    cache: BacktestRolloutCache | None = None
+    cache_namespace = ""
+    if not args.no_cache:
+        repo_root = Path(__file__).resolve().parents[1]
+        cache_namespace = args.cache_version or f"flow_policy_{source_digest(repo_root)}"
+        cache_path = args.cache_dir / "rollouts.sqlite3"
+        cache = BacktestRolloutCache(cache_path, namespace=cache_namespace)
+        print(json.dumps({"cache": cache.stats()}, ensure_ascii=False, indent=2))
 
     dataset_payloads: list[dict[str, Any]] = []
     merged_rows: list[dict[str, Any]] = []
@@ -358,6 +484,7 @@ def main() -> None:
             character=args.character,
             max_steps=max(100, args.max_steps),
             worker_slot=args.worker_slot,
+            cache=cache,
         )
         dataset_payloads.append(payload)
         merged_rows.extend(payload["rows"])
@@ -373,9 +500,12 @@ def main() -> None:
             "history_floor_threshold": int(args.history_floor_threshold),
             "curated_seeds_file": str(args.seeds_file),
             "random_count": int(args.random_count),
+            "cache_enabled": cache is not None,
+            "cache_namespace": cache_namespace,
         },
         "datasets": dataset_payloads,
         "merged_summary": _summary(merged_rows),
+        "cache": cache.stats() if cache is not None else {"enabled": False},
     }
     print(json.dumps(payload["merged_summary"], ensure_ascii=False, indent=2))
     if args.out:
