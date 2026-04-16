@@ -49,8 +49,6 @@ _EVENT_POSITIVE_TOKENS = (
     "smith",
     "transform",
     "gold",
-    "max hp",
-    "maxhp",
     "\u9057\u7269",
     "\u836f\u6c34",
     "\u5220\u724c",
@@ -59,7 +57,6 @@ _EVENT_POSITIVE_TOKENS = (
     "\u953b\u9020",
     "\u53d8\u5316",
     "\u91d1\u5e01",
-    "\u6700\u5927\u751f\u547d",
 )
 _EVENT_NEGATIVE_TOKENS = (
     "curse",
@@ -77,17 +74,17 @@ _EVENT_NEGATIVE_TOKENS = (
 )
 _CARD_REWARD_PRIORS = {
     "CARD.FLAME_BARRIER": 2.4,
-    "CARD.SHRUG_IT_OFF": 2.2,
-    "CARD.TRUE_GRIT": 2.0,
+    "CARD.SHRUG_IT_OFF": 2.7,
+    "CARD.TRUE_GRIT": -0.2,
     "CARD.ARMAMENTS": 1.9,
     "CARD.TAUNT": 1.6,
     "CARD.WHIRLWIND": 1.5,
     "CARD.UPPERCUT": 1.5,
     "CARD.INFLAME": 1.4,
-    "CARD.BATTLE_TRANCE": 1.4,
-    "CARD.BURNING_PACT": 2.1,
+    "CARD.BATTLE_TRANCE": 2.5,
+    "CARD.BURNING_PACT": 3.0,
     "CARD.GRAPPLE": 1.2,
-    "CARD.BLOODLETTING": 2.3,
+    "CARD.BLOODLETTING": 3.0,
     "CARD.RAMPAGE": 1.0,
     "CARD.PILLAGE": 1.0,
     "CARD.HEADBUTT": 0.9,
@@ -97,7 +94,7 @@ _CARD_REWARD_PRIORS = {
     "CARD.UNRELENTING": 0.2,
     "CARD.BODY_SLAM": -1.8,
     "CARD.TWIN_STRIKE": -1.8,
-    "CARD.POMMEL_STRIKE": -1.7,
+    "CARD.POMMEL_STRIKE": 2.4,
     "CARD.SETUP_STRIKE": -1.7,
     "CARD.HAVOC": -1.6,
     "CARD.PERFECTED_STRIKE": -1.6,
@@ -116,13 +113,15 @@ _CARD_REWARD_PRIORS = {
     "CARD.TREMBLE": -0.5,
 }
 
+_UNSUPPORTED_HEADLESS_CARD_IDS = {
+    "CARD.WHIRLWIND",
+}
+
 _ELITE_FIGHTER_IDS = {
     "CARD.FLAME_BARRIER",
     "CARD.SHRUG_IT_OFF",
-    "CARD.TRUE_GRIT",
     "CARD.ARMAMENTS",
     "CARD.TAUNT",
-    "CARD.WHIRLWIND",
     "CARD.UPPERCUT",
     "CARD.INFLAME",
     "CARD.BATTLE_TRANCE",
@@ -132,6 +131,88 @@ _ELITE_FIGHTER_IDS = {
     "CARD.HEMOKINESIS",
     "CARD.PILLAGE",
 }
+
+_ARCHETYPE_CARD_WEIGHTS: dict[str, dict[str, float]] = {
+    "strength": {
+        "CARD.INFLAME": 3.0,
+        "CARD.FIGHT_ME": 2.8,
+        "CARD.RUPTURE": 2.6,
+        "CARD.DEMON_FORM": 3.5,
+        "CARD.TWIN_STRIKE": 1.4,
+        "CARD.SWORD_BOOMERANG": 1.5,
+        "CARD.THRASH": 2.0,
+        "CARD.UPPERCUT": 1.2,
+        "CARD.WHIRLWIND": 1.0,
+    },
+    "block": {
+        "CARD.BODY_SLAM": 3.2,
+        "CARD.SHRUG_IT_OFF": 2.2,
+        "CARD.TRUE_GRIT": 0.4,
+        "CARD.FLAME_BARRIER": 2.4,
+        "CARD.TAUNT": 2.0,
+        "CARD.STONE_ARMOR": 2.2,
+        "CARD.JUGGERNAUT": 2.8,
+        "CARD.BARRICADE": 3.2,
+        "CARD.CRIMSON_MANTLE": 1.5,
+        "CARD.IMPERVIOUS": 2.3,
+    },
+    "exhaust": {
+        "CARD.CORRUPTION": 4.0,
+        "CARD.DARK_EMBRACE": 3.8,
+        "CARD.FEEL_NO_PAIN": 3.5,
+        "CARD.TRUE_GRIT": 0.6,
+        "CARD.BURNING_PACT": 2.5,
+        "CARD.FORGOTTEN_RITUAL": 2.0,
+        "CARD.BRAND": 2.2,
+        "CARD.OFFERING": 2.5,
+        "CARD.PACTS_END": 2.8,
+        "CARD.ASHEN_STRIKE": 1.7,
+        "CARD.THRASH": 1.6,
+        "CARD.JUGGERNAUT": 1.7,
+        "CARD.BODY_SLAM": 1.6,
+        "CARD.EVIL_EYE": 1.6,
+    },
+    "bloodletting": {
+        "CARD.BLOODLETTING": 3.4,
+        "CARD.RUPTURE": 3.2,
+        "CARD.INFERNO": 3.0,
+        "CARD.BREAKTHROUGH": 2.3,
+        "CARD.HEMOKINESIS": 2.2,
+        "CARD.CRIMSON_MANTLE": 2.1,
+        "CARD.OFFERING": 2.3,
+        "CARD.BRAND": 1.8,
+        "CARD.FEED": 1.8,
+        "CARD.TEAR_ASUNDER": 2.2,
+        "CARD.POMMEL_STRIKE": 1.7,
+        "CARD.SHRUG_IT_OFF": 1.5,
+        "CARD.BURNING_PACT": 1.6,
+        "CARD.BATTLE_TRANCE": 1.7,
+    },
+    "strike": {
+        "CARD.PERFECTED_STRIKE": 3.0,
+        "CARD.POMMEL_STRIKE": 2.5,
+        "CARD.TWIN_STRIKE": 2.0,
+        "CARD.BREAKTHROUGH": 1.8,
+        "CARD.TREMBLE": 1.2,
+        "CARD.TAUNT": 1.8,
+        "CARD.EXPECT_A_FIGHT": 2.0,
+        "CARD.PYRE": 1.8,
+        "CARD.HELLRAISER": 2.4,
+        "CARD.COLOSSUS": 1.8,
+        "CARD.CRUELTY": 1.6,
+        "CARD.UPPERCUT": 1.4,
+    },
+}
+
+_ARCHETYPE_ANCHORS: dict[str, set[str]] = {
+    "strength": {"CARD.INFLAME", "CARD.FIGHT_ME", "CARD.RUPTURE", "CARD.DEMON_FORM"},
+    "block": {"CARD.BODY_SLAM", "CARD.JUGGERNAUT", "CARD.BARRICADE", "CARD.STONE_ARMOR"},
+    "exhaust": {"CARD.CORRUPTION", "CARD.DARK_EMBRACE", "CARD.FEEL_NO_PAIN"},
+    "bloodletting": {"CARD.BLOODLETTING", "CARD.RUPTURE", "CARD.INFERNO", "CARD.CRIMSON_MANTLE"},
+    "strike": {"CARD.PERFECTED_STRIKE", "CARD.HELLRAISER", "CARD.EXPECT_A_FIGHT"},
+}
+
+_ARCHETYPE_COMPONENT_HUNGRY = {"exhaust"}
 
 
 def _text(value: Any) -> str:
@@ -158,6 +239,28 @@ def _stats_total(card: dict[str, Any]) -> int:
     for value in stats.values():
         total += max(0, _safe_int(value, 0))
     return total
+
+
+def _stat_value(card: dict[str, Any], *names: str) -> int:
+    stats = card.get("stats") or {}
+    if not isinstance(stats, dict):
+        return 0
+    lowered = {str(key).lower(): value for key, value in stats.items()}
+    return max((_safe_int(lowered.get(name.lower()), 0) for name in names), default=0)
+
+
+def _card_draw_amount(card: dict[str, Any]) -> int:
+    card_id = _card_id(card)
+    if card_id in {"CARD.POMMEL_STRIKE", "CARD.SHRUG_IT_OFF", "CARD.BURNING_PACT", "CARD.BATTLE_TRANCE"}:
+        return _stat_value(card, "cards", "draw")
+    description = _description(card)
+    if "draw" in description or "\u62bd" in description:
+        return _stat_value(card, "cards", "draw")
+    return _stat_value(card, "draw")
+
+
+def _card_energy_amount(card: dict[str, Any]) -> int:
+    return _stat_value(card, "energy")
 
 
 def _description(card: dict[str, Any]) -> str:
@@ -189,8 +292,11 @@ def is_negative_card(card: dict[str, Any]) -> bool:
     card_type = _text(card.get("type"))
     if card_type in _NEGATIVE_TYPES:
         return True
+    card_id = _card_id(card)
+    if card_id in {"CARD.BURN", "CARD.WOUND", "CARD.DAZED", "CARD.VOID", "CARD.REGRET", "CARD.SHAME"}:
+        return True
     text = f"{_text(card.get('name'))} {_text(card.get('id'))}"
-    return any(token in text for token in ("curse", "status", "wound", "burn", "dazed", "void", "regret", "shame"))
+    return any(token in text for token in ("curse", "status", "wound", "dazed", "void", "regret", "shame"))
 
 
 def is_exhaust_card(card: dict[str, Any]) -> bool:
@@ -292,6 +398,64 @@ def _deck_basics(deck: list[dict[str, Any]]) -> dict[str, int]:
     return {"strike": strikes, "defend": defends, "total": strikes + defends}
 
 
+def _deck_archetype_scores(deck: list[dict[str, Any]]) -> dict[str, float]:
+    scores = {name: 0.0 for name in _ARCHETYPE_CARD_WEIGHTS}
+    for card in deck:
+        if not isinstance(card, dict):
+            continue
+        card_id = _card_id(card)
+        for name, weights in _ARCHETYPE_CARD_WEIGHTS.items():
+            scores[name] += weights.get(card_id, 0.0)
+        if _card_draw_amount(card) > 0:
+            scores["bloodletting"] += 0.35
+            scores["exhaust"] += 0.25
+            scores["strike"] += 0.2
+        if _card_energy_amount(card) > 0:
+            scores["bloodletting"] += 0.35
+            scores["strike"] += 0.25
+            scores["strength"] += 0.2
+        if is_exhaust_card(card):
+            scores["exhaust"] += 0.35
+        if _text(card.get("type")) == "skill" and any(token in _description(card) for token in ("block", "\u683c\u6321")):
+            scores["block"] += 0.25
+    return scores
+
+
+def _deck_archetype_anchors(deck: list[dict[str, Any]]) -> dict[str, int]:
+    anchors = {name: 0 for name in _ARCHETYPE_CARD_WEIGHTS}
+    for card in deck:
+        if not isinstance(card, dict):
+            continue
+        card_id = _card_id(card)
+        for name, anchor_ids in _ARCHETYPE_ANCHORS.items():
+            if card_id in anchor_ids:
+                anchors[name] += 1
+    return anchors
+
+
+def _archetype_reward_bonus(card: dict[str, Any], deck: list[dict[str, Any]]) -> float:
+    if not deck:
+        return 0.0
+    card_id = _card_id(card)
+    deck_size = len(deck)
+    scores = _deck_archetype_scores(deck)
+    anchors = _deck_archetype_anchors(deck)
+    bonus = 0.0
+    for name, weights in _ARCHETYPE_CARD_WEIGHTS.items():
+        weight = weights.get(card_id, 0.0)
+        if weight <= 0:
+            continue
+        anchor_count = anchors.get(name, 0)
+        affinity = scores.get(name, 0.0)
+        if anchor_count <= 0:
+            continue
+        if deck_size < 15 and anchor_count < 2:
+            continue
+        bonus += min(weight * (0.07 + min(affinity, 12.0) * 0.012), 0.8)
+
+    return bonus
+
+
 @lru_cache(maxsize=1)
 def _knowledge_card_index() -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
@@ -322,6 +486,8 @@ def _lookup_card_knowledge(card: dict[str, Any]) -> dict[str, Any] | None:
 
 def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] | None = None) -> float:
     deck = [item for item in (deck or []) if isinstance(item, dict)]
+    if _card_id(card) in _UNSUPPORTED_HEADLESS_CARD_IDS:
+        return -100.0
     if is_negative_card(card):
         return -100.0
 
@@ -330,16 +496,20 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     if not rarity and isinstance(knowledge, dict):
         rarity = knowledge.get("rarity")
     score = _rarity_value(rarity)
-    score += min(_stats_total(card), 24) * 0.12
+    non_engine_stats = max(0, _stats_total(card) - _card_draw_amount(card) - _card_energy_amount(card))
+    score += min(non_engine_stats, 24) * 0.12
     score += min(sum(1 for token in _UTILITY_TOKENS if token in _description(card)), 4) * 0.35
+    draw_amount = _card_draw_amount(card)
+    energy_amount = _card_energy_amount(card)
+    if draw_amount > 0:
+        score += min(draw_amount, 4) * 0.75
+    if energy_amount > 0:
+        score += min(energy_amount, 3) * 0.95
     if card.get("after_upgrade"):
         score += 0.35
 
     if is_basic_strike(card) or is_basic_defend(card):
         score -= 3.5
-
-    if is_exhaust_card(card):
-        score -= 1.2
 
     score += _CARD_REWARD_PRIORS.get(_card_id(card), 0.0)
 
@@ -349,7 +519,9 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     deck_size = len(deck)
     if cost >= 2 and counts["high_cost"] >= 3:
         score -= 0.8
-    if is_exhaust_card(card) and counts["exhaust"] >= 3:
+    if is_exhaust_card(card) and _card_id(card) not in {"CARD.BURNING_PACT", "CARD.TRUE_GRIT"}:
+        score -= 1.2
+    if is_exhaust_card(card) and counts["exhaust"] >= 3 and _card_id(card) != "CARD.BURNING_PACT":
         score -= 0.6
 
     card_type = _text(card.get("type"))
@@ -364,15 +536,29 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     if card_id_upper == "CARD.BLOODLETTING":
         score += 0.6
         if counts["draw"] >= 2:
-            score += 0.8
+            score += 1.2
         if counts["zero_cost"] >= 3:
             score += 0.35
+        if counts["burning_pact"] > 0:
+            score += 1.0
     if card_id_upper == "CARD.BURNING_PACT":
         score += 0.5
         if basics["total"] >= 4:
             score += 0.7
+        if counts["bloodletting"] > 0:
+            score += 1.2
+    if card_id_upper == "CARD.TRUE_GRIT":
+        if not bool(card.get("upgraded")):
+            score -= 1.8
+        if counts["attack"] <= 5:
+            score -= 0.8
+        if _deck_archetype_anchors(deck).get("exhaust", 0) <= 0:
+            score -= 0.8
+    if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.SHRUG_IT_OFF"} and counts["bloodletting"] > 0:
+        score += 0.8
     if counts["bloodletting"] > 0 and any(token in _description(card) for token in ("draw", "\u62bd\u724c")):
         score += 0.5
+    score += _archetype_reward_bonus(card, deck)
     if deck_size >= 22 and cost >= 2 and counts["high_cost"] >= 4:
         score -= 0.5
     if deck_size >= 25 and score < 3.6:
@@ -428,12 +614,52 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
     deck = [card for card in (state.player.get("deck") or []) if isinstance(card, dict)]
     elite_readiness = estimate_elite_readiness(deck, hp_ratio, floor)
     purge_target = choose_purge_target(deck)
+    node_by_coord: dict[tuple[int, int], dict[str, Any]] = {}
+    for node in state.map_nodes:
+        if isinstance(node, dict):
+            node_by_coord[(_safe_int(node.get("col"), -1), _safe_int(node.get("row"), -1))] = node
+    for row in (state.full_map.get("rows") or []):
+        if not isinstance(row, list):
+            continue
+        for node in row:
+            if isinstance(node, dict):
+                node_by_coord[(_safe_int(node.get("col"), -1), _safe_int(node.get("row"), -1))] = node
 
     def room_type(choice: dict[str, Any]) -> str:
-        return _text(choice.get("room_type") or choice.get("type") or choice.get("symbol") or choice.get("icon"))
+        node = node_by_coord.get((_safe_int(choice.get("col"), -1), _safe_int(choice.get("row"), -1)), {})
+        return _text(
+            choice.get("room_type")
+            or choice.get("type")
+            or choice.get("symbol")
+            or choice.get("icon")
+            or node.get("room_type")
+            or node.get("type")
+            or node.get("symbol")
+        )
+
+    def child_room_types(choice: dict[str, Any]) -> list[str]:
+        node = node_by_coord.get((_safe_int(choice.get("col"), -1), _safe_int(choice.get("row"), -1)), {})
+        children = node.get("children") or choice.get("children") or []
+        rooms: list[str] = []
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            child_node = node_by_coord.get((_safe_int(child.get("col"), -1), _safe_int(child.get("row"), -1)), child)
+            rooms.append(
+                _text(
+                    child_node.get("room_type")
+                    or child_node.get("type")
+                    or child_node.get("symbol")
+                    or child.get("room_type")
+                    or child.get("type")
+                    or child.get("symbol")
+                )
+            )
+        return rooms
 
     def score(choice: dict[str, Any]) -> tuple[float, int, int]:
         room = room_type(choice)
+        next_rooms = child_room_types(choice)
         value = 0.0
         if "elite" in room:
             if floor <= 6:
@@ -449,19 +675,35 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
         elif "rest" in room or "camp" in room or room == "r":
             value = 3.2 if hp_ratio < 0.5 else (2.1 if hp_ratio < 0.7 else 0.65)
         elif "shop" in room or room in {"merchant", "$", "s"}:
-            value = 2.0 if state.gold >= 150 else (-0.25 if state.gold < 110 else 0.6)
+            value = 2.0 if state.gold >= 150 else (-0.25 if state.gold < 110 else 1.35)
             if purge_target is not None and state.gold >= 75:
                 value += 0.7
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
-            value = 1.55
+            if floor <= 10 and hp_ratio >= 0.55:
+                value = 1.3
+            elif floor <= 10:
+                value = 1.45
+            else:
+                value = 1.45
         elif "monster" in room or "combat" in room or room == "m":
-            value = 1.25
+            if floor <= 10 and hp_ratio >= 0.55:
+                value = 1.45
+            elif floor <= 10:
+                value = 0.95
+            else:
+                value = 1.25
         elif "boss" in room or room == "b":
             value = 4.0
         else:
             value = 1.0
+        if any("elite" in next_room for next_room in next_rooms) and hp_ratio < 0.72 and elite_readiness < 1.15:
+            value -= 1.4
+        if any("elite" in next_room for next_room in next_rooms) and ("rest" in room or "shop" in room):
+            value += 0.35
+        if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):
+            value -= 0.65
         return (
             value,
             -_safe_int(choice.get("row"), 0),
@@ -485,6 +727,23 @@ def choose_card_reward(cards: list[dict[str, Any]], deck: list[dict[str, Any]] |
     sparse_offer = all(_has_sparse_card_metadata(card) for card in indexed)
     if can_skip:
         threshold = 0.0 if sparse_offer else 1.25
+        if deck_size <= 14:
+            threshold = min(threshold, -0.25)
+
+        replacement: tuple[float, dict[str, Any]] | None = None
+        for candidate_score, candidate_card in scored:
+            if candidate_score < threshold:
+                continue
+            if deck_size >= 12 and (is_basic_strike(candidate_card) or is_basic_defend(candidate_card)):
+                continue
+            if is_low_impact_card(candidate_card) and candidate_score < 2.0:
+                continue
+            replacement = (candidate_score, candidate_card)
+            break
+        if replacement is None:
+            return None
+        best_score, best_card = replacement
+
         if best_score < threshold:
             return None
         if deck_size >= 25 and best_score < 3.4:
@@ -552,6 +811,9 @@ def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
     indexed = [card for card in cards if isinstance(card, dict) and card.get("index") is not None]
     if not indexed:
         return None
+    deck = [card for card in cards if isinstance(card, dict)]
+    archetype_scores = _deck_archetype_scores(deck)
+    archetype_anchors = _deck_archetype_anchors(deck)
 
     def core_priority(card: dict[str, Any]) -> int:
         card_id = _card_id(card)
@@ -559,6 +821,7 @@ def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
             "CARD.BURNING_PACT",
             "CARD.BLOODLETTING",
             "CARD.SHRUG_IT_OFF",
+            "CARD.POMMEL_STRIKE",
             "CARD.FLAME_BARRIER",
             "CARD.TRUE_GRIT",
             "CARD.BATTLE_TRANCE",
@@ -571,12 +834,28 @@ def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
             return 1
         return 2
 
-    def score(card: dict[str, Any]) -> tuple[int, int, int, float, int]:
+    def archetype_priority(card: dict[str, Any]) -> float:
+        card_id = _card_id(card)
+        priority = 0.0
+        for name, weights in _ARCHETYPE_CARD_WEIGHTS.items():
+            weight = weights.get(card_id, 0.0)
+            if weight <= 0:
+                continue
+            anchor_count = archetype_anchors.get(name, 0)
+            if anchor_count <= 0:
+                continue
+            if len(deck) < 15 and anchor_count < 2:
+                continue
+            priority += weight * (1.0 + min(archetype_scores.get(name, 0.0), 12.0) / 12.0)
+        return priority
+
+    def score(card: dict[str, Any]) -> tuple[int, int, int, float, float, int]:
         return (
             core_priority(card),
             1 if is_basic_strike(card) or is_basic_defend(card) else 0,
             1 if bool(card.get("upgraded")) else 0,
             0 if card.get("after_upgrade") else 1,
+            -archetype_priority(card),
             -estimate_card_reward_score(card, cards),
             _safe_int(card.get("cost"), 99),
         )
@@ -690,11 +969,53 @@ def choose_event_option(options: list[dict[str, Any]], state: GameStateView) -> 
     def option_score(option: dict[str, Any]) -> tuple[float, int]:
         text = " ".join(
             _text(option.get(key))
-            for key in ("option_id", "name", "label", "description")
+            for key in ("option_id", "name", "label", "title", "description", "text_key")
         )
+        vars_payload = option.get("vars") or {}
         score = 0.0
         score += sum(1.6 for token in _EVENT_POSITIVE_TOKENS if token in text)
         score -= sum(1.8 for token in _EVENT_NEGATIVE_TOKENS if token in text)
+        if "relic" in text or "遗物" in text or "{relic}" in text:
+            score += 2.5
+        if "gold" in text or "金币" in text or "{gold}" in text:
+            score -= 0.8
+        if isinstance(vars_payload, dict):
+            if any(str(key).lower() == "relic" for key in vars_payload):
+                score += 4.0
+            if any(str(key).lower() == "potion" for key in vars_payload):
+                score += 2.2
+            gold_amount = max(_safe_int(vars_payload.get("Gold"), 0), _safe_int(vars_payload.get("gold"), 0))
+            if gold_amount > 0:
+                score += min(gold_amount / 80.0, 2.5)
+            hp_loss = max(_safe_int(vars_payload.get("HpLoss"), 0), _safe_int(vars_payload.get("hp_loss"), 0))
+            if hp_loss > 0:
+                score -= min(hp_loss / 3.0, 4.0)
+                if hp_ratio < 0.6:
+                    score -= 1.5
+                if hp_ratio < 0.45:
+                    score -= 1.5
+            max_hp_delta = max(_safe_int(vars_payload.get("MaxHp"), 0), _safe_int(vars_payload.get("max_hp"), 0))
+            if max_hp_delta > 0:
+                loses_max_hp = (
+                    "lose max hp" in text
+                    or ("失去" in text and "最大生命" in text)
+                    or ("lose hp" in text and "max hp" in text)
+                    or ("扣除" in text and "最大生命" in text)
+                    or ("减少" in text and "最大生命" in text)
+                )
+                gains_max_hp = (
+                    "gain max hp" in text
+                    or ("获得" in text and "最大生命" in text)
+                    or ("提升" in text and "最大生命" in text)
+                    or ("增加" in text and "最大生命" in text)
+                    or "increase max hp" in text
+                )
+                if loses_max_hp:
+                    score -= min(max_hp_delta / 2.5, 5.0)
+                elif gains_max_hp:
+                    score += min(max_hp_delta / 4.0, 3.0)
+            if any(token in text for token in ("transform", "变化", "变形")):
+                score += 1.8
         if "skip" in text or "\u8df3\u8fc7" in text:
             score -= 0.25
         if hp_ratio < 0.45 and any(token in text for token in ("hp", "\u751f\u547d", "\u53d7\u4f24", "\u4f24\u5bb3")):

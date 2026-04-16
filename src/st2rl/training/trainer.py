@@ -273,6 +273,17 @@ class UnifiedTrainer:
 
         self.model.save(path)
 
+    def close(self) -> None:
+        """Release vectorized environments and their remote game sessions."""
+        env = self.env
+        self.env = None
+        if env is None:
+            return
+        try:
+            env.close()
+        except Exception:
+            pass
+
     def load(self, path: str):
         """加载模型"""
         if self.env is None:

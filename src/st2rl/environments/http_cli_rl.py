@@ -33,7 +33,7 @@ class HttpCliEnvConfig:
     character: str = "Ironclad"
     max_steps: int | None = 5000
     game_dir: str | None = None
-    base_url: str = "http://localhost:5000"
+    base_url: str = "http://127.0.0.1:5000"
     timeout_seconds: int = 30
     health_check_retries: int = 2
     step_delay_seconds: float = 0.0

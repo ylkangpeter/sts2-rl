@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -242,6 +243,17 @@ def _service_health(runtime: dict[str, Any]) -> dict[str, Any]:
     return _json_request(f"{_service_base_url(runtime)}/health")
 
 
+def _service_request(
+    runtime: dict[str, Any],
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    return _json_request(f"{_service_base_url(runtime)}{path}", method=method, payload=payload, timeout=timeout)
+
+
 def _subprocess_kwargs() -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -252,9 +264,19 @@ def _subprocess_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+def _powershell_executable() -> str:
+    if os.name != "nt":
+        return "powershell"
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    candidate = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if candidate.exists():
+        return str(candidate)
+    return "powershell.exe"
+
+
 def _run_powershell(command: str, timeout: int = 20) -> str:
     completed = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", command],
+        [_powershell_executable(), "-NoProfile", "-Command", command],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -266,11 +288,15 @@ def _run_powershell(command: str, timeout: int = 20) -> str:
 
 
 def _find_python_pids(pattern: str) -> list[int]:
-    escaped = pattern.replace("\\", "\\\\").replace("'", "''")
+    needle = str(pattern or "").strip()
+    if not needle:
+        return []
+    escaped = needle.replace("'", "''")
     try:
         output = _run_powershell(
-            "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" | "
-            f"Where-Object {{ $_.CommandLine -and $_.CommandLine -match '{escaped}' }} | "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -match '^python(w)?\\.exe$' -and $_.CommandLine } | "
+            f"Where-Object {{ $_.CommandLine.Replace('\\\\', '\\').IndexOf('{escaped}'.Replace('\\\\', '\\'), [StringComparison]::OrdinalIgnoreCase) -ge 0 }} | "
             "ForEach-Object { $_.ProcessId }"
         )
     except Exception:
@@ -282,13 +308,29 @@ def _pid_file(name: str) -> Path:
     return ROOT / "logs" / "launcher" / f"{name}.pid"
 
 
+def _record_pid(name: str, pid: int) -> None:
+    path = _pid_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(int(pid)), encoding="utf-8")
+
+
+def _clear_pid(name: str) -> None:
+    path = _pid_file(name)
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
         result = subprocess.run(
             [
-                "powershell",
+                _powershell_executable(),
                 "-NoProfile",
                 "-Command",
                 f"$ErrorActionPreference='Stop'; Get-Process -Id {int(pid)} | Out-Null",
@@ -405,16 +447,78 @@ def _start_managed_process(name: str, node: dict[str, Any] | None, runtime: dict
         return False
 
 
+def _spawn_replacement_watchdog(runtime: dict[str, Any]) -> None:
+    watchdog = runtime.get("watchdog") or {}
+    if not isinstance(watchdog, dict) or not bool(watchdog.get("enabled", False)):
+        return
+
+    default_root = _project_root(runtime, "st2rl_root", ROOT)
+    workdir = _resolve_managed_path(default_root, watchdog.get("workdir") or default_root)
+    script_path = _resolve_managed_path(default_root, watchdog.get("script"))
+    if not script_path.exists():
+        print(f"[watchdog] replacement watchdog script missing at {script_path}", flush=True)
+        return
+
+    log_dir = ROOT / "logs" / "launcher"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = log_dir / "watchdog.out.log"
+    stderr_path = log_dir / "watchdog.err.log"
+
+    env = os.environ.copy()
+    env.update(_shared_runtime_env(runtime))
+    for key, value in (watchdog.get("env") or {}).items():
+        env[str(key)] = str(value)
+    python_executable = _node_python_executable(runtime, watchdog)
+
+    try:
+        with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
+            subprocess.Popen(
+                [python_executable, str(script_path)],
+                cwd=str(workdir),
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                env=env,
+                **_subprocess_kwargs(),
+            )
+        print("[watchdog] replacement watchdog spawned", flush=True)
+    except Exception as exc:
+        print(f"[watchdog] failed to spawn replacement watchdog: {exc}", flush=True)
+
+
+def _node_health_url(node: dict[str, Any] | None) -> str | None:
+    if not isinstance(node, dict):
+        return None
+    explicit = str(node.get("base_url") or "").strip()
+    health_path = str(node.get("health_path") or "").strip()
+    if explicit and health_path:
+        return f"{explicit.rstrip('/')}{health_path}"
+    host = str(node.get("host") or "").strip()
+    port = _safe_int(node.get("port"), 0)
+    if host and port > 0 and health_path:
+        return f"http://{host}:{port}{health_path}"
+    return None
+
+
 def _is_managed_process_running(node: dict[str, Any] | None) -> bool:
     if not isinstance(node, dict):
         return True
     if not bool(node.get("enabled", False)):
         return True
+    health_url = _node_health_url(node)
+    if health_url:
+        try:
+            _json_request(health_url, timeout=3.0)
+            return True
+        except Exception:
+            pass
     pid_name = _node_pid_name(node)
     if pid_name:
         pid = _pid_from_file(pid_name)
         if pid is not None:
             return True
+    port = _safe_int(node.get("port"), 0)
+    if port > 0 and _listening_port_pids(port):
+        return True
     process_match = str(node.get("process_match") or "").strip()
     if not process_match:
         return True
@@ -432,7 +536,7 @@ def _stop_processes(pids: list[int]) -> None:
     for pid in pids:
         try:
             subprocess.run(
-                ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {int(pid)} -Force"],
+                [_powershell_executable(), "-NoProfile", "-Command", f"Stop-Process -Id {int(pid)} -Force"],
                 cwd=str(ROOT),
                 capture_output=True,
                 text=True,
@@ -456,7 +560,7 @@ def _wait_for_url(url: str, *, timeout_seconds: int = 30) -> bool:
 
 def _start_stack(*, include_client: bool = True) -> None:
     command = [
-        "powershell",
+        _powershell_executable(),
         "-ExecutionPolicy",
         "Bypass",
         "-File",
@@ -556,7 +660,7 @@ Start-Sleep -Seconds 3
 Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-ExecutionPolicy','Bypass','-File',{start_stack_path}) | Out-Null
 """
     subprocess.Popen(
-        ["powershell", "-NoProfile", "-Command", script],
+        [_powershell_executable(), "-NoProfile", "-Command", script],
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -992,6 +1096,7 @@ def _restart_runtime(runtime: dict[str, Any], config: WatchdogConfig, reason: st
             f"[watchdog] restart completed: dashboard_ok={dashboard_ok} service_ok={service_ok}",
             flush=True,
         )
+        _spawn_replacement_watchdog(runtime)
     except Exception as exc:
         print(f"[watchdog] in-process restart failed, falling back to hard restart: {exc}", flush=True)
         _spawn_hard_restart()
@@ -1175,6 +1280,8 @@ def _write_status(snapshot: dict[str, Any] | None, incidents: list[dict[str, Any
 def main() -> None:
     WATCHDOG_ROOT.mkdir(parents=True, exist_ok=True)
     INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
+    _record_pid("watchdog", os.getpid())
+    atexit.register(lambda: _clear_pid("watchdog"))
     print("[watchdog] started", flush=True)
 
     while True:

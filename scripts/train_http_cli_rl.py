@@ -80,11 +80,15 @@ def _run_quality_is_bad(run_dir: Path) -> bool:
     finished = 0
     anomaly_flags = 0
     floor_sum = 0.0
+    ge17 = 0
     for row in _iter_history_rows(run_dir):
         if bool(row.get("active", False)):
             continue
         finished += 1
-        floor_sum += float(row.get("max_floor", row.get("floor", 0)) or 0.0)
+        floor = float(row.get("max_floor", row.get("floor", 0)) or 0.0)
+        floor_sum += floor
+        if floor >= 17:
+            ge17 += 1
         flags = row.get("anomaly_flags") or []
         if isinstance(flags, list) and flags:
             anomaly_flags += 1
@@ -92,7 +96,12 @@ def _run_quality_is_bad(run_dir: Path) -> bool:
         return False
     avg_floor = floor_sum / max(1, finished)
     anomaly_ratio = anomaly_flags / max(1, finished)
-    return (finished >= 80 and avg_floor < 4.0) or anomaly_ratio > 0.45
+    ge17_ratio = ge17 / max(1, finished)
+    return (
+        (finished >= 80 and avg_floor < 4.0)
+        or (finished >= 200 and avg_floor < 9.0 and ge17_ratio < 0.03)
+        or anomaly_ratio > 0.45
+    )
 
 
 def resolve_resume_model_path(config: dict, explicit_model_path: str | None, fresh_start: bool) -> str | None:
@@ -143,9 +152,12 @@ def main() -> None:
         config["training"]["vec_env"] = args.vec_env
     model_path = resolve_resume_model_path(config, args.model_path, args.fresh_start)
     trainer = UnifiedTrainer(config)
-    trainer.create_environment()
-    trainer.create_model(model_path=model_path)
-    trainer.train(total_timesteps=args.timesteps)
+    try:
+        trainer.create_environment()
+        trainer.create_model(model_path=model_path)
+        trainer.train(total_timesteps=args.timesteps)
+    finally:
+        trainer.close()
 
 
 if __name__ == "__main__":

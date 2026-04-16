@@ -205,7 +205,7 @@ def _best_healing_potion_action(state: GameStateView) -> Optional[FlowAction]:
 class HttpCliProtocolConfig:
     """Transport and session settings for the HTTP CLI protocol."""
 
-    base_url: str = "http://localhost:5000"
+    base_url: str = "http://127.0.0.1:5000"
     timeout_seconds: int = 30
     game_dir: str | None = None
     close_retries: int = 5
@@ -334,7 +334,7 @@ class HttpCliProtocol(FlowProtocol):
         attempts = 2 if worker_slot is not None else 1
         last_error: Dict[str, Any] | None = None
         for attempt in range(attempts):
-            data = self._request("POST", "/start", payload=payload)
+            data = self._request("POST", "/start", payload=payload, retries=5)
             if data.get("status") == "success":
                 return ProtocolStartResult(game_id=data["game_id"], raw_state=data.get("state") or {})
 
@@ -358,7 +358,7 @@ class HttpCliProtocol(FlowProtocol):
         return data["state"]
 
     def step(self, game_id: str, action: FlowAction) -> ProtocolStepResult:
-        data = self._request("POST", f"/step/{game_id}", payload=self._serialize_action(action))
+        data = self._request("POST", f"/step/{game_id}", payload=self._serialize_action(action), retries=2)
         return ProtocolStepResult(
             status=str(data.get("status", "error")),
             state=data.get("state"),
@@ -511,7 +511,6 @@ class HttpCliProtocol(FlowProtocol):
 
         if state.decision == "shop":
             _, _, free_potion_slots = _potion_slot_counts(state)
-            healing_potion_action = _best_healing_potion_action(state)
             affordable_cards = [
                 card for card in state.cards if isinstance(card, dict) and _is_buyable_shop_card(card) and card.get("cost", 9999) <= state.gold
             ]
@@ -541,8 +540,6 @@ class HttpCliProtocol(FlowProtocol):
             if safe.name == "leave_shop":
                 if replacement_target is not None:
                     return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
-                if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
-                    return healing_potion_action
                 if prioritize_purge and purge_target is not None:
                     return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
                 if state.gold >= 150 and best_relic is not None:
@@ -556,8 +553,6 @@ class HttpCliProtocol(FlowProtocol):
                     return safe
                 if replacement_target is not None:
                     return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
-            if free_potion_slots <= 0 and affordable_shop_potions and healing_potion_action is not None:
-                return healing_potion_action
             if replacement_target is not None:
                 return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
             if prioritize_purge and purge_target is not None:
@@ -604,7 +599,9 @@ class HttpCliProtocol(FlowProtocol):
                     ),
                     None,
                 )
-                if state.hp / max(1, state.max_hp) < 0.5 and heal is not None:
+                floor = _safe_int((state.raw.get("context") or {}).get("floor"), 0) or 0
+                heal_threshold = 0.7 if floor <= 8 else 0.62
+                if state.hp / max(1, state.max_hp) < heal_threshold and heal is not None:
                     return FlowAction("choose_option", {"option_index": heal.get("index", 0)})
                 if smith is not None:
                     return FlowAction("choose_option", {"option_index": smith.get("index", 0)})

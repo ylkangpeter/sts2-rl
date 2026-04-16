@@ -18,7 +18,7 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 8787,
-    "health_path": "/api/state",
+    "health_path": "/api/health",
     "script": "scripts\\training_dashboard.py",
     "workdir": ".",
     "process_match": "scripts\\\\training_dashboard.py",

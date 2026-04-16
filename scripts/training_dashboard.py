@@ -2742,6 +2742,24 @@ def api_state() -> Response:
     return jsonify(payload)
 
 
+@app.route("/api/health")
+def api_health() -> Response:
+    _ensure_snapshot_worker_started()
+    payload = _snapshot_cache_payload()
+    if payload is None:
+        payload = {}
+    training = payload.get("training") if isinstance(payload, dict) else {}
+    return jsonify(
+        {
+            "status": "ok",
+            "updated_at": payload.get("updated_at") if isinstance(payload, dict) else None,
+            "run_id": training.get("run_id") if isinstance(training, dict) else None,
+            "training_status": training.get("status") if isinstance(training, dict) else None,
+            "active_slots": len(payload.get("active_slots") or []) if isinstance(payload, dict) else 0,
+        }
+    )
+
+
 @app.route("/api/runtime/control")
 def api_runtime_control() -> Response:
     run_id = request.args.get("run_id")

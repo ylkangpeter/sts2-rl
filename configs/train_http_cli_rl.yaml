@@ -6,11 +6,12 @@ mode: headless
 environment:
   character: Ironclad
   max_steps: 5000
-  base_url: http://localhost:5000
+  base_url: http://127.0.0.1:5000
   game_dir:
   timeout_seconds: 30
   step_delay_seconds: 0.0
   recovery_delay_seconds: 0.01
+  transport_retry_delay_seconds: 0.25
   initial_state_poll_interval_seconds: 0.05
   stuck_warn_threshold: 60
   stuck_abort_threshold: 140
@@ -51,7 +52,7 @@ training:
   total_timesteps: 1000000
   save_freq: 2048
   verbose: 1
-  num_envs: 20
+  num_envs: 12
   vec_env: threaded
 
 paths:

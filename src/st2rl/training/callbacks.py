@@ -42,8 +42,10 @@ class TrainingCallback(BaseCallback):
         # 定期输出统计
         if self.n_calls % 1000 == 0 and self.verbose > 0:
             if self.episode_rewards:
-                mean_reward = np.mean(self.episode_rewards[-100:])
-                mean_length = np.mean(self.episode_lengths[-100:])
+                recent_rewards = list(self.episode_rewards)
+                recent_lengths = list(self.episode_lengths)
+                mean_reward = np.mean(recent_rewards)
+                mean_length = np.mean(recent_lengths)
                 print(f"Step {self.num_timesteps}: "
                       f"Mean Reward (last 100): {mean_reward:.2f}, "
                       f"Mean Length: {mean_length:.1f}")
