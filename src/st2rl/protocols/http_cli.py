@@ -304,6 +304,16 @@ class HttpCliProtocol(FlowProtocol):
 
     @staticmethod
     def _slot_matches_game(slot: int, game: Dict[str, Any]) -> bool:
+        for key in ("worker_slot", "slot", "worker"):
+            value = game.get(key)
+            if value is None:
+                continue
+            try:
+                if int(value) == int(slot):
+                    return True
+            except (TypeError, ValueError):
+                pass
+
         slot_token = f"_{int(slot):02d}_"
         for key in ("seed", "game_id"):
             value = str(game.get(key) or "")

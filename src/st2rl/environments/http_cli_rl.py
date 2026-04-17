@@ -1444,6 +1444,20 @@ class HttpCliRlEnv(gym.Env):
             self._write_current_slot(active=not (terminated or truncated), force=bool(terminated or truncated))
             if terminated or truncated:
                 self._record_episode_summary(terminated=terminated, truncated=truncated)
+                if self._game_id:
+                    try:
+                        self.protocol.close_game(self._game_id)
+                    except Exception:
+                        self.logger.warning(
+                            "Failed to close finished game: slot=%s episode=%s seed=%s game_id=%s",
+                            self.config.seed_offset,
+                            self._episode_index,
+                            self._seed,
+                            self._game_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        self._game_id = None
             return obs, reward, terminated, truncated, info
         except Exception as exc:
             return self._truncate_episode_on_exception(
