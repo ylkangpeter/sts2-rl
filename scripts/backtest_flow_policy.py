@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import random
 import time
@@ -101,6 +102,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional fixed game-server worker slot for this backtest process.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent backtest games to run against reusable game-server workers.",
     )
     return parser.parse_args()
 
@@ -426,28 +433,56 @@ def _run_dataset(
     character: str,
     max_steps: int,
     worker_slot: int | None = None,
+    workers: int = 1,
     cache: BacktestRolloutCache | None = None,
 ) -> dict[str, Any]:
     name = str(dataset.get("name") or "dataset")
     seeds = list(dataset.get("seeds") or [])
-    rows: list[dict[str, Any]] = []
-    for index, seed in enumerate(seeds, start=1):
+    rows_by_index: dict[int, dict[str, Any]] = {}
+    worker_count = max(1, int(workers))
+
+    def run_indexed_seed(index: int, seed: str, slot: int | None) -> tuple[int, dict[str, Any]]:
         row = _run_single_seed(
             protocol,
             policy,
             seed,
             character=character,
             max_steps=max(100, max_steps),
-            worker_slot=worker_slot,
+            worker_slot=slot,
             cache=cache,
         )
         row["dataset"] = name
-        rows.append(row)
-        print(
-            f"[{name} {index:03d}/{len(seeds):03d}] seed={seed} success={row['success']} "
-            f"victory={row['victory']} floor={row['max_floor']} steps={row['steps']} "
-            f"cache={bool(row.get('cache_hit'))} err={row['error']}"
-        )
+        return index, row
+
+    if worker_slot is not None:
+        worker_count = 1
+
+    if worker_count <= 1 or len(seeds) <= 1:
+        for completed_count, (index, seed) in enumerate(enumerate(seeds, start=1), start=1):
+            _, row = run_indexed_seed(index, seed, worker_slot)
+            rows_by_index[index] = row
+            print(
+                f"[{name} {completed_count:03d}/{len(seeds):03d}] index={index:03d} seed={row['seed']} "
+                f"success={row['success']} victory={row['victory']} floor={row['max_floor']} "
+                f"steps={row['steps']} cache={bool(row.get('cache_hit'))} err={row['error']}",
+                flush=True,
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(run_indexed_seed, index, seed, None): index
+                for index, seed in enumerate(seeds, start=1)
+            }
+            for completed_count, future in enumerate(as_completed(futures), start=1):
+                index, row = future.result()
+                rows_by_index[index] = row
+                print(
+                    f"[{name} {completed_count:03d}/{len(seeds):03d}] index={index:03d} seed={row['seed']} "
+                    f"success={row['success']} victory={row['victory']} floor={row['max_floor']} "
+                    f"steps={row['steps']} cache={bool(row.get('cache_hit'))} err={row['error']}",
+                    flush=True,
+                )
+    rows = [rows_by_index[index] for index in sorted(rows_by_index)]
     return {
         "name": name,
         "source": str(dataset.get("source") or ""),
@@ -484,6 +519,7 @@ def main() -> None:
             character=args.character,
             max_steps=max(100, args.max_steps),
             worker_slot=args.worker_slot,
+            workers=args.workers,
             cache=cache,
         )
         dataset_payloads.append(payload)
@@ -500,6 +536,7 @@ def main() -> None:
             "history_floor_threshold": int(args.history_floor_threshold),
             "curated_seeds_file": str(args.seeds_file),
             "random_count": int(args.random_count),
+            "workers": max(1, int(args.workers)),
             "cache_enabled": cache is not None,
             "cache_namespace": cache_namespace,
         },
