@@ -302,6 +302,13 @@ class HttpCliProtocol(FlowProtocol):
         games = data.get("games")
         return list(games) if isinstance(games, list) else []
 
+    def _list_workers(self) -> list[Dict[str, Any]]:
+        data = self._request("GET", "/admin/worker_debug", retries=1)
+        if data.get("status") != "success":
+            return []
+        workers = data.get("workers")
+        return list(workers) if isinstance(workers, list) else []
+
     @staticmethod
     def _slot_matches_game(slot: int, game: Dict[str, Any]) -> bool:
         for key in ("worker_slot", "slot", "worker"):
@@ -331,6 +338,16 @@ class HttpCliProtocol(FlowProtocol):
             result = self._request("POST", f"/close/{game_id}", payload={}, retries=1)
             if result.get("status") == "success":
                 return True
+        worker_key = f"slot_{int(worker_slot):02d}"
+        for worker in self._list_workers():
+            if not isinstance(worker, dict) or str(worker.get("worker_key") or "") != worker_key:
+                continue
+            game_id = str(worker.get("game_id") or "").strip()
+            if not game_id:
+                return False
+            result = self._request("POST", f"/close/{game_id}", payload={}, retries=1)
+            if result.get("status") == "success":
+                return True
         return False
 
     def start_game(self, character: str, seed: str, worker_slot: int | None = None) -> ProtocolStartResult:
@@ -341,7 +358,7 @@ class HttpCliProtocol(FlowProtocol):
         if game_dir:
             payload["game_dir"] = game_dir
 
-        attempts = 2 if worker_slot is not None else 1
+        attempts = 12 if worker_slot is not None else 1
         last_error: Dict[str, Any] | None = None
         for attempt in range(attempts):
             data = self._request("POST", "/start", payload=payload, retries=5)
@@ -350,13 +367,9 @@ class HttpCliProtocol(FlowProtocol):
 
             last_error = data
             message = str(data.get("message") or "")
-            if (
-                worker_slot is None
-                or attempt >= attempts - 1
-                or "busy" not in message.lower()
-                or not self._close_worker_slot_game(int(worker_slot))
-            ):
+            if worker_slot is None or attempt >= attempts - 1 or "busy" not in message.lower():
                 break
+            self._close_worker_slot_game(int(worker_slot))
             time.sleep(self.config.close_retry_delay_seconds)
 
         raise RuntimeError(f"Start game failed: {last_error}")
