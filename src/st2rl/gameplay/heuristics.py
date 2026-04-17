@@ -117,6 +117,59 @@ _UNSUPPORTED_HEADLESS_CARD_IDS = {
     "CARD.WHIRLWIND",
 }
 
+_BLOCK_CARD_IDS = {
+    "CARD.BLOOD_WALL",
+    "CARD.FLAME_BARRIER",
+    "CARD.SHRUG_IT_OFF",
+    "CARD.TAUNT",
+    "CARD.TRUE_GRIT",
+    "CARD.IMPERVIOUS",
+    "CARD.STONE_ARMOR",
+    "CARD.CRIMSON_MANTLE",
+    "CARD.ARMAMENTS",
+}
+
+_DRAW_CARD_IDS = {
+    "CARD.BATTLE_TRANCE",
+    "CARD.BURNING_PACT",
+    "CARD.DARK_EMBRACE",
+    "CARD.OFFERING",
+    "CARD.POMMEL_STRIKE",
+    "CARD.SHRUG_IT_OFF",
+}
+
+_ENERGY_CARD_IDS = {
+    "CARD.BLOODLETTING",
+    "CARD.EXPECT_A_FIGHT",
+    "CARD.FORGOTTEN_RITUAL",
+    "CARD.OFFERING",
+}
+
+_SELF_DAMAGE_CARD_IDS = {
+    "CARD.BLOODLETTING",
+    "CARD.BREAKTHROUGH",
+    "CARD.CRIMSON_MANTLE",
+    "CARD.HEMOKINESIS",
+    "CARD.INFERNO",
+    "CARD.OFFERING",
+}
+
+_SELF_DAMAGE_PAYOFF_IDS = {
+    "CARD.RUPTURE",
+    "CARD.INFERNO",
+    "CARD.FEED",
+    "CARD.REAPER",
+    "CARD.TEAR_ASUNDER",
+}
+
+_EXHAUST_CONTROL_CARD_IDS = {
+    "CARD.BRAND",
+    "CARD.BURNING_PACT",
+    "CARD.FIEND_FIRE",
+    "CARD.SECOND_WIND",
+    "CARD.TRUE_GRIT",
+}
+
 _ELITE_FIGHTER_IDS = {
     "CARD.FLAME_BARRIER",
     "CARD.SHRUG_IT_OFF",
@@ -355,9 +408,14 @@ def _deck_counts(deck: list[dict[str, Any]]) -> dict[str, int]:
         "attack": 0,
         "skill": 0,
         "power": 0,
+        "block": 0,
         "high_cost": 0,
         "exhaust": 0,
+        "exhaust_control": 0,
         "draw": 0,
+        "energy": 0,
+        "self_damage": 0,
+        "self_damage_payoff": 0,
         "zero_cost": 0,
         "bloodletting": 0,
         "burning_pact": 0,
@@ -372,12 +430,22 @@ def _deck_counts(deck: list[dict[str, Any]]) -> dict[str, int]:
             counts["high_cost"] += 1
         if _safe_int(card.get("cost"), 1) <= 0:
             counts["zero_cost"] += 1
+        description = _description(card)
+        card_id = _card_id(card)
+        if card_id in _BLOCK_CARD_IDS or (card_type == "skill" and any(token in description for token in ("block", "\u683c\u6321"))):
+            counts["block"] += 1
         if is_exhaust_card(card):
             counts["exhaust"] += 1
-        description = _description(card)
-        if any(token in description for token in ("draw", "\u62bd\u724c")):
+        if card_id in _EXHAUST_CONTROL_CARD_IDS:
+            counts["exhaust_control"] += 1
+        if _card_draw_amount(card) > 0 or card_id in _DRAW_CARD_IDS or any(token in description for token in ("draw", "\u62bd\u724c")):
             counts["draw"] += 1
-        card_id = _card_id(card)
+        if _card_energy_amount(card) > 0 or card_id in _ENERGY_CARD_IDS:
+            counts["energy"] += 1
+        if card_id in _SELF_DAMAGE_CARD_IDS:
+            counts["self_damage"] += 1
+        if card_id in _SELF_DAMAGE_PAYOFF_IDS:
+            counts["self_damage_payoff"] += 1
         if card_id == "CARD.BLOODLETTING":
             counts["bloodletting"] += 1
         if card_id == "CARD.BURNING_PACT":
@@ -533,6 +601,9 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
         score += 0.4 if counts["power"] < 2 else -0.2
 
     card_id_upper = _card_id(card)
+    block_deficit = deck_size >= 12 and counts["block"] <= max(2, counts["attack"] // 3)
+    thick_deck = deck_size >= 22
+
     if card_id_upper == "CARD.BLOODLETTING":
         score += 0.6
         if counts["draw"] >= 2:
@@ -547,6 +618,10 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
             score += 0.7
         if counts["bloodletting"] > 0:
             score += 1.2
+    if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL"} and block_deficit:
+        score += 0.5
+    if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.SHRUG_IT_OFF"} and thick_deck:
+        score += 0.25
     if card_id_upper == "CARD.TRUE_GRIT":
         if not bool(card.get("upgraded")):
             score -= 1.8
