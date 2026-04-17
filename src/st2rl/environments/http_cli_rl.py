@@ -903,7 +903,9 @@ class HttpCliRlEnv(gym.Env):
                 target = min(enemies, key=lambda enemy: int(enemy.get("hp") or 9999))
                 args["target_index"] = target.get("index")
             return FlowAction("use_potion", args)
-        return None
+        if enemies:
+            return FlowAction("end_turn")
+        return FlowAction("proceed")
 
     def _remember_deadlock_card(self, state: Optional[GameStateView], action: Optional[FlowAction]) -> None:
         if state is None or action is None or action.name != "play_card":
@@ -1322,9 +1324,17 @@ class HttpCliRlEnv(gym.Env):
                             if should_probe_state:
                                 try:
                                     raw_state = self.protocol.get_state(self._game_id)
-                                    self._state = self.protocol.adapt_state(raw_state)
-                                    forced_combat_action = self._best_effort_combat_action(self._state)
-                                    if forced_combat_action is not None:
+                                    probed_state = self.protocol.adapt_state(raw_state)
+                                    progressed_from_probe = self._progress_marker(probed_state) != before_marker
+                                    if progressed_from_probe:
+                                        self._state = probed_state
+                                        result = type(result)(status="success", state=raw_state)
+                                        self._protocol_error_streak = 0
+                                        self._deadlock_error_streak = 0
+                                        time.sleep(self.config.recovery_delay_seconds)
+                                    else:
+                                        self._state = probed_state
+                                        forced_combat_action = self._best_effort_combat_action(self._state) or FlowAction("proceed")
                                         forced_result = self.protocol.step(
                                             self._game_id,
                                             self.protocol.sanitize_action(self._state, forced_combat_action, random),
@@ -1337,15 +1347,26 @@ class HttpCliRlEnv(gym.Env):
                                             reward += self.reward_tracker.on_invalid_action()
                                             time.sleep(self.config.recovery_delay_seconds)
                                         else:
-                                            reward += self.reward_tracker.on_invalid_action()
-                                            abort_episode = True
-                                            termination_reason = "protocol_deadlock"
-                                            time.sleep(self.config.recovery_delay_seconds)
-                                    else:
-                                        reward += self.reward_tracker.on_invalid_action()
-                                        abort_episode = True
-                                        termination_reason = "protocol_deadlock"
-                                        time.sleep(self.config.recovery_delay_seconds)
+                                            try:
+                                                raw_state = self.protocol.get_state(self._game_id)
+                                                refreshed_state = self.protocol.adapt_state(raw_state)
+                                                if self._progress_marker(refreshed_state) != before_marker:
+                                                    result = type(result)(status="success", state=raw_state)
+                                                    self._state = refreshed_state
+                                                    self._protocol_error_streak = 0
+                                                    self._deadlock_error_streak = 0
+                                                    reward += self.reward_tracker.on_invalid_action()
+                                                    time.sleep(self.config.recovery_delay_seconds)
+                                                else:
+                                                    reward += self.reward_tracker.on_invalid_action()
+                                                    abort_episode = True
+                                                    termination_reason = "protocol_deadlock"
+                                                    time.sleep(self.config.recovery_delay_seconds)
+                                            except Exception:
+                                                reward += self.reward_tracker.on_invalid_action()
+                                                abort_episode = True
+                                                termination_reason = "protocol_deadlock"
+                                                time.sleep(self.config.recovery_delay_seconds)
                                 except Exception:
                                     reward += self.reward_tracker.on_stuck()
                                     abort_episode = True
