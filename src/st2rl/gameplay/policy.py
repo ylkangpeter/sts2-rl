@@ -161,6 +161,30 @@ class SimpleFlowPolicy:
         spendable_cost = sum(max(0, self._safe_int(item.get("cost"), 0)) for item in playable_after)
         return len(playable_after), spendable_cost
 
+    def _playable_followup_quality(self, state: GameStateView, card: dict[str, Any]) -> float:
+        selected_index = card.get("index")
+        quality = 0.0
+        for item in state.playable_cards():
+            if item.get("index") == selected_index:
+                continue
+            card_name = self._text(item.get("name") or item.get("card_id") or item.get("id"))
+            damage = self._card_damage(item)
+            block = self._card_block(item)
+            draw = self._card_draw(item)
+            energy = self._card_energy_gain(item)
+            if damage > 0:
+                quality += min(damage, 20) / 6.0
+                if any(token in card_name for token in ("strike", "打击")):
+                    quality -= 1.0
+            if block > 0:
+                quality += min(block, 16) / 8.0
+                if any(token in card_name for token in ("defend", "防御")):
+                    quality -= 0.8
+            quality += draw * 2.0 + energy * 2.0
+            if "bash" in card_name or "痛击" in card_name:
+                quality += 1.5
+        return quality
+
     def _enemy_attack_pressure(self, state: GameStateView) -> int:
         pressure = 0
         for enemy in state.living_enemies():
@@ -541,6 +565,12 @@ class SimpleFlowPolicy:
                     score += 35.0
                 if not can_convert_hp:
                     score -= 8.0
+                if is_boss_floor and hp_ratio < 0.42 and not lethal_pressure:
+                    followup_quality = self._playable_followup_quality(state, card)
+                    if followup_quality < 4.5:
+                        score -= 22.0
+                    if incoming_damage <= state.block and followup_quality < 7.0:
+                        score -= 14.0
             else:
                 score -= hp_loss * (2.4 if hp_ratio < 0.6 else 1.1)
         if "lose hp" in description or "失去生命" in description or "失去" in description and "生命" in description:
