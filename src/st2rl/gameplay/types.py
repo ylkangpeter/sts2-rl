@@ -27,6 +27,9 @@ class GameStateView:
     decision: str
     player: Dict[str, Any]
     hand: list[Dict[str, Any]]
+    draw_pile: list[Dict[str, Any]]
+    discard_pile: list[Dict[str, Any]]
+    exhaust_pile: list[Dict[str, Any]]
     enemies: list[Dict[str, Any]]
     cards: list[Dict[str, Any]]
     options: list[Dict[str, Any]]
@@ -43,6 +46,7 @@ class GameStateView:
     can_skip: bool
     min_select: int
     max_select: int
+    selection_prompt: str
     game_over: bool
     victory: bool
 
@@ -57,6 +61,9 @@ class GameStateView:
             decision=decision,
             player=player,
             hand=list(state.get("hand") or []),
+            draw_pile=list(state.get("draw_pile") or state.get("drawPile") or []),
+            discard_pile=list(state.get("discard_pile") or state.get("discardPile") or []),
+            exhaust_pile=list(state.get("exhaust_pile") or state.get("exhaustPile") or []),
             enemies=list(state.get("enemies") or []),
             cards=list(state.get("cards") or []),
             options=list(state.get("options") or []),
@@ -73,6 +80,7 @@ class GameStateView:
             can_skip=bool(state.get("can_skip", True)),
             min_select=int(state.get("min_select", 1) or 0),
             max_select=int(state.get("max_select", 1) or 0),
+            selection_prompt=str(state.get("selection_prompt") or state.get("prompt") or ""),
             game_over=bool(state.get("game_over") or raw_decision == "game_over" or decision == "game_over"),
             victory=bool(state.get("victory", False)),
         )
@@ -144,6 +152,10 @@ class GameStateView:
             "gold": self.gold,
             "deck_size": self.deck_size,
             "hand_size": len(self.hand),
+            "selection_prompt": self.selection_prompt,
+            "draw_pile_count": int(self.raw.get("draw_pile_count") or len(self.draw_pile) or 0),
+            "discard_pile_count": int(self.raw.get("discard_pile_count") or len(self.discard_pile) or 0),
+            "exhaust_pile_count": int(self.raw.get("exhaust_pile_count") or len(self.exhaust_pile) or 0),
             "enemy_count": len(self.enemies),
             "living_enemies": len(self.living_enemies()),
             "enemy_hp": [(enemy.get("index"), enemy.get("hp"), enemy.get("block")) for enemy in self.enemies],
