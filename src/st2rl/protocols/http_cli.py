@@ -21,7 +21,9 @@ from st2rl.gameplay.heuristics import (
     choose_event_option,
     choose_map_node_choice,
     choose_purge_target,
+    choose_purge_targets,
     choose_upgrade_target,
+    choose_upgrade_targets,
     is_shop_context,
     shop_purge_cost,
     should_prioritize_shop_purge,
@@ -69,6 +71,8 @@ def _combat_potion_mode(potion: Dict[str, Any]) -> str:
         return "safe_aoe"
     if "anyenemy" in target_type or "enemy" in target_type:
         return "safe_enemy"
+    if "self" in target_type or "player" in target_type or target_type in {"none", "no_target"}:
+        return "safe_self"
     return "unsafe"
 
 
@@ -230,6 +234,38 @@ class HttpCliProtocol(FlowProtocol):
             self._session_local.session = session
         return session
 
+    def _clear_pending_event_select(self) -> None:
+        self._session_local.pending_event_select = None
+
+    def _remember_pending_event_select(self, state: GameStateView, action: FlowAction) -> None:
+        if action.name != "choose_option":
+            self._clear_pending_event_select()
+            return
+        option_index = action.args.get("option_index")
+        selected = next((option for option in state.options if option.get("index") == option_index), None)
+        if not isinstance(selected, dict):
+            selected = next((option for option in state.choices if option.get("index") == option_index), None)
+        if not isinstance(selected, dict):
+            self._clear_pending_event_select()
+            return
+        text = " ".join(
+            str(selected.get(key) or "")
+            for key in ("option_id", "name", "label", "title", "description", "text_key")
+        ).lower()
+        self._session_local.pending_event_select = {
+            "floor": _safe_int((state.raw.get("context") or {}).get("floor"), 0),
+            "text": text,
+        }
+
+    def _pending_event_select_text(self, state: GameStateView) -> str:
+        pending = getattr(self._session_local, "pending_event_select", None)
+        if not isinstance(pending, dict):
+            return ""
+        current_floor = _safe_int((state.raw.get("context") or {}).get("floor"), 0)
+        if pending.get("floor") != current_floor:
+            return ""
+        return str(pending.get("text") or "")
+
     def _request(
         self,
         method: str,
@@ -350,6 +386,11 @@ class HttpCliProtocol(FlowProtocol):
                 return True
         return False
 
+    def _reset_worker_slot(self, worker_slot: int) -> bool:
+        worker_key = f"slot_{int(worker_slot):02d}"
+        result = self._request("POST", f"/admin/workers/{worker_key}/reset", payload={}, retries=1)
+        return result.get("status") == "success"
+
     def start_game(self, character: str, seed: str, worker_slot: int | None = None) -> ProtocolStartResult:
         payload = {"character": character, "seed": seed}
         if worker_slot is not None:
@@ -369,7 +410,8 @@ class HttpCliProtocol(FlowProtocol):
             message = str(data.get("message") or "")
             if worker_slot is None or attempt >= attempts - 1 or "busy" not in message.lower():
                 break
-            self._close_worker_slot_game(int(worker_slot))
+            if not self._close_worker_slot_game(int(worker_slot)):
+                self._reset_worker_slot(int(worker_slot))
             time.sleep(self.config.close_retry_delay_seconds)
 
         raise RuntimeError(f"Start game failed: {last_error}")
@@ -422,6 +464,8 @@ class HttpCliProtocol(FlowProtocol):
 
     def sanitize_action(self, state: GameStateView, action: FlowAction, rng: Any) -> FlowAction:
         safe = FlowAction(action.name, dict(action.args))
+        if state.decision not in {"event", "card_select"}:
+            self._clear_pending_event_select()
 
         if safe.name == "use_potion":
             selected_index = safe.args.get("potion_index")
@@ -597,7 +641,10 @@ class HttpCliProtocol(FlowProtocol):
             unlocked = [option for option in options if not option.get("is_locked")]
             if unlocked:
                 pick = choose_event_option(unlocked, state) or unlocked[0]
-                return FlowAction("choose_option", {"option_index": pick.get("index", 0)})
+                event_action = FlowAction("choose_option", {"option_index": pick.get("index", 0)})
+                self._remember_pending_event_select(state, event_action)
+                return event_action
+            self._clear_pending_event_select()
             return FlowAction("proceed")
 
         if state.decision == "rest_site":
@@ -641,30 +688,55 @@ class HttpCliProtocol(FlowProtocol):
 
         if state.decision == "card_select":
             valid = {str(card.get("index", index)) for index, card in enumerate(state.cards)}
+            pick_count = max(1, min(max(1, state.min_select), state.max_select, len(state.cards)))
+            room_type = str((state.raw.get("context") or {}).get("room_type") or "").strip().lower()
+            is_combat_select = any(token in room_type for token in ("monster", "elite", "boss", "combat"))
+            event_select_text = self._pending_event_select_text(state) if "event" in room_type else ""
+            is_event_purge_like = any(
+                token in event_select_text
+                for token in ("transform", "remove", "purge", "变化", "变形", "移除", "删除", "删牌")
+            )
+            is_event_upgrade_like = any(token in event_select_text for token in ("upgrade", "smith", "升级", "锻造"))
+
+            def _recommended_select_action() -> FlowAction | None:
+                if not state.cards:
+                    return None
+                if is_shop_context(state):
+                    purge_targets = choose_purge_targets(state.cards, pick_count)
+                    if len(purge_targets) >= pick_count:
+                        return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in purge_targets)})
+                if is_combat_select:
+                    exhaust_targets = choose_purge_targets(state.cards, pick_count)
+                    if len(exhaust_targets) >= pick_count:
+                        return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in exhaust_targets)})
+                if is_event_purge_like and not is_event_upgrade_like:
+                    event_targets = choose_purge_targets(state.cards, pick_count)
+                    if len(event_targets) >= pick_count:
+                        return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in event_targets)})
+                upgrade_targets = choose_upgrade_targets(state.cards, pick_count)
+                if len(upgrade_targets) >= pick_count:
+                    return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in upgrade_targets)})
+                return None
+
             if safe.name == "skip_select" and state.min_select == 0:
+                self._clear_pending_event_select()
                 return safe
             if safe.name == "select_cards":
                 raw_indices = str(safe.args.get("indices", ""))
                 picks = [item.strip() for item in raw_indices.split(",") if item.strip()]
                 if picks and all(item in valid for item in picks) and state.min_select <= len(picks) <= state.max_select:
-                    if is_shop_context(state):
-                        purge_target = choose_purge_target(state.cards)
-                        if purge_target is not None:
-                            return FlowAction("select_cards", {"indices": str(purge_target.get("index", 0))})
-                    upgrade_target = choose_upgrade_target(state.cards)
-                    if upgrade_target is not None:
-                        return FlowAction("select_cards", {"indices": str(upgrade_target.get("index", 0))})
-                    return safe
+                    recommended = _recommended_select_action()
+                    self._clear_pending_event_select()
+                    return recommended or safe
             if not state.cards:
+                self._clear_pending_event_select()
                 return FlowAction("skip_select")
-            if is_shop_context(state):
-                purge_target = choose_purge_target(state.cards)
-                if purge_target is not None:
-                    return FlowAction("select_cards", {"indices": str(purge_target.get("index", 0))})
-            upgrade_target = choose_upgrade_target(state.cards)
-            if upgrade_target is not None:
-                return FlowAction("select_cards", {"indices": str(upgrade_target.get("index", 0))})
+            recommended = _recommended_select_action()
+            self._clear_pending_event_select()
+            if recommended is not None:
+                return recommended
             indices = [str(card.get("index", index)) for index, card in enumerate(state.cards)]
+            self._clear_pending_event_select()
             return FlowAction("select_cards", {"indices": ",".join(indices[: max(1, state.min_select)])})
 
         return safe

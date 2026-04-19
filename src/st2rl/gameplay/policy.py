@@ -14,7 +14,8 @@ from st2rl.gameplay.heuristics import (
     choose_event_option,
     choose_map_node_choice,
     choose_purge_target,
-    choose_upgrade_target,
+    choose_purge_targets,
+    choose_upgrade_targets,
     is_shop_context,
     shop_purge_cost,
     should_prioritize_shop_purge,
@@ -239,21 +240,110 @@ class SimpleFlowPolicy:
         digits = [int(item) for item in re.findall(r"\d+", text)]
         return max(digits) if digits else 0
 
+    def _potion_block_amount(self, potion: dict[str, Any]) -> int:
+        vars_payload = potion.get("vars") or {}
+        if isinstance(vars_payload, dict):
+            values = []
+            for key, value in vars_payload.items():
+                if "block" in str(key).lower():
+                    parsed = self._safe_int(value, None)
+                    if parsed is not None and parsed > 0:
+                        values.append(parsed)
+            if values:
+                return max(values)
+
+        text = f"{potion.get('name') or ''} {potion.get('description') or ''}"
+        lowered = text.lower()
+        if not any(token in lowered for token in ("block", "armor", "shield")) and not any(token in text for token in ("格挡", "护甲", "护盾")):
+            return 0
+        digits = [int(item) for item in re.findall(r"\d+", text)]
+        return max(digits) if digits else 0
+
+    def _potion_strength_amount(self, potion: dict[str, Any]) -> int:
+        vars_payload = potion.get("vars") or {}
+        if isinstance(vars_payload, dict):
+            values = []
+            for key, value in vars_payload.items():
+                if "strength" in str(key).lower():
+                    parsed = self._safe_int(value, None)
+                    if parsed is not None and parsed > 0:
+                        values.append(parsed)
+            if values:
+                return max(values)
+
+        text = f"{potion.get('name') or ''} {potion.get('description') or ''}"
+        lowered = text.lower()
+        if "strength" not in lowered and "力量" not in text:
+            return 0
+        digits = [int(item) for item in re.findall(r"\d+", text)]
+        return max(digits) if digits else 1
+
+    def _potion_energy_amount(self, potion: dict[str, Any]) -> int:
+        vars_payload = potion.get("vars") or {}
+        if isinstance(vars_payload, dict):
+            values = []
+            for key, value in vars_payload.items():
+                if "energy" in str(key).lower():
+                    parsed = self._safe_int(value, None)
+                    if parsed is not None and parsed > 0:
+                        values.append(parsed)
+            if values:
+                return max(values)
+
+        text = f"{potion.get('name') or ''} {potion.get('description') or ''}"
+        lowered = text.lower()
+        if "energy" not in lowered and "能量" not in text:
+            return 0
+        digits = [int(item) for item in re.findall(r"\d+", text)]
+        return max(digits) if digits else 1
+
     def _pick_combat_potion_action(self, state: GameStateView) -> FlowAction | None:
         incoming_damage = self._enemy_intended_damage(state)
         missing_hp = max(state.max_hp - state.hp, 0)
         hp_ratio = state.hp / max(1, state.max_hp)
+        context = state.raw.get("context") or {}
+        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        is_boss_floor = floor >= 16
+        early_boss_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
 
         best_choice: tuple[float, dict[str, Any]] | None = None
+        best_self_choice: tuple[float, dict[str, Any]] | None = None
         for potion in state.player.get("potions") or []:
             if not isinstance(potion, dict) or potion.get("index") is None:
                 continue
             target_type = self._text(potion.get("target_type"))
             if "enemy" in target_type:
                 continue
+
+            block_amount = self._potion_block_amount(potion)
+            if block_amount > 0:
+                block_gap = max(0, incoming_damage - state.block)
+                if block_gap > 0:
+                    score = min(block_amount, block_gap) * 1.4
+                    if incoming_damage >= state.hp:
+                        score += 30.0
+                    elif is_boss_floor and block_gap >= 8:
+                        score += 10.0
+                    if best_self_choice is None or score > best_self_choice[0]:
+                        best_self_choice = (score, potion)
+
+            strength_amount = self._potion_strength_amount(potion)
+            if strength_amount > 0 and early_boss_turn:
+                score = 18.0 + strength_amount * 6.0
+                if best_self_choice is None or score > best_self_choice[0]:
+                    best_self_choice = (score, potion)
+
+            energy_amount = self._potion_energy_amount(potion)
+            if energy_amount > 0 and (early_boss_turn or hp_ratio < 0.45):
+                _, spendable_cost = self._playable_followup_pressure(state, {"index": None})
+                if spendable_cost > state.energy:
+                    score = 10.0 + min(energy_amount, spendable_cost - state.energy) * 5.0
+                    if best_self_choice is None or score > best_self_choice[0]:
+                        best_self_choice = (score, potion)
+
             if missing_hp <= 0:
                 continue
-            if incoming_damage <= 0 and hp_ratio > 0.28:
+            if incoming_damage <= 0 and hp_ratio > (0.48 if is_boss_floor else 0.28):
                 continue
             heal_amount = self._potion_heal_amount(potion)
             if heal_amount == 0:
@@ -297,13 +387,21 @@ class SimpleFlowPolicy:
             incoming_damage >= state.hp
             or hp_ratio < 0.35
             or best_attack_choice[0] >= 35.0
+            or (early_boss_turn and self._potion_damage_amount(best_attack_choice[1]) >= 10)
         ):
             args = {"potion_index": best_attack_choice[1].get("index", 0)}
             if "all" not in self._text(best_attack_choice[1].get("target_type")) and best_attack_choice[2] is not None:
                 args["target_index"] = best_attack_choice[2].get("index")
             return FlowAction("use_potion", args)
 
-        if best_choice is not None and (incoming_damage >= state.hp or hp_ratio < 0.3):
+        if best_self_choice is not None and (
+            incoming_damage >= state.hp
+            or best_self_choice[0] >= 22.0
+            or (early_boss_turn and best_self_choice[0] >= 16.0)
+        ):
+            return FlowAction("use_potion", {"potion_index": best_self_choice[1].get("index", 0)})
+
+        if best_choice is not None and (incoming_damage >= state.hp or hp_ratio < 0.3 or (is_boss_floor and hp_ratio < 0.55)):
             return FlowAction("use_potion", {"potion_index": best_choice[1].get("index", 0)})
         return None
 
@@ -333,9 +431,25 @@ class SimpleFlowPolicy:
         enemies: list[dict[str, Any]],
     ) -> dict[str, Any]:
         damage = self._card_damage(card)
+        context = state.raw.get("context") or {}
+        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        room_type = self._text(context.get("room_type"))
+        if floor >= 17 and room_type == "boss" and len(enemies) > 1 and damage > 0:
+            def boss_target_score(enemy: dict[str, Any]) -> tuple[float, int, int]:
+                effective_hp = self._enemy_effective_hp(enemy)
+                lethal = 1 if damage >= effective_hp else 0
+                threat = self._enemy_threat(enemy)
+                return (
+                    lethal * 5000.0 + threat * 35.0 + min(damage, effective_hp) * 3.0 - effective_hp * 3.0,
+                    -effective_hp,
+                    -self._safe_int(enemy.get("index"), 0),
+                )
+
+            return max(enemies, key=boss_target_score)
         return self._pick_damage_target(enemies, damage) or enemies[0]
 
     def _combat_card_score(self, state: GameStateView, card: dict[str, Any]) -> float:
+        card_name = self._text(card.get("name") or card.get("card_id") or card.get("id"))
         description = self._text(card.get("description"))
         card_type = self._text(card.get("type"))
         cost = max(0, self._safe_int(card.get("cost"), 0))
@@ -348,6 +462,9 @@ class SimpleFlowPolicy:
         attack_pressure = self._enemy_attack_pressure(state)
         incoming_damage = self._enemy_intended_damage(state)
         hp_ratio = state.hp / max(1, state.max_hp)
+        context = state.raw.get("context") or {}
+        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        is_boss_floor = floor >= 16
         lowest_enemy_ehp = min(self._enemy_effective_hp(enemy) for enemy in enemies)
         block_gap = max(0, incoming_damage - state.block)
         lethal_pressure = block_gap >= state.hp
@@ -356,10 +473,14 @@ class SimpleFlowPolicy:
         score = 0.0
         if damage > 0:
             score += damage * 1.55
+            if is_boss_floor:
+                score += damage * 0.75
             if damage >= lowest_enemy_ehp:
                 score += 18.0
             if "vulnerable" in description or "易伤" in description:
                 score += 7.0 if state.round in (None, 1, 2) else 3.0
+                if is_boss_floor:
+                    score += 4.0
         if block > 0:
             if attack_pressure > 0:
                 score += min(block, 12) * (1.35 if hp_ratio < 0.55 else 1.0)
@@ -375,18 +496,38 @@ class SimpleFlowPolicy:
                 score += 24.0
             elif projected_hp_after_block <= 0:
                 score -= 4.0
+            if is_boss_floor and damage <= 0 and not lethal_pressure:
+                comfortable_hp = max(18, int(state.max_hp * 0.3))
+                if current_projected_hp >= comfortable_hp:
+                    score -= min(block, 12) * 1.35
+                    if any(token in card_name for token in ("defend", "防御")):
+                        score -= 4.0
         if "draw" in description or "抽牌" in description:
             score += 3.0
         if draw_amount > 0:
             score += min(draw_amount, 4) * 3.0
+            if is_boss_floor and cost <= 1 and state.energy >= cost:
+                followup_count, spendable_cost = self._playable_followup_pressure(state, card)
+                if followup_count >= 2 and spendable_cost > max(0, state.energy - cost):
+                    score += 8.0 + min(followup_count, 5) * 1.2
+            if is_boss_floor:
+                score += min(draw_amount, 4) * 1.8
         if "strength" in description or "力量" in description:
             score += 3.5
+            if is_boss_floor and state.round in (None, 1, 2, 3):
+                score += 5.0
         if "energy" in description or "能量" in description:
             score += 2.5
         if energy_gain > 0:
             followup_count, spendable_cost = self._playable_followup_pressure(state, card)
             usable_energy = max(0, min(energy_gain, spendable_cost - max(0, state.energy - cost)))
             score += usable_energy * 4.0 + min(followup_count, 4) * 0.8
+            if is_boss_floor and cost == 0 and usable_energy > 0:
+                score += 12.0 + usable_energy * 3.0
+            if is_boss_floor and usable_energy > 0 and spendable_cost >= state.energy + 2:
+                score += 8.0
+            if is_boss_floor and followup_count >= 2 and usable_energy > 0:
+                score += 8.0 + usable_energy * 3.0 + min(followup_count, 5) * 1.4
             if followup_count < 2 or usable_energy <= 0:
                 score -= 7.0
         if "weak" in description or "虚弱" in description:
@@ -418,6 +559,10 @@ class SimpleFlowPolicy:
                 score -= 14.0
         if card_type == "attack":
             score += 1.5
+            if is_boss_floor:
+                score += 2.0
+                if any(token in card_name for token in ("strike", "打击")) and draw_amount <= 0 and energy_gain <= 0:
+                    score -= 3.0
         elif card_type == "skill":
             score += 0.5
         elif card_type == "power":
@@ -427,6 +572,30 @@ class SimpleFlowPolicy:
                 score -= 2.0
             else:
                 score += 2.0 if state.round in (None, 1, 2, 3) else -1.0
+            if is_boss_floor and not lethal_pressure:
+                if state.round in (None, 1, 2):
+                    score += 11.0
+                elif state.round == 3:
+                    score += 7.0
+                else:
+                    score += 2.0
+                scaling_text = f"{card_name} {description}"
+                if any(
+                    token in scaling_text
+                    for token in (
+                        "demon",
+                        "inflame",
+                        "rupture",
+                        "aggression",
+                        "barricade",
+                        "feel no pain",
+                        "dark embrace",
+                        "corruption",
+                        "力量",
+                        "恶魔",
+                    )
+                ):
+                    score += 5.0
 
         if cost <= 0:
             score += 2.0
@@ -470,7 +639,16 @@ class SimpleFlowPolicy:
             return FlowAction("purge_card", {"card_index": purge_target.get("index", 0)})
 
         best_potion = best_shop_potion(state.potions, state.gold)
-        if best_potion is not None and state.gold >= self.config.shop_high_gold_threshold:
+        context = state.raw.get("context") or {}
+        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        player_potions = [potion for potion in (state.player.get("potions") or []) if isinstance(potion, dict)]
+        potion_slots_total = self._safe_int(state.player.get("potion_slots_total"), 3)
+        has_potion_space = len(player_potions) < max(1, potion_slots_total)
+        if best_potion is not None and has_potion_space and (
+            state.gold >= self.config.shop_high_gold_threshold
+            or floor >= 10
+            or state.hp / max(1, state.max_hp) < 0.65
+        ):
             return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
 
         buy_probability = self.config.shop_buy_probability
@@ -510,6 +688,8 @@ class SimpleFlowPolicy:
         floor = self._safe_int((state.raw.get("context") or {}).get("floor"), 0)
         if floor <= 8:
             heal_threshold = max(heal_threshold, 0.7)
+        elif floor >= 12:
+            heal_threshold = max(heal_threshold, 0.55)
         if hp_ratio < max(0.4, heal_threshold):
             heal = next(
                 (
@@ -533,23 +713,31 @@ class SimpleFlowPolicy:
         indices = [str(card.get("index", i)) for i, card in enumerate(state.cards)]
         if not indices:
             return FlowAction("skip_select")
-
-        if is_shop_context(state):
-            purge_target = choose_purge_target(state.cards)
-            if purge_target is not None:
-                return FlowAction("select_cards", {"indices": str(purge_target.get("index", 0))})
-
-        upgrade_target = choose_upgrade_target(state.cards)
-        if upgrade_target is not None:
-            return FlowAction("select_cards", {"indices": str(upgrade_target.get("index", 0))})
-
         if state.min_select == 0 and rng.random() < self.config.card_select_skip_probability:
             return FlowAction("skip_select")
 
+        pick_count = max(1, min(max(1, state.min_select), state.max_select, len(indices)))
+        room_type = self._text((state.raw.get("context") or {}).get("room_type"))
+        is_combat_select = any(token in room_type for token in ("monster", "elite", "boss", "combat"))
+
+        if is_shop_context(state):
+            purge_targets = choose_purge_targets(state.cards, pick_count)
+            if len(purge_targets) >= pick_count:
+                return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in purge_targets)})
+
+        if is_combat_select:
+            exhaust_targets = choose_purge_targets(state.cards, pick_count)
+            if len(exhaust_targets) >= pick_count:
+                return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in exhaust_targets)})
+
+        upgrade_targets = choose_upgrade_targets(state.cards, pick_count)
+        if len(upgrade_targets) >= pick_count:
+            return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in upgrade_targets)})
+
         upper_bound = max(1, min(state.max_select, len(indices)))
         lower_bound = max(1, state.min_select)
-        pick_count = rng.randint(lower_bound, upper_bound)
-        picks = rng.sample(indices, k=pick_count)
+        random_count = rng.randint(lower_bound, upper_bound)
+        picks = rng.sample(indices, k=random_count)
         return FlowAction("select_cards", {"indices": ",".join(picks)})
 
     def _pick_bundle_action(self, state: GameStateView, rng: random.Random) -> FlowAction:

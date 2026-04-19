@@ -570,9 +570,9 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     draw_amount = _card_draw_amount(card)
     energy_amount = _card_energy_amount(card)
     if draw_amount > 0:
-        score += min(draw_amount, 4) * 0.75
+        score += min(draw_amount, 4) * 1.05
     if energy_amount > 0:
-        score += min(energy_amount, 3) * 0.95
+        score += min(energy_amount, 3) * 1.25
     if card.get("after_upgrade"):
         score += 0.35
 
@@ -605,23 +605,27 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     thick_deck = deck_size >= 22
 
     if card_id_upper == "CARD.BLOODLETTING":
-        score += 0.6
+        score += 1.0
         if counts["draw"] >= 2:
-            score += 1.2
+            score += 1.5
         if counts["zero_cost"] >= 3:
             score += 0.35
         if counts["burning_pact"] > 0:
             score += 1.0
     if card_id_upper == "CARD.BURNING_PACT":
-        score += 0.5
+        score += 0.9
         if basics["total"] >= 4:
             score += 0.7
         if counts["bloodletting"] > 0:
             score += 1.2
     if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL"} and block_deficit:
-        score += 0.5
-    if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.SHRUG_IT_OFF"} and thick_deck:
-        score += 0.25
+        score += 0.8
+    if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.SHRUG_IT_OFF"}:
+        score += 0.35
+        if thick_deck:
+            score += 0.45
+    if card_id_upper in {"CARD.ARMAMENTS", "CARD.UPPERCUT", "CARD.INFLAME", "CARD.HEMOKINESIS"}:
+        score += 0.35
     if card_id_upper == "CARD.TRUE_GRIT":
         if not bool(card.get("upgraded")):
             score -= 1.8
@@ -636,6 +640,8 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     score += _archetype_reward_bonus(card, deck)
     if deck_size >= 22 and cost >= 2 and counts["high_cost"] >= 4:
         score -= 0.5
+    if deck_size >= 20 and card_id_upper not in _DRAW_CARD_IDS and card_id_upper not in _ENERGY_CARD_IDS and score < 3.0:
+        score -= 0.6
     if deck_size >= 25 and score < 3.6:
         score -= 1.4
 
@@ -749,10 +755,16 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value -= 1.5
         elif "rest" in room or "camp" in room or room == "r":
             value = 3.2 if hp_ratio < 0.5 else (2.1 if hp_ratio < 0.7 else 0.65)
+            if floor >= 11:
+                value += 1.25
+            if floor >= 14:
+                value += 0.55
         elif "shop" in room or room in {"merchant", "$", "s"}:
             value = 2.0 if state.gold >= 150 else (-0.25 if state.gold < 110 else 1.35)
             if purge_target is not None and state.gold >= 75:
                 value += 0.7
+            if floor >= 11 and state.gold >= 120:
+                value += 0.55
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
@@ -769,6 +781,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value = 0.95
             else:
                 value = 1.25
+            if floor >= 13 and hp_ratio < 0.7:
+                value -= 0.65
         elif "boss" in room or room == "b":
             value = 4.0
         else:
@@ -832,21 +846,27 @@ def choose_card_reward(cards: list[dict[str, Any]], deck: list[dict[str, Any]] |
     return best_card
 
 
-def choose_purge_target(deck: list[dict[str, Any]]) -> dict[str, Any] | None:
+def choose_purge_targets(deck: list[dict[str, Any]], count: int = 1) -> list[dict[str, Any]]:
     indexed = [card for card in deck if isinstance(card, dict) and card.get("index") is not None]
     if not indexed:
-        return None
+        return []
 
-    def score(card: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    def score(card: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
         return (
             0 if is_negative_card(card) else 1,
             0 if is_basic_strike(card) else 1,
             0 if is_basic_defend(card) else 1,
             0 if is_low_impact_card(card) else 1,
             _safe_int(card.get("cost"), 9),
+            _safe_int(card.get("index"), 9999),
         )
 
-    return min(indexed, key=score)
+    return sorted(indexed, key=score)[: max(0, count)]
+
+
+def choose_purge_target(deck: list[dict[str, Any]]) -> dict[str, Any] | None:
+    targets = choose_purge_targets(deck, 1)
+    return targets[0] if targets else None
 
 
 def should_prioritize_shop_purge(
@@ -882,10 +902,10 @@ def should_prioritize_shop_purge(
     return False
 
 
-def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+def choose_upgrade_targets(cards: list[dict[str, Any]], count: int = 1) -> list[dict[str, Any]]:
     indexed = [card for card in cards if isinstance(card, dict) and card.get("index") is not None]
     if not indexed:
-        return None
+        return []
     deck = [card for card in cards if isinstance(card, dict)]
     archetype_scores = _deck_archetype_scores(deck)
     archetype_anchors = _deck_archetype_anchors(deck)
@@ -924,7 +944,7 @@ def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
             priority += weight * (1.0 + min(archetype_scores.get(name, 0.0), 12.0) / 12.0)
         return priority
 
-    def score(card: dict[str, Any]) -> tuple[int, int, int, float, float, int]:
+    def score(card: dict[str, Any]) -> tuple[int, int, int, float, float, int, int]:
         return (
             core_priority(card),
             1 if is_basic_strike(card) or is_basic_defend(card) else 0,
@@ -933,9 +953,15 @@ def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
             -archetype_priority(card),
             -estimate_card_reward_score(card, cards),
             _safe_int(card.get("cost"), 99),
+            _safe_int(card.get("index"), 9999),
         )
 
-    return min(indexed, key=score)
+    return sorted(indexed, key=score)[: max(0, count)]
+
+
+def choose_upgrade_target(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    targets = choose_upgrade_targets(cards, 1)
+    return targets[0] if targets else None
 
 
 def shop_card_priority(card: dict[str, Any], deck: list[dict[str, Any]] | None = None) -> tuple[int, float, int, int]:

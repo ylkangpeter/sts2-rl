@@ -242,6 +242,24 @@ def _state_floor(state: GameStateView) -> int:
     return _safe_int(context.get("floor"), 0)
 
 
+def _is_boss_state(state: GameStateView) -> bool:
+    context = state.raw.get("context") or {}
+    room_type = str(context.get("room_type") or "").strip().lower()
+    return _state_floor(state) >= 17 and room_type == "boss"
+
+
+def _boss_cleared(before: GameStateView, after: GameStateView) -> bool:
+    if not _is_boss_state(before) or before.decision != "combat_play":
+        return False
+    if after.game_over and not after.victory:
+        return False
+    if after.victory:
+        return True
+    if after.decision in {"card_reward", "map_node", "map_select"} and not after.living_enemies():
+        return True
+    return _is_boss_state(after) and after.decision != "combat_play" and not after.living_enemies()
+
+
 def _final_hp(state: GameStateView) -> int:
     return _safe_int(state.player.get("hp"), 0)
 
@@ -258,6 +276,8 @@ def _replay_cached_seed(
     state = protocol.adapt_state(cached.initial_state)
     steps = 0
     max_floor = _state_floor(state)
+    boss_attempt = False
+    boss_clear = False
     for entry in cached.transitions:
         if steps >= max_steps:
             return None
@@ -276,7 +296,10 @@ def _replay_cached_seed(
         )
         if result.status != "success" or not result.state:
             return None
+        previous_state = state
+        boss_attempt = boss_attempt or _is_boss_state(previous_state)
         state = protocol.adapt_state(result.state)
+        boss_clear = boss_clear or _boss_cleared(previous_state, state)
         max_floor = max(max_floor, _state_floor(state))
         steps += 1
         if state.game_over:
@@ -293,6 +316,8 @@ def _replay_cached_seed(
             "final_hp": _final_hp(state),
             "error": "",
             "cache_hit": True,
+            "boss_attempt": boss_attempt,
+            "boss_clear": boss_clear,
         }
     )
     return outcome
@@ -324,6 +349,8 @@ def _run_single_seed(
         "final_hp": 0,
         "error": "",
         "cache_hit": False,
+        "boss_attempt": False,
+        "boss_clear": False,
     }
     if cache is not None:
         cached = cache.load(seed=seed, character=character)
@@ -344,11 +371,14 @@ def _run_single_seed(
                 break
             action = protocol.sanitize_action(state, policy.choose_action(state, rng), rng)
             before_hash = state_hash(state.raw)
+            previous_state = state
+            outcome["boss_attempt"] = bool(outcome["boss_attempt"] or _is_boss_state(previous_state))
             result = protocol.step(game_id, action)
             if result.status != "success":
                 recover = protocol.recover_action_from_error(result.raw, state) or FlowAction("proceed")
                 action = protocol.sanitize_action(state, recover, rng)
                 before_hash = state_hash(state.raw)
+                previous_state = state
                 retry = protocol.step(game_id, action)
                 if retry.status != "success":
                     outcome["error"] = str(retry.message or result.message or "step_failed")
@@ -371,6 +401,7 @@ def _run_single_seed(
             )
             raw_state = result.state or state.raw
             state = protocol.adapt_state(raw_state)
+            outcome["boss_clear"] = bool(outcome["boss_clear"] or _boss_cleared(previous_state, state))
             max_floor = max(max_floor, _state_floor(state))
             steps += 1
         completed = bool(state and state.game_over and not outcome["error"])
@@ -421,6 +452,10 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ge10": sum(1 for value in floors if value >= 10),
         "ge15": sum(1 for value in floors if value >= 15),
         "ge17": sum(1 for value in floors if value >= 17),
+        "ge18": sum(1 for value in floors if value >= 18),
+        "gt17": sum(1 for value in floors if value > 17),
+        "boss_attempt": sum(1 for row in done if row.get("boss_attempt")),
+        "boss_clear": sum(1 for row in done if row.get("boss_clear")),
         "cache_hits": cache_hits,
     }
 
