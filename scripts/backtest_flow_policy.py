@@ -242,10 +242,40 @@ def _state_floor(state: GameStateView) -> int:
     return _safe_int(context.get("floor"), 0)
 
 
+def _state_act(state: GameStateView) -> int:
+    context = state.raw.get("context") or {}
+    return max(1, _safe_int(context.get("act"), 1))
+
+
+def _global_floor(act: int, act_floor: int) -> int:
+    act = max(1, int(act))
+    act_floor = max(0, int(act_floor))
+    if act <= 1:
+        return act_floor
+    if act == 2:
+        return 18 + act_floor
+    if act == 3:
+        return 35 + act_floor
+    return 51 + act_floor + max(0, act - 4) * 17
+
+
+def _state_global_floor(state: GameStateView) -> int:
+    return _global_floor(_state_act(state), _state_floor(state))
+
+
+def _update_floor_peak(state: GameStateView, peak: dict[str, int]) -> dict[str, int]:
+    act = _state_act(state)
+    floor = _state_floor(state)
+    global_floor = _global_floor(act, floor)
+    if global_floor > peak["global_floor"]:
+        peak.update({"act": act, "floor": floor, "global_floor": global_floor})
+    return peak
+
+
 def _is_boss_state(state: GameStateView) -> bool:
     context = state.raw.get("context") or {}
     room_type = str(context.get("room_type") or "").strip().lower()
-    return _state_floor(state) >= 17 and room_type == "boss"
+    return room_type == "boss"
 
 
 def _boss_cleared(before: GameStateView, after: GameStateView) -> bool:
@@ -276,6 +306,8 @@ def _replay_cached_seed(
     state = protocol.adapt_state(cached.initial_state)
     steps = 0
     max_floor = _state_floor(state)
+    max_global_floor = _state_global_floor(state)
+    peak = {"act": _state_act(state), "floor": max_floor, "global_floor": max_global_floor}
     boss_attempt = False
     boss_clear = False
     for entry in cached.transitions:
@@ -301,6 +333,8 @@ def _replay_cached_seed(
         state = protocol.adapt_state(result.state)
         boss_clear = boss_clear or _boss_cleared(previous_state, state)
         max_floor = max(max_floor, _state_floor(state))
+        peak = _update_floor_peak(state, peak)
+        max_global_floor = peak["global_floor"]
         steps += 1
         if state.game_over:
             break
@@ -313,6 +347,12 @@ def _replay_cached_seed(
             "victory": bool(state.victory),
             "steps": steps,
             "max_floor": max_floor,
+            "final_act": _state_act(state),
+            "final_floor": _state_floor(state),
+            "final_global_floor": _state_global_floor(state),
+            "max_act": peak["act"],
+            "max_act_floor": peak["floor"],
+            "max_global_floor": max_global_floor,
             "final_hp": _final_hp(state),
             "error": "",
             "cache_hit": True,
@@ -336,6 +376,8 @@ def _run_single_seed(
     rng = random.Random(seed)
     game_id = ""
     max_floor = 0
+    max_global_floor = 0
+    peak = {"act": 1, "floor": 0, "global_floor": 0}
     steps = 0
     state: GameStateView | None = None
     initial_state: dict[str, Any] | None = None
@@ -346,6 +388,12 @@ def _run_single_seed(
         "victory": False,
         "steps": 0,
         "max_floor": 0,
+        "final_act": 1,
+        "final_floor": 0,
+        "final_global_floor": 0,
+        "max_act": 1,
+        "max_act_floor": 0,
+        "max_global_floor": 0,
         "final_hp": 0,
         "error": "",
         "cache_hit": False,
@@ -366,6 +414,8 @@ def _run_single_seed(
         initial_state = raw_state
         state = protocol.adapt_state(raw_state)
         max_floor = max(max_floor, _state_floor(state))
+        peak = _update_floor_peak(state, peak)
+        max_global_floor = peak["global_floor"]
         while steps < max_steps:
             if state.game_over:
                 break
@@ -403,6 +453,8 @@ def _run_single_seed(
             state = protocol.adapt_state(raw_state)
             outcome["boss_clear"] = bool(outcome["boss_clear"] or _boss_cleared(previous_state, state))
             max_floor = max(max_floor, _state_floor(state))
+            peak = _update_floor_peak(state, peak)
+            max_global_floor = peak["global_floor"]
             steps += 1
         completed = bool(state and state.game_over and not outcome["error"])
         outcome.update(
@@ -411,6 +463,12 @@ def _run_single_seed(
                 "victory": bool(state.victory) if state else False,
                 "steps": steps,
                 "max_floor": max_floor,
+                "final_act": _state_act(state) if state else 1,
+                "final_floor": _state_floor(state) if state else 0,
+                "final_global_floor": _state_global_floor(state) if state else 0,
+                "max_act": peak["act"],
+                "max_act_floor": peak["floor"],
+                "max_global_floor": max_global_floor,
                 "final_hp": _final_hp(state) if state else 0,
             }
         )
@@ -441,6 +499,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(rows)
     success = len(done)
     floors = [int(row.get("max_floor") or 0) for row in done]
+    global_floors = [int(row.get("max_global_floor") or row.get("final_global_floor") or row.get("max_floor") or 0) for row in done]
     victories = sum(1 for row in done if row.get("victory"))
     cache_hits = sum(1 for row in rows if row.get("cache_hit"))
     return {
@@ -448,12 +507,17 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "success": success,
         "victory": victories,
         "avg_floor": round(sum(floors) / len(floors), 2) if floors else 0.0,
+        "avg_global_floor": round(sum(global_floors) / len(global_floors), 2) if global_floors else 0.0,
         "ge5": sum(1 for value in floors if value >= 5),
         "ge10": sum(1 for value in floors if value >= 10),
         "ge15": sum(1 for value in floors if value >= 15),
         "ge17": sum(1 for value in floors if value >= 17),
         "ge18": sum(1 for value in floors if value >= 18),
         "gt17": sum(1 for value in floors if value > 17),
+        "ge_global_17": sum(1 for value in global_floors if value >= 17),
+        "ge_global_34": sum(1 for value in global_floors if value >= 34),
+        "ge_global_51": sum(1 for value in global_floors if value >= 51),
+        "ge_global_52": sum(1 for value in global_floors if value >= 52),
         "boss_attempt": sum(1 for row in done if row.get("boss_attempt")),
         "boss_clear": sum(1 for row in done if row.get("boss_clear")),
         "cache_hits": cache_hits,
@@ -498,7 +562,9 @@ def _run_dataset(
             rows_by_index[index] = row
             print(
                 f"[{name} {completed_count:03d}/{len(seeds):03d}] index={index:03d} seed={row['seed']} "
-                f"success={row['success']} victory={row['victory']} floor={row['max_floor']} "
+                f"success={row['success']} victory={row['victory']} "
+                f"final=A{row.get('final_act', 1)}F{row.get('final_floor', row['max_floor'])}/G{row.get('final_global_floor', row['max_floor'])} "
+                f"max=A{row.get('max_act', row.get('final_act', 1))}F{row.get('max_act_floor', row['max_floor'])}/G{row.get('max_global_floor', row['max_floor'])} "
                 f"steps={row['steps']} cache={bool(row.get('cache_hit'))} err={row['error']}",
                 flush=True,
             )
@@ -513,7 +579,9 @@ def _run_dataset(
                 rows_by_index[index] = row
                 print(
                     f"[{name} {completed_count:03d}/{len(seeds):03d}] index={index:03d} seed={row['seed']} "
-                    f"success={row['success']} victory={row['victory']} floor={row['max_floor']} "
+                    f"success={row['success']} victory={row['victory']} "
+                    f"final=A{row.get('final_act', 1)}F{row.get('final_floor', row['max_floor'])}/G{row.get('final_global_floor', row['max_floor'])} "
+                    f"max=A{row.get('max_act', row.get('final_act', 1))}F{row.get('max_act_floor', row['max_floor'])}/G{row.get('max_global_floor', row['max_floor'])} "
                     f"steps={row['steps']} cache={bool(row.get('cache_hit'))} err={row['error']}",
                     flush=True,
                 )
