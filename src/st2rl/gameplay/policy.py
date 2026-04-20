@@ -185,6 +185,97 @@ class SimpleFlowPolicy:
                 quality += 1.5
         return quality
 
+    def _drawn_card_play_value(
+        self,
+        state: GameStateView,
+        card: dict[str, Any],
+        remaining_energy: int,
+        *,
+        draw_locked: bool = False,
+    ) -> float:
+        card_type = self._text(card.get("type"))
+        card_name = self._text(card.get("name") or card.get("card_id") or card.get("id"))
+        cost = max(0, self._safe_int(card.get("cost"), 0))
+        damage = self._card_damage(card)
+        block = self._card_block(card)
+        draw = 0 if draw_locked else self._card_draw(card)
+        energy = self._card_energy_gain(card)
+        if card_type in {"status", "curse"}:
+            return -4.0
+        if cost > remaining_energy and energy <= 0:
+            return max(0.0, draw * 1.5 - cost)
+
+        value = 0.0
+        if damage > 0:
+            lowest_enemy_ehp = min((self._enemy_effective_hp(enemy) for enemy in state.living_enemies()), default=999)
+            value += min(damage, 24) / 3.5
+            if damage >= lowest_enemy_ehp:
+                value += 5.0
+        if block > 0:
+            incoming_damage = self._enemy_intended_damage(state)
+            block_gap = max(0, incoming_damage - state.block)
+            value += min(block, max(0, block_gap)) / 3.0
+            if block_gap <= 0:
+                value += min(block, 12) / 12.0
+        value += draw * 4.0 + energy * 5.0
+        if any(token in card_name for token in ("strike", "打击")) and draw <= 0 and energy <= 0:
+            value -= 2.5
+        if any(token in card_name for token in ("defend", "防御")) and draw <= 0 and energy <= 0:
+            value -= 2.0
+        if any(token in card_name for token in ("pommel", "剑柄", "headbutt", "shrug", "耸肩", "burning pact", "燃烧契约")):
+            value += 4.0
+        if draw_locked and ("battle_trance" in card_name or "战斗专注" in card_name):
+            value -= 5.0
+        if "bloodletting" in card_name or "放血" in card_name:
+            value += 3.0 if state.hp / max(1, state.max_hp) >= 0.45 else -2.0
+        return value
+
+    def _guaranteed_draw_followup_bonus(self, state: GameStateView, card: dict[str, Any]) -> float:
+        if self._text(card.get("type")) in {"status", "curse"}:
+            return 0.0
+        draw_amount = self._card_draw(card)
+        if draw_amount <= 0:
+            return 0.0
+
+        draw_pile = [item for item in state.draw_pile if isinstance(item, dict)]
+        draw_pile_count = self._safe_int(state.raw.get("draw_pile_count"), len(draw_pile))
+        if draw_pile_count <= 0 or len(draw_pile) < draw_pile_count or draw_amount < draw_pile_count:
+            return 0.0
+
+        cost = max(0, self._safe_int(card.get("cost"), 0))
+        remaining_energy = max(0, state.energy - cost + self._card_energy_gain(card))
+        selected_index = card.get("index")
+        current_followup_cost = sum(
+            max(0, self._safe_int(item.get("cost"), 0))
+            for item in state.playable_cards()
+            if item.get("index") != selected_index and self._text(item.get("type")) not in {"status", "curse"}
+        )
+        spendable_after_current_hand = max(0, remaining_energy - current_followup_cost)
+        if spendable_after_current_hand <= 0 and remaining_energy <= 0:
+            return 0.0
+
+        guaranteed = draw_pile[:draw_pile_count]
+        selected_name = self._text(card.get("name") or card.get("card_id") or card.get("id"))
+        draw_locked = "battle_trance" in selected_name or "战斗专注" in selected_name
+        values = [
+            self._drawn_card_play_value(
+                state,
+                item,
+                max(0, spendable_after_current_hand),
+                draw_locked=draw_locked,
+            )
+            for item in guaranteed
+        ]
+        positive_values = [value for value in values if value > 0]
+        bad_values = [value for value in values if value < 0]
+        if not positive_values:
+            return max(-6.0, sum(bad_values) * 0.4)
+
+        bonus = sum(positive_values) * 0.55 + min(len(positive_values), 3) * 1.0
+        if draw_pile_count <= 2:
+            bonus += 1.5
+        return max(-4.0, min(10.0, bonus))
+
     def _enemy_attack_pressure(self, state: GameStateView) -> int:
         pressure = 0
         for enemy in state.living_enemies():
@@ -223,6 +314,16 @@ class SimpleFlowPolicy:
                     continue
                 total += self._intent_damage(intent)
         return total
+
+    def _boss_enemy_key(self, state: GameStateView) -> str:
+        return " ".join(
+            self._text(enemy.get("id") or enemy.get("name") or "")
+            for enemy in state.living_enemies()
+            if isinstance(enemy, dict)
+        )
+
+    def _is_vantom_boss(self, state: GameStateView) -> bool:
+        return "vantom" in self._boss_enemy_key(state)
 
     def _potion_heal_amount(self, potion: dict[str, Any]) -> int:
         vars_payload = potion.get("vars") or {}
@@ -335,6 +436,9 @@ class SimpleFlowPolicy:
         for potion in state.player.get("potions") or []:
             if not isinstance(potion, dict) or potion.get("index") is None:
                 continue
+            potion_id = str(potion.get("id") or "").strip().upper()
+            if potion_id == "POTION.DISTILLED_CHAOS":
+                continue
             target_type = self._text(potion.get("target_type"))
             if "enemy" in target_type:
                 continue
@@ -386,6 +490,9 @@ class SimpleFlowPolicy:
         best_attack_choice: tuple[float, dict[str, Any], dict[str, Any] | None] | None = None
         for potion in state.player.get("potions") or []:
             if not isinstance(potion, dict) or potion.get("index") is None:
+                continue
+            potion_id = str(potion.get("id") or "").strip().upper()
+            if potion_id == "POTION.DISTILLED_CHAOS":
                 continue
             target_type = self._text(potion.get("target_type"))
             if "enemy" not in target_type:
@@ -473,6 +580,9 @@ class SimpleFlowPolicy:
         return self._pick_damage_target(enemies, damage) or enemies[0]
 
     def _combat_card_score(self, state: GameStateView, card: dict[str, Any]) -> float:
+        card_id = str(card.get("id") or "").strip().upper()
+        if card_id in {"CARD.CASCADE", "CARD.HAVOC"}:
+            return -100.0
         card_name = self._text(card.get("name") or card.get("card_id") or card.get("id"))
         description = self._text(card.get("description"))
         card_type = self._text(card.get("type"))
@@ -489,6 +599,7 @@ class SimpleFlowPolicy:
         context = state.raw.get("context") or {}
         floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
         is_boss_floor = floor >= 16
+        is_vantom = self._is_vantom_boss(state)
         lowest_enemy_ehp = min(self._enemy_effective_hp(enemy) for enemy in enemies)
         block_gap = max(0, incoming_damage - state.block)
         lethal_pressure = block_gap >= state.hp
@@ -499,6 +610,8 @@ class SimpleFlowPolicy:
             score += damage * 1.55
             if is_boss_floor:
                 score += damage * 0.75
+            if is_vantom:
+                score += damage * 2.2
             if damage >= lowest_enemy_ehp:
                 score += 18.0
             if "vulnerable" in description or "易伤" in description:
@@ -526,10 +639,15 @@ class SimpleFlowPolicy:
                     score -= min(block, 12) * 1.35
                     if any(token in card_name for token in ("defend", "防御")):
                         score -= 4.0
+            if is_vantom and damage <= 0 and current_projected_hp > 0:
+                score -= min(block, 16) * 2.3
+                if any(token in card_name for token in ("defend", "防御")):
+                    score -= 7.0
         if "draw" in description or "抽牌" in description:
             score += 3.0
         if draw_amount > 0:
             score += min(draw_amount, 4) * 3.0
+            score += self._guaranteed_draw_followup_bonus(state, card)
             if is_boss_floor and cost <= 1 and state.energy >= cost:
                 followup_count, spendable_cost = self._playable_followup_pressure(state, card)
                 if followup_count >= 2 and spendable_cost > max(0, state.energy - cost):
@@ -557,10 +675,15 @@ class SimpleFlowPolicy:
         if "weak" in description or "虚弱" in description:
             score += 2.5
         if hp_loss > 0:
+            absolute_hp_floor = hp_loss + (8 if is_boss_floor else 6)
+            if state.hp <= absolute_hp_floor and not lethal_pressure:
+                score -= 45.0
             if energy_gain > 0:
                 followup_count, spendable_cost = self._playable_followup_pressure(state, card)
                 can_convert_hp = followup_count >= 2 and spendable_cost > state.energy
                 score -= hp_loss * (2.6 if hp_ratio < 0.45 else 0.8)
+                if is_vantom and state.round and state.round >= 2 and hp_ratio < 0.75:
+                    score -= hp_loss * 2.5
                 if can_convert_hp and hp_ratio >= 0.45:
                     score += 35.0
                 if not can_convert_hp:
@@ -571,6 +694,8 @@ class SimpleFlowPolicy:
                         score -= 22.0
                     if incoming_damage <= state.block and followup_quality < 7.0:
                         score -= 14.0
+                if state.hp <= hp_loss + 14 and not can_convert_hp:
+                    score -= 18.0
             else:
                 score -= hp_loss * (2.4 if hp_ratio < 0.6 else 1.1)
         if "lose hp" in description or "失去生命" in description or "失去" in description and "生命" in description:
@@ -593,6 +718,8 @@ class SimpleFlowPolicy:
                 score += 2.0
                 if any(token in card_name for token in ("strike", "打击")) and draw_amount <= 0 and energy_gain <= 0:
                     score -= 3.0
+            if is_vantom:
+                score += 5.0
         elif card_type == "skill":
             score += 0.5
         elif card_type == "power":
@@ -632,6 +759,19 @@ class SimpleFlowPolicy:
         else:
             score += min((damage + block * 0.8) / max(cost, 1), 8.0)
             score -= max(0, cost - max(1, state.energy)) * 2.0
+
+        if any(token in card_name for token in ("headbutt", "剑柄")):
+            score += 7.0
+            if is_boss_floor:
+                score += 4.0
+        if any(token in card_name for token in ("thunderclap", "雷霆", "anger", "愤怒", "bludgeon", "重锤")):
+            score += 4.0
+        if "grapple" in card_name or "擒拿" in card_name:
+            score -= 5.0
+        if "rampage" in card_name or "暴走" in card_name:
+            score -= 3.0
+        if "forgotten_ritual" in card_name or "forgotten ritual" in card_name:
+            score -= 5.0
 
         if attack_pressure <= 0 and block > damage + 2:
             score -= 4.0
@@ -718,8 +858,10 @@ class SimpleFlowPolicy:
         floor = self._safe_int((state.raw.get("context") or {}).get("floor"), 0)
         if floor <= 8:
             heal_threshold = max(heal_threshold, 0.7)
+        elif floor >= 14:
+            heal_threshold = max(heal_threshold, 0.78)
         elif floor >= 12:
-            heal_threshold = max(heal_threshold, 0.55)
+            heal_threshold = max(heal_threshold, 0.72)
         if hp_ratio < max(0.4, heal_threshold):
             heal = next(
                 (

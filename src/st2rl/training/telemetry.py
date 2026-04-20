@@ -149,8 +149,9 @@ class SessionLeaderboardStore:
         return (
             -suspicious,
             1 if entry.get("victory") else 0,
-            int(entry.get("max_floor", 0)),
-            int(entry.get("act", 0)),
+            int(entry.get("max_progress") or entry.get("max_floor", 0)),
+            int(entry.get("max_act") or entry.get("act", 0)),
+            1 if entry.get("act1_boss_clear") else 0,
             round(float(entry.get("episode_reward", 0.0)), 3),
             -int(entry.get("episode_steps", 0)),
         )

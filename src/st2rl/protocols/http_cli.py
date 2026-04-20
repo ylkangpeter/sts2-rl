@@ -210,7 +210,7 @@ class HttpCliProtocolConfig:
     """Transport and session settings for the HTTP CLI protocol."""
 
     base_url: str = "http://127.0.0.1:5000"
-    timeout_seconds: int = 30
+    timeout_seconds: int = 10
     game_dir: str | None = None
     close_retries: int = 5
     transport_retry_delay_seconds: float = 0.15
@@ -281,10 +281,11 @@ class HttpCliProtocol(FlowProtocol):
         for attempt in range(retries + 1):
             response: Optional[requests.Response] = None
             try:
+                timeout = max(1, min(int(self.config.timeout_seconds), 10))
                 if method == "GET":
-                    response = session.get(url, timeout=self.config.timeout_seconds)
+                    response = session.get(url, timeout=timeout)
                 elif method == "POST":
-                    response = session.post(url, json=payload, timeout=self.config.timeout_seconds)
+                    response = session.post(url, json=payload, timeout=timeout)
                 else:
                     raise ValueError(f"Unsupported method: {method}")
 
@@ -487,6 +488,7 @@ class HttpCliProtocol(FlowProtocol):
             player_potions = [potion for potion in (state.player.get("potions") or []) if isinstance(potion, dict)]
             healing_potion_action = _best_healing_potion_action(state)
             force_proceed = bool(safe.args.pop("_force_if_stuck", False))
+            allow_end_turn = bool(safe.args.pop("_policy_allow_end_turn", False))
 
             def _fallback_combat_action() -> FlowAction:
                 if playable:
@@ -555,6 +557,8 @@ class HttpCliProtocol(FlowProtocol):
                 return FlowAction("end_turn")
 
             if safe.name == "end_turn":
+                if allow_end_turn:
+                    return FlowAction("end_turn")
                 if playable or player_potions:
                     return _fallback_combat_action()
                 if not enemies:

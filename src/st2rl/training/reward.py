@@ -23,6 +23,8 @@ class RewardConfig:
     invalid_action_penalty: float = -0.1
     stuck_penalty: float = -5.0
     progress_floor_reward: float = 0.5
+    act_progress_reward: float = 25.0
+    boss_combat_victory_reward: float = 30.0
 
 
 class RewardTracker:
@@ -41,6 +43,30 @@ class RewardTracker:
     def on_stuck(self) -> float:
         return self.config.stuck_penalty
 
+    @staticmethod
+    def _safe_int(value: object, default: int = 0) -> int:
+        try:
+            if value is None or value == "":
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+
+    @classmethod
+    def _context(cls, state: GameStateView) -> tuple[int, int, str]:
+        context = state.raw.get("context") or {}
+        act = cls._safe_int(context.get("act") or state.raw.get("act"), 0)
+        floor = cls._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        room_type = str(context.get("room_type") or state.raw.get("room_type") or "")
+        return act, floor, room_type
+
+    @staticmethod
+    def _is_act1_boss_context(act: int, floor: int, room_type: str) -> bool:
+        return act == 1 and (floor >= 17 or "boss" in room_type.lower())
+
     def compute(self, state: GameStateView) -> float:
         previous = self._previous_state
         self._previous_state = state
@@ -56,11 +82,14 @@ class RewardTracker:
 
         reward += (state.gold - previous.gold) * self.config.gold_delta_weight
 
-        prev_floor = int(previous.raw.get("floor") or 0)
-        curr_floor = int(state.raw.get("floor") or 0)
+        prev_act, prev_floor, prev_room_type = self._context(previous)
+        curr_act, curr_floor, curr_room_type = self._context(state)
+        if curr_act > prev_act:
+            reward += (curr_act - prev_act) * self.config.act_progress_reward
+
         if curr_floor > prev_floor:
             reward += (curr_floor - prev_floor) * self.config.progress_floor_reward
-            room_type = str((state.raw.get("context") or {}).get("room_type") or state.raw.get("room_type") or "").lower()
+            room_type = curr_room_type.lower()
             if "elite" in room_type:
                 reward += self.config.elite_reward
             elif "shop" in room_type:
@@ -71,6 +100,11 @@ class RewardTracker:
 
         if previous.decision == "combat_play" and state.decision == "card_reward":
             reward += self.config.combat_victory_reward
+            if self._is_act1_boss_context(prev_act, prev_floor, prev_room_type):
+                reward += self.config.boss_combat_victory_reward
+
+        if prev_act == 1 and curr_act >= 2:
+            reward += self.config.boss_combat_victory_reward
 
         if state.decision == "card_reward" and previous.decision != "card_reward":
             reward += self.config.card_reward_seen_reward

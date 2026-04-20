@@ -65,6 +65,16 @@ Training is considered healthy only when all of the following hold:
 - Prefer fixing root causes over masking problems with endless restarts.
 - Surface suspicious sessions explicitly in telemetry/dashboard output so operators do not need to infer them from raw logs.
 
+## Script And Runtime Output Discipline
+
+- Never treat a backtest, training run, or server probe as healthy just because the process exits with code 0 or prints a summary.
+- Inspect script output, result JSON, worker debug endpoints, and relevant stderr tails for every run used to make a decision.
+- Any non-empty per-seed `err`, `error`, Python/C# exception, `MissingMethodException`, `NullReferenceException`, `Game not found`, timeout, deadlock hint, or warning from the game server/headless runtime must be investigated.
+- Do not filter these problems out of metrics and continue. Either fix the root cause, prove with a narrow explanation that the warning is intentionally benign and suppress/record it appropriately, or stop and report the blocker.
+- Backtest metrics are valid only after runtime quality is clean enough that errors, exceptions, and warnings are not contaminating the sample.
+- If a script emits noisy warnings that are expected in headless mode, update the mock/headless layer so the warning no longer appears, or make the script fail fast with a clear diagnostic until the warning is handled.
+- When a server-side fix changes `sts2-cli`, terminate existing headless workers and rebuild before validating; stale worker processes must not be mixed with new code.
+
 ## Policy-Change Backtest Gate (Required)
 
 - Any change that affects gameplay decisions (card reward, shop, rest/campfire, event choice, map routing, combat fallback) must run deterministic seed backtests before restarting long training.

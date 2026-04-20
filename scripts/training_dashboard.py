@@ -827,7 +827,9 @@ def _score(item: dict[str, Any]) -> tuple[Any, ...]:
     return (
         -suspicious,
         1 if item.get("victory") else 0,
-        int(item.get("max_floor", 0)),
+        _safe_int(item.get("max_progress") or item.get("max_floor"), 0),
+        _safe_int(item.get("max_act") or item.get("act"), 0),
+        1 if item.get("act1_boss_clear") else 0,
         round(float(item.get("episode_reward", 0.0)), 3),
         -int(item.get("episode_steps", 0)),
     )
@@ -1101,9 +1103,11 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         key = row.get("game_id") or f"{row.get('slot')}-{row.get('episode_index')}"
         existing = history_by_job.get(key, {})
         max_floor = max(int(existing.get("max_floor", 0)), int(row.get("floor", 0)))
+        max_progress = max(_safe_int(existing.get("max_progress"), 0), _safe_int(row.get("max_progress") or row.get("floor"), 0))
         merged = dict(existing)
         merged.update(row)
         merged["max_floor"] = max_floor
+        merged["max_progress"] = max_progress
         history_by_job[key] = merged
 
     for slot in active_slots:
@@ -1116,9 +1120,14 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             slot["service_alive"] = live_row.get("alive")
         existing = history_by_job.get(key, {})
         max_floor = max(int(existing.get("max_floor", 0)), int(slot.get("floor", 0)))
+        current_progress = _safe_int(slot.get("max_progress"), 0)
+        if current_progress <= 0:
+            current_progress = max(0, (_safe_int(slot.get("act"), 0) - 1) * 100 + _safe_int(slot.get("floor"), 0))
+        max_progress = max(_safe_int(existing.get("max_progress"), 0), current_progress)
         merged = dict(existing)
         merged.update(slot)
         merged["max_floor"] = max_floor
+        merged["max_progress"] = max_progress
         history_by_job[key] = merged
 
     computed_top_sessions = sorted(history_by_job.values(), key=_score, reverse=True)[:50]

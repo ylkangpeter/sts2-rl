@@ -158,7 +158,7 @@ def _deck_counter(state: GameStateView | None) -> Counter[str]:
     return Counter(_card_id(card) for card in state.player.get("deck") or [] if isinstance(card, dict))
 
 
-def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot: int) -> dict[str, Any]:
+def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot: int | None) -> dict[str, Any]:
     seed = str(seed_row.get("seed") or "")
     protocol = HttpCliProtocol(HttpCliProtocolConfig(timeout_seconds=args.timeout_seconds))
     policy = SimpleFlowPolicy(FlowPolicyConfig())
@@ -197,7 +197,9 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
                     break
             state = protocol.adapt_state(result.state or previous.raw)
             boss_clear = boss_clear or _boss_cleared(previous, state)
-        if state is not None and not state.game_over and not error:
+            if boss_clear:
+                break
+        if state is not None and not state.game_over and not error and not boss_clear:
             error = "max_steps_exceeded"
     except Exception as exc:  # pragma: no cover - runtime integration
         error = str(exc)
@@ -255,7 +257,9 @@ def _bucket_hp(value: Any) -> str:
 
 
 def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
-    attempted = [row for row in results if row.get("boss_attempt")]
+    errored = [row for row in results if row.get("error")]
+    valid = [row for row in results if not row.get("error")]
+    attempted = [row for row in valid if row.get("boss_attempt")]
     clears = [row for row in attempted if row.get("boss_clear")]
     fails = [row for row in attempted if not row.get("boss_clear")]
 
@@ -272,6 +276,16 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
     return {
+        "run_quality": {
+            "total": len(results),
+            "valid": len(valid),
+            "errored": len(errored),
+            "error_rate": round(len(errored) / len(results), 4) if results else 0.0,
+            "error_examples": [
+                {"seed": row.get("seed"), "error": str(row.get("error") or "")[:240]}
+                for row in errored[:12]
+            ],
+        },
         "summary": _summarize_group(attempted, clears, fails),
         "by_boss": by_boss,
         "by_entry_hp": by_entry_hp,
@@ -353,9 +367,10 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+    worker_count = max(1, args.workers)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
-            executor.submit(_trace_seed, seed_row, args, index % max(1, args.workers)): seed_row
+            executor.submit(_trace_seed, seed_row, args, 0 if worker_count == 1 else None): seed_row
             for index, seed_row in enumerate(seed_rows)
         }
         for index, future in enumerate(as_completed(future_map), 1):

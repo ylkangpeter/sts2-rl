@@ -73,28 +73,28 @@ _EVENT_NEGATIVE_TOKENS = (
     "\u4f24\u5bb3",
 )
 _CARD_REWARD_PRIORS = {
-    "CARD.FLAME_BARRIER": 2.4,
-    "CARD.SHRUG_IT_OFF": 2.7,
+    "CARD.FLAME_BARRIER": 3.1,
+    "CARD.SHRUG_IT_OFF": 3.4,
     "CARD.TRUE_GRIT": -0.2,
-    "CARD.ARMAMENTS": 1.9,
-    "CARD.TAUNT": 1.6,
+    "CARD.ARMAMENTS": 2.2,
+    "CARD.TAUNT": 2.4,
     "CARD.WHIRLWIND": 1.5,
-    "CARD.UPPERCUT": 1.5,
-    "CARD.INFLAME": 1.4,
-    "CARD.BATTLE_TRANCE": 2.5,
-    "CARD.BURNING_PACT": 3.0,
-    "CARD.GRAPPLE": 1.2,
-    "CARD.BLOODLETTING": 3.0,
-    "CARD.RAMPAGE": 1.0,
+    "CARD.UPPERCUT": 2.0,
+    "CARD.INFLAME": 2.1,
+    "CARD.BATTLE_TRANCE": 3.4,
+    "CARD.BURNING_PACT": 3.7,
+    "CARD.GRAPPLE": -0.4,
+    "CARD.BLOODLETTING": 3.6,
+    "CARD.RAMPAGE": -0.2,
     "CARD.PILLAGE": 1.0,
-    "CARD.HEADBUTT": 0.9,
+    "CARD.HEADBUTT": 3.2,
     "CARD.HEMOKINESIS": 0.7,
     "CARD.FIGHT_ME": 0.5,
     "CARD.DISMANTLE": 0.4,
     "CARD.UNRELENTING": 0.2,
     "CARD.BODY_SLAM": -1.8,
     "CARD.TWIN_STRIKE": -1.8,
-    "CARD.POMMEL_STRIKE": 2.4,
+    "CARD.POMMEL_STRIKE": 3.5,
     "CARD.SETUP_STRIKE": -1.7,
     "CARD.HAVOC": -1.6,
     "CARD.PERFECTED_STRIKE": -1.6,
@@ -103,7 +103,7 @@ _CARD_REWARD_PRIORS = {
     "CARD.FEEL_NO_PAIN": -1.4,
     "CARD.INFERNAL_BLADE": -1.3,
     "CARD.JUGGLING": -1.3,
-    "CARD.FORGOTTEN_RITUAL": -1.3,
+    "CARD.FORGOTTEN_RITUAL": -2.2,
     "CARD.STAMPEDE": -1.2,
     "CARD.RUPTURE": -1.2,
     "CARD.PRIMAL_FORCE": -1.1,
@@ -111,10 +111,21 @@ _CARD_REWARD_PRIORS = {
     "CARD.SWORD_BOOMERANG": -0.8,
     "CARD.MOLTEN_FIST": -0.7,
     "CARD.TREMBLE": -0.5,
+    "CARD.SPOILS_MAP": -1.6,
+    "CARD.THUNDERCLAP": 2.2,
+    "CARD.ANGER": 1.8,
+    "CARD.BLUDGEON": 2.4,
+    "CARD.HOWL_FROM_BEYOND": 1.6,
 }
 
 _UNSUPPORTED_HEADLESS_CARD_IDS = {
+    "CARD.CASCADE",
+    "CARD.HAVOC",
     "CARD.WHIRLWIND",
+}
+
+_UNSUPPORTED_HEADLESS_POTION_IDS = {
+    "POTION.DISTILLED_CHAOS",
 }
 
 _BLOCK_CARD_IDS = {
@@ -183,6 +194,9 @@ _ELITE_FIGHTER_IDS = {
     "CARD.HEADBUTT",
     "CARD.HEMOKINESIS",
     "CARD.PILLAGE",
+    "CARD.THUNDERCLAP",
+    "CARD.ANGER",
+    "CARD.BLUDGEON",
 }
 
 _ARCHETYPE_CARD_WEIGHTS: dict[str, dict[str, float]] = {
@@ -567,12 +581,17 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     non_engine_stats = max(0, _stats_total(card) - _card_draw_amount(card) - _card_energy_amount(card))
     score += min(non_engine_stats, 24) * 0.12
     score += min(sum(1 for token in _UTILITY_TOKENS if token in _description(card)), 4) * 0.35
+    cost = _safe_int(card.get("cost"), _safe_int((knowledge or {}).get("energy"), 0))
     draw_amount = _card_draw_amount(card)
     energy_amount = _card_energy_amount(card)
     if draw_amount > 0:
         score += min(draw_amount, 4) * 1.05
+        if cost <= 1:
+            score += 0.55
     if energy_amount > 0:
         score += min(energy_amount, 3) * 1.25
+        if cost <= 1:
+            score += 0.65
     if card.get("after_upgrade"):
         score += 0.35
 
@@ -581,7 +600,6 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
 
     score += _CARD_REWARD_PRIORS.get(_card_id(card), 0.0)
 
-    cost = _safe_int(card.get("cost"), _safe_int((knowledge or {}).get("energy"), 0))
     counts = _deck_counts(deck)
     basics = _deck_basics(deck)
     deck_size = len(deck)
@@ -608,6 +626,8 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
         score += 1.0
         if counts["draw"] >= 2:
             score += 1.5
+        elif counts["draw"] >= 1:
+            score += 0.8
         if counts["zero_cost"] >= 3:
             score += 0.35
         if counts["burning_pact"] > 0:
@@ -620,12 +640,24 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
             score += 1.2
     if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL"} and block_deficit:
         score += 0.8
+    if card_id_upper == "CARD.HEADBUTT":
+        score += 1.4
+        if counts["draw"] >= 1:
+            score += 0.8
+        if basics["total"] >= 5:
+            score += 0.4
     if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.SHRUG_IT_OFF"}:
-        score += 0.35
+        score += 0.85
         if thick_deck:
             score += 0.45
+        if deck_size <= 18:
+            score += 0.35
     if card_id_upper in {"CARD.ARMAMENTS", "CARD.UPPERCUT", "CARD.INFLAME", "CARD.HEMOKINESIS"}:
         score += 0.35
+    if card_id_upper in {"CARD.THUNDERCLAP", "CARD.ANGER", "CARD.BLUDGEON", "CARD.HOWL_FROM_BEYOND"}:
+        score += 0.75
+    if card_id_upper in {"CARD.GRAPPLE", "CARD.RAMPAGE", "CARD.FORGOTTEN_RITUAL", "CARD.SPOILS_MAP"}:
+        score -= 1.0
     if card_id_upper == "CARD.TRUE_GRIT":
         if not bool(card.get("upgraded")):
             score -= 1.8
@@ -634,7 +666,7 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
         if _deck_archetype_anchors(deck).get("exhaust", 0) <= 0:
             score -= 0.8
     if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.SHRUG_IT_OFF"} and counts["bloodletting"] > 0:
-        score += 0.8
+        score += 1.2
     if counts["bloodletting"] > 0 and any(token in _description(card) for token in ("draw", "\u62bd\u724c")):
         score += 0.5
     score += _archetype_reward_bonus(card, deck)
@@ -744,51 +776,68 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
         value = 0.0
         if "elite" in room:
             if floor <= 6:
-                value = -4.5
+                value = -5.2
             elif floor <= 8:
-                value = -2.8 + elite_readiness
+                value = -3.4 + elite_readiness
             elif floor <= 12:
-                value = -1.0 + elite_readiness * 1.1
+                value = -3.2 + elite_readiness * 0.75
             else:
-                value = 0.3 + elite_readiness * 1.15
-            if hp_ratio < 0.55:
-                value -= 1.5
+                value = -4.3 + elite_readiness * 0.65
+            if hp_ratio < 0.65:
+                value -= 2.0
+            if floor >= 11 and hp_ratio < 0.8:
+                value -= 2.6
+            if floor >= 13 and hp_ratio < 0.9:
+                value -= 3.0
         elif "rest" in room or "camp" in room or room == "r":
-            value = 3.2 if hp_ratio < 0.5 else (2.1 if hp_ratio < 0.7 else 0.65)
+            value = 4.4 if hp_ratio < 0.6 else (3.4 if hp_ratio < 0.8 else 1.15)
             if floor >= 11:
-                value += 1.25
+                value += 2.35
             if floor >= 14:
-                value += 0.55
+                value += 1.35
         elif "shop" in room or room in {"merchant", "$", "s"}:
-            value = 2.0 if state.gold >= 150 else (-0.25 if state.gold < 110 else 1.35)
+            value = 2.65 if state.gold >= 150 else (0.35 if state.gold < 110 else 1.95)
             if purge_target is not None and state.gold >= 75:
-                value += 0.7
+                value += 0.95
             if floor >= 11 and state.gold >= 120:
-                value += 0.55
+                value += 1.25
+            if floor >= 13 and hp_ratio < 0.85:
+                value += 0.75
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
             if floor <= 10 and hp_ratio >= 0.55:
                 value = 1.3
             elif floor <= 10:
-                value = 1.45
+                value = 1.7
             else:
-                value = 1.45
+                value = 2.25 if hp_ratio < 0.8 else 1.65
         elif "monster" in room or "combat" in room or room == "m":
             if floor <= 10 and hp_ratio >= 0.55:
                 value = 1.45
             elif floor <= 10:
                 value = 0.95
             else:
-                value = 1.25
+                value = 0.55
             if floor >= 13 and hp_ratio < 0.7:
-                value -= 0.65
+                value -= 1.9
+            if floor >= 11 and hp_ratio < 0.55:
+                value -= 1.35
+            if floor >= 14 and hp_ratio < 0.85:
+                value -= 1.1
         elif "boss" in room or room == "b":
             value = 4.0
         else:
             value = 1.0
-        if any("elite" in next_room for next_room in next_rooms) and hp_ratio < 0.72 and elite_readiness < 1.15:
-            value -= 1.4
+        has_elite_next = any("elite" in next_room for next_room in next_rooms)
+        if has_elite_next and hp_ratio < 0.78 and elite_readiness < 1.35:
+            value -= 1.8
+        if has_elite_next and floor >= 10 and hp_ratio < 0.9:
+            value -= 3.8
+        if has_elite_next and floor >= 13:
+            value -= 2.5
+            if hp_ratio < 0.97:
+                value -= 3.5
         if any("elite" in next_room for next_room in next_rooms) and ("rest" in room or "shop" in room):
             value += 0.35
         if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):
@@ -1017,6 +1066,9 @@ def best_shop_relic(relics: list[dict[str, Any]], gold: int) -> dict[str, Any] |
 
 
 def estimate_potion_score(potion: dict[str, Any]) -> float:
+    potion_id = str(potion.get("id") or "").strip().upper()
+    if potion_id in _UNSUPPORTED_HEADLESS_POTION_IDS:
+        return -100.0
     description = _text(potion.get("description"))
     target_type = _text(potion.get("target_type"))
     score = _rarity_value(potion.get("rarity")) * 0.6 + 1.0
@@ -1119,6 +1171,8 @@ def choose_event_option(options: list[dict[str, Any]], state: GameStateView) -> 
                 score += 1.8
         if "skip" in text or "\u8df3\u8fc7" in text:
             score -= 0.25
+        if any(token in text for token in ("amalgamator", "combine", "combine strikes", "junglemaze", "jungle maze", "safety in numbers")):
+            score -= 8.0
         if hp_ratio < 0.45 and any(token in text for token in ("hp", "\u751f\u547d", "\u53d7\u4f24", "\u4f24\u5bb3")):
             score -= 2.0
         if any(token in text for token in ("remove", "purge", "\u5220\u724c", "\u79fb\u9664")):

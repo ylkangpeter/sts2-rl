@@ -79,7 +79,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=None, help="Optional JSON output path.")
     parser.add_argument("--character", type=str, default="Ironclad")
     parser.add_argument("--max-steps", type=int, default=1200)
-    parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument("--timeout-seconds", type=int, default=10)
     parser.add_argument(
         "--cache-dir",
         type=Path,

@@ -13,7 +13,9 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from st2rl.gameplay.config import FlowPolicyConfig
 from st2rl.gameplay.knowledge_matcher import DEFAULT_MISMATCH_LOG_PATH, KnowledgeMatcher
+from st2rl.gameplay.policy import SimpleFlowPolicy
 from st2rl.gameplay.types import FlowAction, GameStateView
 from st2rl.protocols.http_cli import (
     HttpCliProtocol,
@@ -34,7 +36,7 @@ class HttpCliEnvConfig:
     max_steps: int | None = 5000
     game_dir: str | None = None
     base_url: str = "http://127.0.0.1:5000"
-    timeout_seconds: int = 30
+    timeout_seconds: int = 10
     health_check_retries: int = 2
     step_delay_seconds: float = 0.0
     recovery_delay_seconds: float = 0.01
@@ -103,6 +105,8 @@ class HttpCliRlEnv(gym.Env):
         if isinstance(reward_config, dict):
             reward_config = RewardConfig(**reward_config)
         self.reward_tracker = RewardTracker(reward_config or RewardConfig())
+        self.flow_policy = SimpleFlowPolicy(FlowPolicyConfig())
+        self._flow_policy_rng = random.Random(self.config.seed_offset)
         self.logger = get_run_logger()
         self.telemetry = SlotTelemetry(self.config.telemetry_dir, self.config.seed_offset)
         self.session_store = SessionLeaderboardStore(self.config.telemetry_dir)
@@ -131,6 +135,7 @@ class HttpCliRlEnv(gym.Env):
         self._deadlock_error_streak = 0
         self._termination_reason: Optional[str] = None
         self._combat_deadlock_card_ids: set[str] = set()
+        self._flow_policy_override_count = 0
 
     def _normalize_room_type(self, value: Any, *, symbol: Any = None) -> str:
         text = str(value or symbol or "").strip().lower()
@@ -164,6 +169,8 @@ class HttpCliRlEnv(gym.Env):
         state = self._state
         summary = state.summary() if state is not None else {}
         context = (state.raw.get("context") if state is not None else {}) or {}
+        act = int(context.get("act") or state.raw.get("act") or 0) if state is not None else 0
+        floor = int(context.get("floor") or state.raw.get("floor") or 0) if state is not None else 0
         boss_info = self._extract_boss_info(state)
         return {
             "slot": f"{self.config.seed_offset:02d}",
@@ -174,8 +181,10 @@ class HttpCliRlEnv(gym.Env):
             "started_at": self._episode_started_at,
             "active": active,
             "decision": summary.get("decision"),
-            "floor": int(context.get("floor") or state.raw.get("floor") or 0) if state is not None else 0,
-            "act": int(context.get("act") or state.raw.get("act") or 0) if state is not None else 0,
+            "floor": floor,
+            "act": act,
+            "max_progress": self._progress_score(act=act, floor=floor),
+            "act1_boss_attempt": self._is_act1_boss_state(state),
             "room_type": context.get("room_type"),
             "hp": summary.get("player_hp", 0),
             "max_hp": summary.get("player_max_hp", 0),
@@ -211,6 +220,58 @@ class HttpCliRlEnv(gym.Env):
             "floor": self._safe_number(context.get("floor") or state.raw.get("floor"), 0),
             "room_type": context.get("room_type") or state.raw.get("room_type") or state.decision,
         }
+
+    def _progress_score(self, *, act: int, floor: int) -> int:
+        if act <= 0:
+            return max(floor, 0)
+        return (act - 1) * 100 + max(floor, 0)
+
+    def _is_act1_boss_state(self, state: Optional[GameStateView]) -> bool:
+        context = self._state_context(state)
+        if self._safe_number(context.get("act"), 0) != 1:
+            return False
+        floor = self._safe_number(context.get("floor"), 0)
+        room_type = str(context.get("room_type") or "").strip().lower()
+        return floor >= 17 or "boss" in room_type
+
+    def _flow_policy_action(self, state: GameStateView) -> FlowAction:
+        action = self.flow_policy.choose_action(state, self._flow_policy_rng)
+        if state.decision == "combat_play" and action.name == "end_turn":
+            args = dict(action.args)
+            args["_policy_allow_end_turn"] = True
+            return FlowAction(action.name, args)
+        return action
+
+    def _should_use_flow_policy_combat_action(self, state: Optional[GameStateView], action: FlowAction) -> bool:
+        if state is None or state.decision != "combat_play":
+            return False
+        if not state.living_enemies():
+            return False
+
+        playable = [
+            card
+            for card in state.playable_cards()
+            if str(card.get("id") or "").strip().upper() not in self._combat_deadlock_card_ids
+        ]
+        if not playable:
+            return False
+
+        if self._is_act1_boss_state(state):
+            return True
+
+        if action.name in {"end_turn", "proceed"}:
+            return True
+        if action.name == "play_card":
+            playable_indices = {card.get("index") for card in playable}
+            return action.args.get("card_index") not in playable_indices
+        if action.name == "use_potion":
+            valid_potions = {
+                potion.get("index")
+                for potion in (state.player.get("potions") or [])
+                if isinstance(potion, dict) and potion.get("index") is not None
+            }
+            return action.args.get("potion_index") not in valid_potions
+        return action.name not in {"play_card", "use_potion"}
 
     def _extract_boss_info(self, state: Optional[GameStateView]) -> dict[str, Any]:
         if state is None:
@@ -695,7 +756,29 @@ class HttpCliRlEnv(gym.Env):
             )
             maps.append(act_map)
 
-        max_floor = max((self._safe_number(node.get("floor"), 0) for node in nodes_by_id.values()), default=self._safe_number(final.get("context", {}).get("floor"), 0))
+        final_context = final.get("context", {}) or {}
+        final_act = self._safe_number(final_context.get("act"), 0)
+        final_floor = self._safe_number(final_context.get("floor"), 0)
+        node_progress = [
+            (
+                self._safe_number(node.get("act"), 0),
+                self._safe_number(node.get("floor"), 0),
+                str(node.get("room_type") or ""),
+            )
+            for node in nodes_by_id.values()
+        ]
+        node_progress.append((final_act, final_floor, str(final_context.get("room_type") or "")))
+        max_floor = max((floor for _, floor, _ in node_progress), default=final_floor)
+        max_act = max((act for act, _, _ in node_progress), default=final_act)
+        max_progress = max(
+            (self._progress_score(act=act, floor=floor) for act, floor, _ in node_progress),
+            default=self._progress_score(act=final_act, floor=final_floor),
+        )
+        act1_boss_attempt = any(
+            act == 1 and (floor >= 17 or "boss" in room_type.lower())
+            for act, floor, room_type in node_progress
+        )
+        act1_boss_clear = bool(final_act >= 2 or max_act >= 2)
         boss_info = self._extract_boss_info(self._state)
         summary = {
             "game_id": self._game_id,
@@ -709,7 +792,12 @@ class HttpCliRlEnv(gym.Env):
             "terminated": terminated,
             "truncated": truncated,
             "max_floor": max_floor,
-            "act": self._safe_number(final.get("context", {}).get("act"), 0),
+            "max_floor_local": max_floor,
+            "max_act": max_act,
+            "max_progress": max_progress,
+            "act1_boss_attempt": act1_boss_attempt,
+            "act1_boss_clear": act1_boss_clear,
+            "act": final_act,
             "final_hp": self._safe_number(final.get("hp"), 0),
             "max_hp": self._safe_number(final.get("max_hp"), 0),
             "final_gold": self._safe_number(final.get("gold"), 0),
@@ -743,6 +831,16 @@ class HttpCliRlEnv(gym.Env):
             payload["termination_reason"] = self._termination_reason or "max_steps_exceeded"
             self._record_overlong_seed()
         details = self._build_session_details(terminated=terminated, truncated=truncated)
+        for key in (
+            "max_floor",
+            "max_floor_local",
+            "max_act",
+            "max_progress",
+            "act1_boss_attempt",
+            "act1_boss_clear",
+        ):
+            if key in details["summary"]:
+                payload[key] = details["summary"][key]
         anomaly_flags = self._episode_anomaly_flags(details["summary"])
         if anomaly_flags:
             payload["anomaly_flags"] = anomaly_flags
@@ -1071,7 +1169,7 @@ class HttpCliRlEnv(gym.Env):
 
         if self._no_action_combat_stagnant_steps == self.config.no_action_combat_proceed_threshold:
             forced = FlowAction("proceed", {"_force_if_stuck": True})
-            result = self.protocol.step(self._game_id, self.protocol.sanitize_action(self._state, forced, random))
+            result = self.protocol.step(self._game_id, self.protocol.sanitize_action(self._state, forced, self._flow_policy_rng))
             if result.status == "success" and result.state:
                 self._state = self.protocol.adapt_state(result.state)
                 self.reward_tracker.reset(self._state)
@@ -1242,6 +1340,7 @@ class HttpCliRlEnv(gym.Env):
             self._deadlock_error_streak = 0
             self._termination_reason = None
             self._combat_deadlock_card_ids = set()
+            self._flow_policy_override_count = 0
             try:
                 self.protocol.health_check(retries=self.config.health_check_retries)
                 start = self.protocol.start_game(self.config.character, self._seed, self.config.seed_offset)
@@ -1292,7 +1391,12 @@ class HttpCliRlEnv(gym.Env):
             raise RuntimeError("Environment not reset")
         before_state = self._state
         decoded = decode_action(action)
-        sanitized = self.protocol.sanitize_action(self._state, decoded, random)
+        override_reason: Optional[str] = None
+        if self._should_use_flow_policy_combat_action(self._state, decoded):
+            decoded = self._flow_policy_action(self._state)
+            self._flow_policy_override_count += 1
+            override_reason = "act1_boss" if self._is_act1_boss_state(self._state) else "combat_fallback"
+        sanitized = self.protocol.sanitize_action(self._state, decoded, self._flow_policy_rng)
         try:
             before_marker = self._progress_marker(before_state)
             result = self.protocol.step(self._game_id, sanitized)
@@ -1309,7 +1413,10 @@ class HttpCliRlEnv(gym.Env):
                 else:
                     reward += self.reward_tracker.on_invalid_action()
                     recovery = self.protocol.recover_action_from_error(result.raw, self._state) or FlowAction("proceed")
-                    retry = self.protocol.step(self._game_id, self.protocol.sanitize_action(self._state, recovery, random))
+                    retry = self.protocol.step(
+                        self._game_id,
+                        self.protocol.sanitize_action(self._state, recovery, self._flow_policy_rng),
+                    )
                     if retry.status != "success":
                         self._protocol_error_streak += 1
                         if self._is_deadlock_error(retry.raw):
@@ -1337,10 +1444,14 @@ class HttpCliRlEnv(gym.Env):
                                         time.sleep(self.config.recovery_delay_seconds)
                                     else:
                                         self._state = probed_state
-                                        forced_combat_action = self._best_effort_combat_action(self._state) or FlowAction("proceed")
+                                        forced_combat_action = (
+                                            self._flow_policy_action(self._state)
+                                            if self._state is not None and self._state.decision == "combat_play"
+                                            else self._best_effort_combat_action(self._state)
+                                        ) or FlowAction("proceed")
                                         forced_result = self.protocol.step(
                                             self._game_id,
-                                            self.protocol.sanitize_action(self._state, forced_combat_action, random),
+                                            self.protocol.sanitize_action(self._state, forced_combat_action, self._flow_policy_rng),
                                         )
                                         if forced_result.status == "success" and forced_result.state:
                                             result = forced_result
@@ -1434,6 +1545,9 @@ class HttpCliRlEnv(gym.Env):
                 reward=reward,
                 status="success" if result.status == "success" else result.status,
             )
+            if override_reason and self._episode_trace:
+                self._episode_trace[-1]["policy_override"] = override_reason
+                self._episode_trace[-1]["policy_override_count"] = self._flow_policy_override_count
             obs = self._get_observation(self._state)
             info = {
                 "decision": self._state.decision,
