@@ -315,6 +315,14 @@ class SimpleFlowPolicy:
                 total += self._intent_damage(intent)
         return total
 
+    def _combat_context(self, state: GameStateView) -> tuple[int, int, str, bool]:
+        context = state.raw.get("context") or {}
+        act = self._safe_int(context.get("act") or state.raw.get("act"), 0)
+        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        room_type = self._text(context.get("room_type"))
+        is_boss_room = room_type == "boss" or "boss" in room_type
+        return act, floor, room_type, is_boss_room
+
     def _boss_enemy_key(self, state: GameStateView) -> str:
         return " ".join(
             self._text(enemy.get("id") or enemy.get("name") or "")
@@ -420,6 +428,31 @@ class SimpleFlowPolicy:
         digits = [int(item) for item in re.findall(r"\d+", text)]
         return max(digits) if digits else 1
 
+    def _potion_dexterity_amount(self, potion: dict[str, Any]) -> int:
+        vars_payload = potion.get("vars") or {}
+        if isinstance(vars_payload, dict):
+            values = []
+            for key, value in vars_payload.items():
+                if "dex" in str(key).lower() or "dexterity" in str(key).lower():
+                    parsed = self._safe_int(value, None)
+                    if parsed is not None and parsed > 0:
+                        values.append(parsed)
+            if values:
+                return max(values)
+
+        text = f"{potion.get('name') or ''} {potion.get('description') or ''}"
+        lowered = text.lower()
+        if "dex" not in lowered and "dexterity" not in lowered and "敏捷" not in text:
+            return 0
+        digits = [int(item) for item in re.findall(r"\d+", text)]
+        return max(digits) if digits else 1
+
+    def _hand_block_card_count(self, state: GameStateView) -> int:
+        return sum(1 for card in state.playable_cards() if self._card_block(card) > 0)
+
+    def _hand_attack_card_count(self, state: GameStateView) -> int:
+        return sum(1 for card in state.playable_cards() if self._card_damage(card) > 0)
+
     def _potion_energy_amount(self, potion: dict[str, Any]) -> int:
         vars_payload = potion.get("vars") or {}
         if isinstance(vars_payload, dict):
@@ -443,10 +476,13 @@ class SimpleFlowPolicy:
         incoming_damage = self._enemy_intended_damage(state)
         missing_hp = max(state.max_hp - state.hp, 0)
         hp_ratio = state.hp / max(1, state.max_hp)
-        context = state.raw.get("context") or {}
-        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        _, floor, room_type, _ = self._combat_context(state)
         is_boss_floor = floor >= 16
+        is_elite_room = "elite" in room_type
+        high_value_combat = is_boss_floor or is_elite_room
+        late_act_pressure = floor >= 13
         early_boss_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
+        early_high_value_turn = high_value_combat and (state.round in (None, 1, 2, 3))
 
         best_choice: tuple[float, dict[str, Any]] | None = None
         best_self_choice: tuple[float, dict[str, Any]] | None = None
@@ -463,32 +499,53 @@ class SimpleFlowPolicy:
             block_amount = self._potion_block_amount(potion)
             if block_amount > 0:
                 block_gap = max(0, incoming_damage - state.block)
-                if block_gap > 0:
+                if block_gap > 0 and (high_value_combat or incoming_damage >= state.hp or hp_ratio < 0.28):
                     score = min(block_amount, block_gap) * 1.4
                     if incoming_damage >= state.hp:
                         score += 30.0
                     elif is_boss_floor and block_gap >= 8:
                         score += 10.0
+                    elif not high_value_combat:
+                        score -= 8.0
                     if best_self_choice is None or score > best_self_choice[0]:
                         best_self_choice = (score, potion)
 
             strength_amount = self._potion_strength_amount(potion)
-            if strength_amount > 0 and early_boss_turn:
-                score = 18.0 + strength_amount * 6.0
-                if best_self_choice is None or score > best_self_choice[0]:
-                    best_self_choice = (score, potion)
+            if strength_amount > 0 and early_high_value_turn:
+                attack_card_count = self._hand_attack_card_count(state)
+                if attack_card_count > 0:
+                    score = 14.0 + strength_amount * 6.0 + min(attack_card_count, 3) * 2.5
+                    if best_self_choice is None or score > best_self_choice[0]:
+                        best_self_choice = (score, potion)
 
             energy_amount = self._potion_energy_amount(potion)
-            if energy_amount > 0 and (early_boss_turn or hp_ratio < 0.45):
+            if energy_amount > 0 and (
+                early_high_value_turn
+                or incoming_damage >= state.hp
+                or (high_value_combat and hp_ratio < 0.45)
+                or (high_value_combat and late_act_pressure and hp_ratio < 0.7)
+            ):
                 _, spendable_cost = self._playable_followup_pressure(state, {"index": None})
                 if spendable_cost > state.energy:
                     score = 10.0 + min(energy_amount, spendable_cost - state.energy) * 5.0
+                    if late_act_pressure and hp_ratio < 0.7:
+                        score += 5.0
+                    if best_self_choice is None or score > best_self_choice[0]:
+                        best_self_choice = (score, potion)
+
+            dexterity_amount = self._potion_dexterity_amount(potion)
+            if dexterity_amount > 0 and early_high_value_turn:
+                block_card_count = self._hand_block_card_count(state)
+                if block_card_count > 0:
+                    score = 12.0 + dexterity_amount * 5.0 + min(block_card_count, 3) * 2.5
+                    if incoming_damage > state.block:
+                        score += 4.0
                     if best_self_choice is None or score > best_self_choice[0]:
                         best_self_choice = (score, potion)
 
             if missing_hp <= 0:
                 continue
-            if incoming_damage <= 0 and hp_ratio > (0.48 if is_boss_floor else 0.28):
+            if incoming_damage <= 0 and hp_ratio > (0.72 if high_value_combat else 0.28):
                 continue
             heal_amount = self._potion_heal_amount(potion)
             if heal_amount == 0:
@@ -497,6 +554,8 @@ class SimpleFlowPolicy:
             score = float(effective_heal)
             if incoming_damage >= state.hp:
                 score += 20.0
+            elif high_value_combat and hp_ratio < 0.72:
+                score += 12.0
             elif hp_ratio < 0.25:
                 score += 10.0
             elif hp_ratio < 0.4:
@@ -533,9 +592,10 @@ class SimpleFlowPolicy:
 
         if best_attack_choice is not None and (
             incoming_damage >= state.hp
-            or hp_ratio < 0.35
-            or best_attack_choice[0] >= 35.0
-            or (early_boss_turn and self._potion_damage_amount(best_attack_choice[1]) >= 10)
+            or (not high_value_combat and hp_ratio < 0.35 and best_attack_choice[0] >= 35.0)
+            or (high_value_combat and hp_ratio < 0.35)
+            or (high_value_combat and best_attack_choice[0] >= 35.0)
+            or (early_high_value_turn and self._potion_damage_amount(best_attack_choice[1]) >= 10)
         ):
             args = {"potion_index": best_attack_choice[1].get("index", 0)}
             if "all" not in self._text(best_attack_choice[1].get("target_type")) and best_attack_choice[2] is not None:
@@ -544,12 +604,16 @@ class SimpleFlowPolicy:
 
         if best_self_choice is not None and (
             incoming_damage >= state.hp
-            or best_self_choice[0] >= 22.0
-            or (early_boss_turn and best_self_choice[0] >= 16.0)
+            or (high_value_combat and best_self_choice[0] >= 22.0)
+            or (early_high_value_turn and best_self_choice[0] >= 16.0)
         ):
             return FlowAction("use_potion", {"potion_index": best_self_choice[1].get("index", 0)})
 
-        if best_choice is not None and (incoming_damage >= state.hp or hp_ratio < 0.3 or (is_boss_floor and hp_ratio < 0.55)):
+        if best_choice is not None and (
+            incoming_damage >= state.hp
+            or hp_ratio < 0.22
+            or (high_value_combat and hp_ratio < 0.72)
+        ):
             return FlowAction("use_potion", {"potion_index": best_choice[1].get("index", 0)})
         return None
 
@@ -579,10 +643,8 @@ class SimpleFlowPolicy:
         enemies: list[dict[str, Any]],
     ) -> dict[str, Any]:
         damage = self._card_damage(card)
-        context = state.raw.get("context") or {}
-        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
-        room_type = self._text(context.get("room_type"))
-        if floor >= 16 and room_type == "boss" and len(enemies) > 1 and damage > 0:
+        _, floor, room_type, is_boss_room = self._combat_context(state)
+        if floor >= 16 and is_boss_room and len(enemies) > 1 and damage > 0:
             def boss_target_score(enemy: dict[str, Any]) -> tuple[float, int, int]:
                 effective_hp = self._enemy_effective_hp(enemy)
                 lethal = 1 if damage >= effective_hp else 0
@@ -613,8 +675,7 @@ class SimpleFlowPolicy:
         attack_pressure = self._enemy_attack_pressure(state)
         incoming_damage = self._enemy_intended_damage(state)
         hp_ratio = state.hp / max(1, state.max_hp)
-        context = state.raw.get("context") or {}
-        floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        _, floor, _, _ = self._combat_context(state)
         is_boss_floor = floor >= 16
         is_vantom = self._is_vantom_boss(state)
         is_insatiable = self._is_insatiable_boss(state)
@@ -889,7 +950,12 @@ class SimpleFlowPolicy:
         )
         heal_threshold = self.config.rest_heal_threshold
         floor = self._safe_int((state.raw.get("context") or {}).get("floor"), 0)
-        if floor <= 8:
+        act = self._safe_int((state.raw.get("context") or {}).get("act"), 0)
+        if act >= 2:
+            heal_threshold = max(heal_threshold, 0.82)
+            if floor >= 12:
+                heal_threshold = max(heal_threshold, 0.88)
+        elif floor <= 8:
             heal_threshold = max(heal_threshold, 0.7)
         elif floor >= 14:
             heal_threshold = max(heal_threshold, 0.78)
