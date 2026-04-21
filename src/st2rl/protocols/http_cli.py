@@ -452,11 +452,39 @@ class HttpCliProtocol(FlowProtocol):
         message = str(error_payload.get("message", ""))
         lower_message = message.lower()
         if "no free potion slot" in lower_message or "potion inventory full" in lower_message:
-            return _best_healing_potion_action(state) or FlowAction("leave_shop")
-        if any(token in message for token in ("EnergyCostTooHigh", "Invalid card index", "Cannot play card", "Cannot use potion", "Use potion failed", "Potion action did not resolve")):
-            return FlowAction("end_turn")
-        if any(token in message for token in ("Buy relic failed", "Buy potion failed", "Buy card failed", "Card already purchased", "buy_card", "buy_relic", "buy_potion", "purge_card", "remove_card")):
-            return FlowAction("leave_shop")
+            if state.decision == "combat_play":
+                return _best_healing_potion_action(state) or FlowAction("end_turn", {"_policy_allow_end_turn": True})
+            return FlowAction("leave_shop", {"_force_if_stuck": True})
+        if any(
+            token in message
+            for token in (
+                "EnergyCostTooHigh",
+                "Invalid card index",
+                "Cannot play card",
+                "Card could not be played",
+                "Cannot use potion",
+                "Use potion failed",
+                "Potion action did not resolve",
+            )
+        ):
+            return FlowAction("end_turn", {"_policy_allow_end_turn": True})
+        if any(
+            token in message
+            for token in (
+                "Buy relic failed",
+                "Buy potion failed",
+                "Buy card failed",
+                "Card already purchased",
+                "Potion already purchased",
+                "Relic already purchased",
+                "buy_card",
+                "buy_relic",
+                "buy_potion",
+                "purge_card",
+                "remove_card",
+            )
+        ):
+            return FlowAction("leave_shop", {"_force_if_stuck": True})
         if "No pending card selection" in message:
             return FlowAction("proceed")
         if state.decision in ("map_node", "map_select") and "No pending card selection" in message:
@@ -601,6 +629,7 @@ class HttpCliProtocol(FlowProtocol):
             best_potion = best_shop_potion(affordable_shop_potions, state.gold)
             replacement_target = should_replace_potion(state.player.get("potions") or [], best_potion) if free_potion_slots <= 0 else None
             purge_target = choose_purge_target(deck)
+            force_leave_shop = bool(safe.args.pop("_force_if_stuck", False))
             prioritize_purge = should_prioritize_shop_purge(
                 deck,
                 state.gold,
@@ -609,6 +638,8 @@ class HttpCliProtocol(FlowProtocol):
                 best_relic=best_relic,
             )
             if safe.name == "leave_shop":
+                if force_leave_shop:
+                    return FlowAction("leave_shop")
                 if replacement_target is not None:
                     return FlowAction("discard_potion", {"potion_index": replacement_target.get("index", 0)})
                 if prioritize_purge and purge_target is not None:

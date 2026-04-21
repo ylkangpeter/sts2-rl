@@ -41,13 +41,23 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Trace and aggregate floor-17 boss attempts.")
     parser.add_argument("--backtest-json", type=Path, default=None, help="Backtest JSON whose rows contain seeds.")
     parser.add_argument("--seeds-file", type=Path, default=None, help="UTF-8 seed file, one seed per line.")
-    parser.add_argument("--focus", choices=("all", "boss_attempt", "boss_fail", "boss_clear"), default="boss_attempt")
+    parser.add_argument(
+        "--focus",
+        choices=("all", "boss_attempt", "boss_fail", "boss_clear", "act2_boss_attempt", "act2_boss_fail", "act2_boss_clear"),
+        default="boss_attempt",
+    )
+    parser.add_argument("--boss-act", type=int, default=1, help="Boss act to trace; use 2 for Act2/global floor 34.")
     parser.add_argument("--max-seeds", type=int, default=120)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--character", type=str, default="Ironclad")
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--max-steps", type=int, default=1200)
     parser.add_argument("--out", type=Path, default=Path("logs/backtests/boss_floor_analysis.json"))
+    parser.add_argument(
+        "--allow-runtime-errors",
+        action="store_true",
+        help="Write analysis but do not fail the process when any traced seed reports an error.",
+    )
     return parser.parse_args()
 
 
@@ -65,7 +75,13 @@ def _load_seed_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             rows = [row for row in rows if row.get("boss_attempt") and not row.get("boss_clear")]
         elif args.focus == "boss_clear":
             rows = [row for row in rows if row.get("boss_clear")]
-        return rows[: max(0, args.max_seeds)]
+        elif args.focus == "act2_boss_attempt":
+            rows = [row for row in rows if row.get("act2_boss_attempt")]
+        elif args.focus == "act2_boss_fail":
+            rows = [row for row in rows if row.get("act2_boss_attempt") and not row.get("act2_boss_clear")]
+        elif args.focus == "act2_boss_clear":
+            rows = [row for row in rows if row.get("act2_boss_clear")]
+        return _dedupe_seed_rows(rows)[: max(0, args.max_seeds)]
 
     if args.seeds_file is None:
         raise SystemExit("Provide --backtest-json or --seeds-file.")
@@ -74,7 +90,19 @@ def _load_seed_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
         for line in args.seeds_file.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    return [{"seed": seed} for seed in list(dict.fromkeys(seeds))[: max(0, args.max_seeds)]]
+    return _dedupe_seed_rows([{"seed": seed} for seed in seeds])[: max(0, args.max_seeds)]
+
+
+def _dedupe_seed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for row in rows:
+        seed = str(row.get("seed") or "").strip()
+        if not seed or seed in seen:
+            continue
+        seen.add(seed)
+        unique.append(row)
+    return unique
 
 
 def _enemy_intended_damage(state: GameStateView) -> int:
@@ -170,6 +198,7 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
     boss_attempt = False
     boss_clear = False
     error = ""
+    target_act = max(1, _safe_int(args.boss_act, 1))
     try:
         start = protocol.start_game(args.character, seed, worker_slot=worker_slot)
         game_id = start.game_id
@@ -179,7 +208,9 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
                 break
             action = protocol.sanitize_action(state, policy.choose_action(state, rng), rng)
             previous = state
-            if _is_boss_state(previous):
+            previous_act = _safe_int((previous.raw.get("context") or {}).get("act"), 1)
+            is_target_boss = _is_boss_state(previous) and previous_act == target_act
+            if is_target_boss:
                 boss_attempt = True
                 if boss_entry_state is None:
                     boss_entry_state = previous
@@ -196,8 +227,9 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
                     error = str(result.message or "retry_failed")
                     break
             state = protocol.adapt_state(result.state or previous.raw)
-            boss_clear = boss_clear or _boss_cleared(previous, state)
-            if boss_clear:
+            cleared_target_boss = is_target_boss and _boss_cleared(previous, state)
+            boss_clear = boss_clear or cleared_target_boss
+            if cleared_target_boss:
                 break
         if state is not None and not state.game_over and not error and not boss_clear:
             error = "max_steps_exceeded"
@@ -387,6 +419,7 @@ def main() -> None:
             "backtest_json": str(args.backtest_json) if args.backtest_json else None,
             "seeds_file": str(args.seeds_file) if args.seeds_file else None,
             "focus": args.focus,
+            "boss_act": args.boss_act,
             "max_seeds": args.max_seeds,
             "workers": args.workers,
             "character": args.character,
@@ -397,6 +430,8 @@ def main() -> None:
     args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(payload["aggregate"]["summary"], ensure_ascii=False, indent=2))
     print(f"wrote {args.out}")
+    if payload["aggregate"]["run_quality"]["errored"] and not args.allow_runtime_errors:
+        raise SystemExit("Boss analysis produced runtime errors; refusing to treat metrics as valid.")
 
 
 if __name__ == "__main__":

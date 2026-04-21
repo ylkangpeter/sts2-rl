@@ -812,7 +812,7 @@ class HttpCliRlEnv(gym.Env):
             "terminated": terminated,
             "truncated": truncated,
             "max_floor": max_floor,
-            "max_floor_local": max_floor,
+            "max_floor_local": max_global_act_floor,
             "max_act": max_act,
             "max_global_floor": max_global_floor,
             "max_global_act": max_global_act,

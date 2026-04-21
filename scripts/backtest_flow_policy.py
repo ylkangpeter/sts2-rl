@@ -54,9 +54,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-mode",
         type=str,
-        choices=("auto", "single"),
+        choices=("auto", "single", "focused"),
         default="auto",
-        help="auto: historical>=threshold + curated + random sample; single: only the seeds file.",
+        help=(
+            "focused: high-floor + suspicious historical seeds for first-pass tuning; "
+            "auto: full gate with historical>=threshold + curated + random sample; "
+            "single: only the seeds file."
+        ),
     )
     parser.add_argument(
         "--dataset-name",
@@ -69,6 +73,30 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=17,
         help="Minimum terminal floor required for historical seed inclusion.",
+    )
+    parser.add_argument(
+        "--focused-high-floor-threshold",
+        type=int,
+        default=17,
+        help="Minimum global floor for focused high-floor seed inclusion.",
+    )
+    parser.add_argument(
+        "--focused-anomaly-floor-threshold",
+        type=int,
+        default=10,
+        help="Minimum global floor for suspicious focused seed inclusion unless explicit errors exist.",
+    )
+    parser.add_argument(
+        "--focused-high-floor-limit",
+        type=int,
+        default=240,
+        help="Maximum high-floor historical seeds in focused mode.",
+    )
+    parser.add_argument(
+        "--focused-anomaly-limit",
+        type=int,
+        default=120,
+        help="Maximum suspicious historical seeds in focused mode.",
     )
     parser.add_argument(
         "--random-count",
@@ -109,6 +137,11 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Number of concurrent backtest games to run against reusable game-server workers.",
     )
+    parser.add_argument(
+        "--allow-runtime-errors",
+        action="store_true",
+        help="Write results but do not fail the process when any seed reports an error.",
+    )
     return parser.parse_args()
 
 
@@ -145,6 +178,57 @@ def _row_floor(row: dict[str, Any]) -> int:
     return _safe_int(row.get("max_floor", row.get("floor")), 0)
 
 
+def _global_floor(act: int, act_floor: int) -> int:
+    act = max(1, int(act))
+    act_floor = max(0, int(act_floor))
+    if act <= 1:
+        return act_floor
+    if act == 2:
+        return 18 + act_floor
+    if act == 3:
+        return 35 + act_floor
+    return 51 + act_floor + max(0, act - 4) * 17
+
+
+def _global_floor_from_progress(progress: Any) -> int:
+    value = _safe_int(progress, 0)
+    if value <= 0:
+        return 0
+    if value < 100:
+        return value
+    return _global_floor(value // 100 + 1, value % 100)
+
+
+def _row_global_floor(row: dict[str, Any]) -> int:
+    for key in ("max_global_floor", "final_global_floor", "global_floor"):
+        value = _safe_int(row.get(key), 0)
+        if value > 0:
+            return value
+    progress_floor = _global_floor_from_progress(row.get("max_progress"))
+    if progress_floor > 0:
+        return progress_floor
+    act = _safe_int(row.get("max_global_act") or row.get("max_act") or row.get("act"), 0)
+    floor = _safe_int(row.get("max_global_act_floor") or row.get("final_floor") or row.get("floor"), 0)
+    if act > 0 and floor > 0:
+        return _global_floor(act, floor)
+    return _row_floor(row)
+
+
+def _row_is_suspicious(row: dict[str, Any]) -> bool:
+    if row.get("error"):
+        return True
+    flags = row.get("anomaly_flags") or []
+    if isinstance(flags, list) and flags:
+        return True
+    if bool(row.get("truncated")) and not bool(row.get("victory")):
+        return True
+    if not bool(row.get("active", False)) and not bool(row.get("victory")):
+        final_hp = _safe_int(row.get("final_hp", row.get("hp")), 0)
+        if final_hp > 0:
+            return True
+    return False
+
+
 def _row_has_terminal_outcome(row: dict[str, Any]) -> bool:
     if bool(row.get("active", False)):
         return False
@@ -162,7 +246,7 @@ def _collect_historical_seeds(root: Path, *, min_floor: int) -> list[str]:
         seed = str(row.get("seed") or "").strip()
         if not seed or not _row_has_terminal_outcome(row):
             continue
-        floor = _row_floor(row)
+        floor = _row_global_floor(row)
         if floor < min_floor:
             continue
         recorded_at = str(row.get("recorded_at") or row.get("updated_at") or "")
@@ -171,6 +255,38 @@ def _collect_historical_seeds(root: Path, *, min_floor: int) -> list[str]:
             best_by_seed[seed] = (floor, recorded_at)
     ranked = sorted(best_by_seed.items(), key=lambda item: (-item[1][0], item[1][1], item[0]))
     return [seed for seed, _meta in ranked]
+
+
+def _collect_focused_historical_seeds(
+    root: Path,
+    *,
+    high_floor_threshold: int,
+    anomaly_floor_threshold: int,
+    high_floor_limit: int,
+    anomaly_limit: int,
+) -> tuple[list[str], list[str]]:
+    high_by_seed: dict[str, tuple[int, str]] = {}
+    anomaly_by_seed: dict[str, tuple[int, str]] = {}
+    for row in _iter_history_rows(root):
+        seed = str(row.get("seed") or "").strip()
+        if not seed or not _row_has_terminal_outcome(row):
+            continue
+        global_floor = _row_global_floor(row)
+        recorded_at = str(row.get("recorded_at") or row.get("updated_at") or "")
+        if global_floor >= high_floor_threshold:
+            current = high_by_seed.get(seed)
+            if current is None or (global_floor, recorded_at) > current:
+                high_by_seed[seed] = (global_floor, recorded_at)
+        if _row_is_suspicious(row) and (global_floor >= anomaly_floor_threshold or row.get("error")):
+            current = anomaly_by_seed.get(seed)
+            if current is None or (global_floor, recorded_at) > current:
+                anomaly_by_seed[seed] = (global_floor, recorded_at)
+
+    def ranked(values: dict[str, tuple[int, str]], limit: int) -> list[str]:
+        rows = sorted(values.items(), key=lambda item: (-item[1][0], item[1][1], item[0]))
+        return [seed for seed, _meta in rows[: max(0, limit)]]
+
+    return ranked(high_by_seed, high_floor_limit), ranked(anomaly_by_seed, anomaly_limit)
 
 
 def _generate_random_seeds(count: int) -> list[str]:
@@ -205,6 +321,32 @@ def _build_datasets(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "seeds": curated_seeds,
             }
         ]
+    if args.dataset_mode == "focused":
+        high_floor_seeds, anomaly_seeds = _collect_focused_historical_seeds(
+            args.history_root,
+            high_floor_threshold=max(1, int(args.focused_high_floor_threshold)),
+            anomaly_floor_threshold=max(1, int(args.focused_anomaly_floor_threshold)),
+            high_floor_limit=max(0, int(args.focused_high_floor_limit)),
+            anomaly_limit=max(0, int(args.focused_anomaly_limit)),
+        )
+        datasets = [
+            {
+                "name": f"focused_high_ge_global_{int(args.focused_high_floor_threshold)}",
+                "source": str(args.history_root),
+                "seeds": high_floor_seeds,
+            },
+            {
+                "name": f"focused_anomaly_ge_global_{int(args.focused_anomaly_floor_threshold)}",
+                "source": str(args.history_root),
+                "seeds": anomaly_seeds,
+            },
+        ]
+        datasets = [dataset for dataset in datasets if dataset["seeds"]]
+        if not datasets:
+            raise SystemExit("Focused dataset collection produced no high-floor or suspicious seeds.")
+        for dataset in datasets:
+            dataset["seeds"] = _dedupe_preserve_order(list(dataset.get("seeds") or []))
+        return datasets
 
     historical_seeds = _collect_historical_seeds(
         args.history_root,
@@ -245,18 +387,6 @@ def _state_floor(state: GameStateView) -> int:
 def _state_act(state: GameStateView) -> int:
     context = state.raw.get("context") or {}
     return max(1, _safe_int(context.get("act"), 1))
-
-
-def _global_floor(act: int, act_floor: int) -> int:
-    act = max(1, int(act))
-    act_floor = max(0, int(act_floor))
-    if act <= 1:
-        return act_floor
-    if act == 2:
-        return 18 + act_floor
-    if act == 3:
-        return 35 + act_floor
-    return 51 + act_floor + max(0, act - 4) * 17
 
 
 def _state_global_floor(state: GameStateView) -> int:
@@ -310,6 +440,8 @@ def _replay_cached_seed(
     peak = {"act": _state_act(state), "floor": max_floor, "global_floor": max_global_floor}
     boss_attempt = False
     boss_clear = False
+    act_boss_attempt = {1: False, 2: False, 3: False}
+    act_boss_clear = {1: False, 2: False, 3: False}
     for entry in cached.transitions:
         if steps >= max_steps:
             return None
@@ -329,9 +461,16 @@ def _replay_cached_seed(
         if result.status != "success" or not result.state:
             return None
         previous_state = state
-        boss_attempt = boss_attempt or _is_boss_state(previous_state)
+        previous_boss_act = _state_act(previous_state)
+        is_boss = _is_boss_state(previous_state)
+        boss_attempt = boss_attempt or is_boss
+        if is_boss and previous_boss_act in act_boss_attempt:
+            act_boss_attempt[previous_boss_act] = True
         state = protocol.adapt_state(result.state)
-        boss_clear = boss_clear or _boss_cleared(previous_state, state)
+        cleared_boss = _boss_cleared(previous_state, state)
+        boss_clear = boss_clear or cleared_boss
+        if cleared_boss and previous_boss_act in act_boss_clear:
+            act_boss_clear[previous_boss_act] = True
         max_floor = max(max_floor, _state_floor(state))
         peak = _update_floor_peak(state, peak)
         max_global_floor = peak["global_floor"]
@@ -358,6 +497,12 @@ def _replay_cached_seed(
             "cache_hit": True,
             "boss_attempt": boss_attempt,
             "boss_clear": boss_clear,
+            "act1_boss_attempt": act_boss_attempt[1],
+            "act1_boss_clear": act_boss_clear[1],
+            "act2_boss_attempt": act_boss_attempt[2],
+            "act2_boss_clear": act_boss_clear[2],
+            "act3_boss_attempt": act_boss_attempt[3],
+            "act3_boss_clear": act_boss_clear[3],
         }
     )
     return outcome
@@ -399,6 +544,12 @@ def _run_single_seed(
         "cache_hit": False,
         "boss_attempt": False,
         "boss_clear": False,
+        "act1_boss_attempt": False,
+        "act1_boss_clear": False,
+        "act2_boss_attempt": False,
+        "act2_boss_clear": False,
+        "act3_boss_attempt": False,
+        "act3_boss_clear": False,
     }
     if cache is not None:
         cached = cache.load(seed=seed, character=character)
@@ -422,7 +573,11 @@ def _run_single_seed(
             action = protocol.sanitize_action(state, policy.choose_action(state, rng), rng)
             before_hash = state_hash(state.raw)
             previous_state = state
-            outcome["boss_attempt"] = bool(outcome["boss_attempt"] or _is_boss_state(previous_state))
+            previous_boss_act = _state_act(previous_state)
+            is_boss = _is_boss_state(previous_state)
+            outcome["boss_attempt"] = bool(outcome["boss_attempt"] or is_boss)
+            if is_boss and 1 <= previous_boss_act <= 3:
+                outcome[f"act{previous_boss_act}_boss_attempt"] = True
             result = protocol.step(game_id, action)
             if result.status != "success":
                 recover = protocol.recover_action_from_error(result.raw, state) or FlowAction("proceed")
@@ -451,7 +606,10 @@ def _run_single_seed(
             )
             raw_state = result.state or state.raw
             state = protocol.adapt_state(raw_state)
-            outcome["boss_clear"] = bool(outcome["boss_clear"] or _boss_cleared(previous_state, state))
+            cleared_boss = _boss_cleared(previous_state, state)
+            outcome["boss_clear"] = bool(outcome["boss_clear"] or cleared_boss)
+            if cleared_boss and 1 <= previous_boss_act <= 3:
+                outcome[f"act{previous_boss_act}_boss_clear"] = True
             max_floor = max(max_floor, _state_floor(state))
             peak = _update_floor_peak(state, peak)
             max_global_floor = peak["global_floor"]
@@ -498,6 +656,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     done = [row for row in rows if row.get("success")]
     total = len(rows)
     success = len(done)
+    errored = [row for row in rows if row.get("error") or not row.get("success")]
     floors = [int(row.get("max_floor") or 0) for row in done]
     global_floors = [int(row.get("max_global_floor") or row.get("final_global_floor") or row.get("max_floor") or 0) for row in done]
     victories = sum(1 for row in done if row.get("victory"))
@@ -505,6 +664,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total": total,
         "success": success,
+        "errors": len(errored),
         "victory": victories,
         "avg_floor": round(sum(floors) / len(floors), 2) if floors else 0.0,
         "avg_global_floor": round(sum(global_floors) / len(global_floors), 2) if global_floors else 0.0,
@@ -520,8 +680,33 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ge_global_52": sum(1 for value in global_floors if value >= 52),
         "boss_attempt": sum(1 for row in done if row.get("boss_attempt")),
         "boss_clear": sum(1 for row in done if row.get("boss_clear")),
+        "act1_boss_attempt": sum(1 for row in done if row.get("act1_boss_attempt")),
+        "act1_boss_clear": sum(1 for row in done if row.get("act1_boss_clear")),
+        "act2_boss_attempt": sum(1 for row in done if row.get("act2_boss_attempt")),
+        "act2_boss_clear": sum(1 for row in done if row.get("act2_boss_clear")),
+        "act3_boss_attempt": sum(1 for row in done if row.get("act3_boss_attempt")),
+        "act3_boss_clear": sum(1 for row in done if row.get("act3_boss_clear")),
         "cache_hits": cache_hits,
     }
+
+
+def _runtime_error_examples(rows: list[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    for row in rows:
+        error = str(row.get("error") or "").strip()
+        if not error and row.get("success"):
+            continue
+        examples.append(
+            {
+                "dataset": row.get("dataset"),
+                "seed": row.get("seed"),
+                "success": bool(row.get("success")),
+                "error": error[:500],
+            }
+        )
+        if len(examples) >= limit:
+            break
+    return examples
 
 
 def _run_dataset(
@@ -637,6 +822,10 @@ def main() -> None:
             "timeout_seconds": args.timeout_seconds,
             "history_root": str(args.history_root),
             "history_floor_threshold": int(args.history_floor_threshold),
+            "focused_high_floor_threshold": int(args.focused_high_floor_threshold),
+            "focused_anomaly_floor_threshold": int(args.focused_anomaly_floor_threshold),
+            "focused_high_floor_limit": int(args.focused_high_floor_limit),
+            "focused_anomaly_limit": int(args.focused_anomaly_limit),
             "curated_seeds_file": str(args.seeds_file),
             "random_count": int(args.random_count),
             "workers": max(1, int(args.workers)),
@@ -645,12 +834,17 @@ def main() -> None:
         },
         "datasets": dataset_payloads,
         "merged_summary": _summary(merged_rows),
+        "runtime_error_examples": _runtime_error_examples(merged_rows),
         "cache": cache.stats() if cache is not None else {"enabled": False},
     }
     print(json.dumps(payload["merged_summary"], ensure_ascii=False, indent=2))
+    if payload["runtime_error_examples"]:
+        print(json.dumps({"runtime_error_examples": payload["runtime_error_examples"]}, ensure_ascii=False, indent=2))
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if payload["runtime_error_examples"] and not args.allow_runtime_errors:
+        raise SystemExit("Backtest produced runtime errors; refusing to treat metrics as valid.")
 
 
 if __name__ == "__main__":

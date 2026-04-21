@@ -78,7 +78,13 @@ Training is considered healthy only when all of the following hold:
 ## Policy-Change Backtest Gate (Required)
 
 - Any change that affects gameplay decisions (card reward, shop, rest/campfire, event choice, map routing, combat fallback) must run deterministic seed backtests before restarting long training.
-- Backtest dataset must include three parts every time:
+- Use a staged gate by default:
+  1. First run a focused gate concentrated on high-floor seeds and suspicious/error seeds.
+  2. Iterate on policy only against the focused gate until runtime quality is clean and grouped metrics are stable or improved.
+  3. Only after the focused gate is clean, run the full global gate.
+  4. Start or restart long training only after the full global gate passes.
+- Do not repeatedly run full global backtests while the policy still cannot pass the focused high-floor/anomaly gate; that wastes time and hides the actionable failures.
+- The full global backtest dataset must include three parts every time:
   1. all historical seeds whose terminal floor is `>=17` at the moment the script runs,
   2. a fixed curated seed set with broad floor distribution (at least floor bands around `5`, `10`, and `15`),
   3. an additional random seed sample regenerated every run to reduce overfitting risk.

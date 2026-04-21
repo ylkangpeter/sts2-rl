@@ -325,6 +325,23 @@ class SimpleFlowPolicy:
     def _is_vantom_boss(self, state: GameStateView) -> bool:
         return "vantom" in self._boss_enemy_key(state)
 
+    def _is_insatiable_boss(self, state: GameStateView) -> bool:
+        key = self._boss_enemy_key(state)
+        return "insatiable" in key or "sand" in key or "沙虫" in key
+
+    def _sandpit_turns(self, state: GameStateView) -> int:
+        for enemy in state.living_enemies():
+            for power in enemy.get("powers") or []:
+                if not isinstance(power, dict):
+                    continue
+                power_id = str(power.get("id") or power.get("name") or "").strip().upper()
+                if "SANDPIT" not in power_id and "沙坑" not in power_id:
+                    continue
+                amount = self._safe_int(power.get("amount"), 0)
+                if amount > 0:
+                    return amount
+        return 0
+
     def _potion_heal_amount(self, potion: dict[str, Any]) -> int:
         vars_payload = potion.get("vars") or {}
         if isinstance(vars_payload, dict):
@@ -565,7 +582,7 @@ class SimpleFlowPolicy:
         context = state.raw.get("context") or {}
         floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
         room_type = self._text(context.get("room_type"))
-        if floor >= 17 and room_type == "boss" and len(enemies) > 1 and damage > 0:
+        if floor >= 16 and room_type == "boss" and len(enemies) > 1 and damage > 0:
             def boss_target_score(enemy: dict[str, Any]) -> tuple[float, int, int]:
                 effective_hp = self._enemy_effective_hp(enemy)
                 lethal = 1 if damage >= effective_hp else 0
@@ -600,12 +617,28 @@ class SimpleFlowPolicy:
         floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
         is_boss_floor = floor >= 16
         is_vantom = self._is_vantom_boss(state)
+        is_insatiable = self._is_insatiable_boss(state)
+        sandpit_turns = self._sandpit_turns(state) if is_insatiable else 0
         lowest_enemy_ehp = min(self._enemy_effective_hp(enemy) for enemy in enemies)
         block_gap = max(0, incoming_damage - state.block)
         lethal_pressure = block_gap >= state.hp
         can_tank = state.hp > incoming_damage * 2
 
         score = 0.0
+        if card_id == "CARD.FRANTIC_ESCAPE":
+            if is_insatiable:
+                if sandpit_turns <= 1:
+                    score += 150.0
+                elif sandpit_turns == 2:
+                    score += 95.0
+                elif sandpit_turns == 3:
+                    score += 42.0
+                else:
+                    score += 18.0
+                if state.energy <= cost:
+                    score += 8.0
+            else:
+                score -= 10.0
         if damage > 0:
             score += damage * 1.55
             if is_boss_floor:

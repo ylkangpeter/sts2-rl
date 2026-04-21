@@ -149,12 +149,23 @@
     };
     function fmt(v) { return v === null || v === undefined || v === '' ? '-' : v; }
     function pct(v) { return (v ?? 0).toFixed(2) + '%'; }
+    function floorFromGlobal(globalFloor) {
+      const value = Number(globalFloor);
+      if (!Number.isFinite(value) || value <= 0) return null;
+      if (value <= 17) return { act: 1, floor: value };
+      if (value <= 34) return { act: 2, floor: value - 18 };
+      if (value <= 51) return { act: 3, floor: value - 35 };
+      return { act: 4, floor: value - 51 };
+    }
     function floorDisplay(row, maxField = false) {
       const global = maxField ? row.max_global_floor : row.global_floor;
       const fallback = maxField ? row.max_floor : row.floor;
       const value = global ?? fallback;
-      const act = maxField ? (row.max_global_act ?? row.max_act ?? row.act) : row.act;
-      const local = maxField ? (row.max_global_act_floor ?? row.max_floor_local ?? row.max_floor) : row.floor;
+      const derived = floorFromGlobal(value);
+      const rawAct = maxField ? (row.max_global_act ?? row.max_act ?? row.act) : row.act;
+      const rawLocal = maxField ? (row.max_global_act_floor ?? row.max_floor_local ?? row.max_floor) : row.floor;
+      const act = derived?.act ?? rawAct;
+      const local = derived?.floor ?? rawLocal;
       const base = fmt(value);
       if (act && local) return `${base} (A${act}F${local})`;
       return base;
