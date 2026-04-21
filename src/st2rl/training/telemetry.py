@@ -133,6 +133,47 @@ class SessionLeaderboardStore:
                 return default
 
     @classmethod
+    def _global_floor(cls, act: Any, floor: Any) -> int:
+        act_value = max(1, cls._safe_int(act, 1))
+        floor_value = max(0, cls._safe_int(floor, 0))
+        if act_value <= 1:
+            return floor_value
+        if act_value == 2:
+            return 18 + floor_value
+        if act_value == 3:
+            return 35 + floor_value
+        return 51 + floor_value + max(0, act_value - 4) * 17
+
+    @classmethod
+    def _global_floor_from_progress(cls, progress: Any) -> int:
+        value = cls._safe_int(progress, 0)
+        if value <= 0:
+            return 0
+        if value < 100:
+            return value
+        act = value // 100 + 1
+        floor = value % 100
+        return cls._global_floor(act, floor)
+
+    @classmethod
+    def _entry_global_floor(cls, entry: dict[str, Any]) -> int:
+        explicit = cls._safe_int(entry.get("max_global_floor"), 0)
+        if explicit > 0:
+            return explicit
+        progress_floor = cls._global_floor_from_progress(entry.get("max_progress"))
+        if progress_floor > 0:
+            return progress_floor
+        max_global_act = cls._safe_int(entry.get("max_global_act"), 0)
+        max_global_act_floor = cls._safe_int(entry.get("max_global_act_floor"), 0)
+        if max_global_act > 0 and max_global_act_floor > 0:
+            return cls._global_floor(max_global_act, max_global_act_floor)
+        act = cls._safe_int(entry.get("act"), 0)
+        floor = cls._safe_int(entry.get("final_floor") or entry.get("floor"), 0)
+        if act > 0 and floor > 0:
+            return cls._global_floor(act, floor)
+        return cls._safe_int(entry.get("max_floor"), 0)
+
+    @classmethod
     def _health_flags(cls, entry: dict[str, Any]) -> list[str]:
         flags: list[str] = []
         victory = bool(entry.get("victory"))
@@ -149,7 +190,7 @@ class SessionLeaderboardStore:
         return (
             -suspicious,
             1 if entry.get("victory") else 0,
-            int(entry.get("max_progress") or entry.get("max_floor", 0)),
+            SessionLeaderboardStore._entry_global_floor(entry),
             int(entry.get("max_act") or entry.get("act", 0)),
             1 if entry.get("act1_boss_clear") else 0,
             round(float(entry.get("episode_reward", 0.0)), 3),

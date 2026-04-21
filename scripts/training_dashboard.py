@@ -379,8 +379,8 @@ def _select_run_dir(*, require_active: bool = False) -> Path | None:
     candidates.sort(
         key=lambda item: (
             1 if item.get("active") else 0,
-            int(item.get("active_slot_count") or 0),
             float(item.get("freshest_ts") or 0.0),
+            int(item.get("active_slot_count") or 0),
         ),
         reverse=True,
     )
@@ -564,6 +564,10 @@ def _build_live_session(run_dir: Path, game_id: str) -> dict[str, Any]:
     context = state_snapshot.get("context") or {}
     boss = context.get("boss") or {}
     summary = dict(cached.get("summary") or {})
+    slot_row = _normalize_floor_fields(slot_row) if slot_row else {}
+    act_value = slot_row.get("act") or summary.get("act") or context.get("act") or 0
+    floor_value = slot_row.get("floor") or summary.get("final_floor") or context.get("floor") or 0
+    current_global_floor = _global_floor(act_value, floor_value) if _safe_int(act_value, 0) > 0 else 0
     summary.update(
         {
             "game_id": game_id,
@@ -576,8 +580,13 @@ def _build_live_session(run_dir: Path, game_id: str) -> dict[str, Any]:
             "victory": bool(raw_state.get("victory")),
             "terminated": bool(raw_state.get("game_over")),
             "truncated": False,
-            "max_floor": slot_row.get("floor") or summary.get("max_floor") or context.get("floor") or 0,
-            "act": slot_row.get("act") or summary.get("act") or context.get("act") or 0,
+            "max_floor": max(_safe_int(slot_row.get("max_floor"), 0), _safe_int(summary.get("max_floor"), 0), _safe_int(floor_value, 0)),
+            "max_floor_local": max(_safe_int(slot_row.get("max_floor_local"), 0), _safe_int(summary.get("max_floor_local"), 0), _safe_int(floor_value, 0)),
+            "global_floor": current_global_floor,
+            "max_global_floor": max(_row_global_floor(slot_row), _row_global_floor(summary), current_global_floor),
+            "act": act_value,
+            "final_floor": floor_value,
+            "final_global_floor": current_global_floor,
             "final_hp": slot_row.get("hp") if slot_row else state_snapshot.get("hp"),
             "max_hp": slot_row.get("max_hp") if slot_row else state_snapshot.get("max_hp"),
             "final_gold": slot_row.get("gold") if slot_row else state_snapshot.get("gold"),
@@ -659,23 +668,32 @@ def _build_service_only_session(game_id: str) -> dict[str, Any]:
             pass
     state_snapshot = _snapshot_state(raw_state)
     context = state_snapshot.get("context") or {}
+    cached_summary = _normalize_floor_fields(dict(cached.get("summary") or {}))
+    act_value = context.get("act") or cached_summary.get("act") or 0
+    floor_value = context.get("floor") or cached_summary.get("final_floor") or cached_summary.get("floor") or 0
+    current_global_floor = _global_floor(act_value, floor_value) if _safe_int(act_value, 0) > 0 else 0
     summary = {
         "game_id": game_id,
-        "seed": (cached.get("summary") or {}).get("seed"),
-        "character": (cached.get("summary") or {}).get("character") or "Ironclad",
-        "slot": (cached.get("summary") or {}).get("slot"),
-        "episode_index": (cached.get("summary") or {}).get("episode_index"),
-        "episode_reward": (cached.get("summary") or {}).get("episode_reward", 0.0),
-        "episode_steps": (cached.get("summary") or {}).get("episode_steps", 0),
+        "seed": cached_summary.get("seed"),
+        "character": cached_summary.get("character") or "Ironclad",
+        "slot": cached_summary.get("slot"),
+        "episode_index": cached_summary.get("episode_index"),
+        "episode_reward": cached_summary.get("episode_reward", 0.0),
+        "episode_steps": cached_summary.get("episode_steps", 0),
         "victory": bool(raw_state.get("victory")),
         "terminated": bool(raw_state.get("game_over")),
         "truncated": False,
-        "max_floor": context.get("floor") or 0,
-        "act": context.get("act") or 0,
+        "max_floor": max(_safe_int(cached_summary.get("max_floor"), 0), _safe_int(floor_value, 0)),
+        "max_floor_local": max(_safe_int(cached_summary.get("max_floor_local"), 0), _safe_int(floor_value, 0)),
+        "global_floor": current_global_floor,
+        "max_global_floor": max(_row_global_floor(cached_summary), current_global_floor),
+        "act": act_value,
+        "final_floor": floor_value,
+        "final_global_floor": current_global_floor,
         "final_hp": state_snapshot.get("hp"),
         "max_hp": state_snapshot.get("max_hp"),
         "final_gold": state_snapshot.get("gold"),
-        "started_at": (cached.get("summary") or {}).get("started_at"),
+        "started_at": cached_summary.get("started_at"),
         "finished_at": None if not raw_state.get("game_over") else _now_iso(),
         "boss_id": ((context.get("boss") or {}).get("id") if isinstance(context.get("boss"), dict) else None),
         "boss_name": ((context.get("boss") or {}).get("name") if isinstance(context.get("boss"), dict) else None),
@@ -777,6 +795,62 @@ def _safe_int(value: Any, default: int = 0) -> int:
             return default
 
 
+def _global_floor(act: Any, floor: Any) -> int:
+    act_value = max(1, _safe_int(act, 1))
+    floor_value = max(0, _safe_int(floor, 0))
+    if act_value <= 1:
+        return floor_value
+    if act_value == 2:
+        return 18 + floor_value
+    if act_value == 3:
+        return 35 + floor_value
+    return 51 + floor_value + max(0, act_value - 4) * 17
+
+
+def _global_floor_from_progress(progress: Any) -> int:
+    value = _safe_int(progress, 0)
+    if value <= 0:
+        return 0
+    if value < 100:
+        return value
+    act = value // 100 + 1
+    floor = value % 100
+    return _global_floor(act, floor)
+
+
+def _row_global_floor(row: dict[str, Any]) -> int:
+    for key in ("max_global_floor", "final_global_floor", "global_floor"):
+        value = _safe_int(row.get(key), 0)
+        if value > 0:
+            return value
+    progress_floor = _global_floor_from_progress(row.get("max_progress"))
+    if progress_floor > 0:
+        return progress_floor
+    max_global_act = _safe_int(row.get("max_global_act"), 0)
+    max_global_act_floor = _safe_int(row.get("max_global_act_floor"), 0)
+    if max_global_act > 0 and max_global_act_floor > 0:
+        return _global_floor(max_global_act, max_global_act_floor)
+    act = _safe_int(row.get("act"), 0)
+    floor = _safe_int(row.get("final_floor") or row.get("floor"), 0)
+    if act > 0 and floor > 0:
+        return _global_floor(act, floor)
+    return _safe_int(row.get("max_floor"), 0)
+
+
+def _normalize_floor_fields(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    act = _safe_int(item.get("act"), 0)
+    floor = _safe_int(item.get("floor") or item.get("final_floor"), 0)
+    if act > 0 and floor > 0:
+        item.setdefault("global_floor", _global_floor(act, floor))
+    if "max_floor_local" not in item and item.get("max_floor") is not None:
+        item["max_floor_local"] = item.get("max_floor")
+    max_global_floor = _row_global_floor(item)
+    if max_global_floor > 0:
+        item["max_global_floor"] = max_global_floor
+    return item
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None or value == "":
@@ -814,7 +888,7 @@ def _row_health_flags(row: dict[str, Any]) -> list[str]:
 
 
 def _annotate_health(row: dict[str, Any]) -> dict[str, Any]:
-    item = dict(row)
+    item = _normalize_floor_fields(row)
     flags = _row_health_flags(item)
     item["health_flags"] = flags
     item["flags_display"] = ", ".join(flags)
@@ -827,7 +901,7 @@ def _score(item: dict[str, Any]) -> tuple[Any, ...]:
     return (
         -suspicious,
         1 if item.get("victory") else 0,
-        _safe_int(item.get("max_progress") or item.get("max_floor"), 0),
+        _row_global_floor(item),
         _safe_int(item.get("max_act") or item.get("act"), 0),
         1 if item.get("act1_boss_clear") else 0,
         round(float(item.get("episode_reward", 0.0)), 3),
@@ -902,6 +976,7 @@ def _telemetry_sort_top(rows: list[dict[str, Any]], *, limit: int = 50) -> list[
         key = str(row.get("game_id") or f"{row.get('slot')}:{row.get('episode_index')}")
         if not key:
             continue
+        row = _normalize_floor_fields(row)
         existing = deduped.get(key)
         if existing is None or _score(row) > _score(existing):
             deduped[key] = dict(row)
@@ -911,7 +986,7 @@ def _telemetry_sort_top(rows: list[dict[str, Any]], *, limit: int = 50) -> list[
 def _telemetry_update_historical_best(summary: dict[str, Any], run: dict[str, Any]) -> None:
     if not summary.get("game_id"):
         return
-    entry = dict(summary)
+    entry = _normalize_floor_fields(summary)
     entry["run_id"] = run.get("run_id")
     entry["run_dir"] = run.get("run_dir")
     entry["experiment_name"] = run.get("experiment_name")
@@ -965,7 +1040,7 @@ def _telemetry_update_all_time(summary: dict[str, Any], run: dict[str, Any]) -> 
     all_time["run_count"] = len(TELEMETRY_STATE.get("runs") or {})
     all_time["runs_seen"] = total_seen
     all_time["runs_finished"] = total_finished
-    all_time["best_floor"] = max(_safe_int(all_time.get("best_floor"), 0), _safe_int(summary.get("max_floor"), 0))
+    all_time["best_floor"] = max(_safe_int(all_time.get("best_floor"), 0), _row_global_floor(_normalize_floor_fields(summary)))
     wins = _safe_int(all_time.get("wins"), 0)
     if bool(summary.get("victory")) and seen_key and seen_key not in finished_ids:
         wins += 1
@@ -998,8 +1073,8 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
         "top_sessions": top_sessions,
         "slot_histories": deepcopy(run.get("slot_histories") or {}),
         "checkpoints": [],
-        "seen_sessions": len(run.get("seen_game_ids") or set()),
-        "completed_sessions": len(run.get("finished_game_ids") or set()),
+        "seen_sessions": max(len(run.get("seen_game_ids") or set()), _safe_int(run.get("snapshot_seen_sessions"), 0)),
+        "completed_sessions": max(len(run.get("finished_game_ids") or set()), _safe_int(run.get("snapshot_completed_sessions"), 0)),
         "defaults": _load_training_defaults(),
         "monitoring": {
             "resume_model_path": training.get("resume_model_path"),
@@ -1095,22 +1170,37 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         for history_file in sorted(slots_dir.glob("slot_*.history.jsonl")):
             rows = _read_jsonl(history_file)
             slot_key = history_file.stem.replace(".history", "")
-            slot_history_map[slot_key] = rows[-50:]
+            slot_history_map[slot_key] = [_normalize_floor_fields(row) for row in rows[-50:]]
             histories.extend(rows)
 
     history_by_job: dict[str, dict[str, Any]] = {}
     for row in histories:
+        row = _normalize_floor_fields(row)
         key = row.get("game_id") or f"{row.get('slot')}-{row.get('episode_index')}"
-        existing = history_by_job.get(key, {})
-        max_floor = max(int(existing.get("max_floor", 0)), int(row.get("floor", 0)))
+        existing = _normalize_floor_fields(history_by_job.get(key, {}))
+        max_floor = max(
+            _safe_int(existing.get("max_floor"), 0),
+            _safe_int(row.get("max_floor"), 0),
+            _safe_int(row.get("floor"), 0),
+        )
+        max_floor_local = max(
+            _safe_int(existing.get("max_floor_local"), 0),
+            _safe_int(row.get("max_floor_local"), 0),
+            _safe_int(row.get("floor"), 0),
+        )
+        max_global_floor = max(_row_global_floor(existing), _row_global_floor(row))
         max_progress = max(_safe_int(existing.get("max_progress"), 0), _safe_int(row.get("max_progress") or row.get("floor"), 0))
         merged = dict(existing)
         merged.update(row)
         merged["max_floor"] = max_floor
+        merged["max_floor_local"] = max_floor_local
+        merged["max_global_floor"] = max_global_floor
         merged["max_progress"] = max_progress
         history_by_job[key] = merged
 
+    normalized_active_slots = []
     for slot in active_slots:
+        slot = _normalize_floor_fields(slot)
         key = slot.get("game_id") or f"{slot.get('slot')}-{slot.get('episode_index')}"
         live_row = live_games.get(str(slot.get("game_id") or ""))
         if isinstance(live_row, dict):
@@ -1118,17 +1208,33 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             slot["service_created_at"] = live_row.get("created_at")
             slot["service_start_time"] = live_row.get("start_time")
             slot["service_alive"] = live_row.get("alive")
-        existing = history_by_job.get(key, {})
-        max_floor = max(int(existing.get("max_floor", 0)), int(slot.get("floor", 0)))
+        existing = _normalize_floor_fields(history_by_job.get(key, {}))
+        max_floor = max(
+            _safe_int(existing.get("max_floor"), 0),
+            _safe_int(slot.get("max_floor"), 0),
+            _safe_int(slot.get("floor"), 0),
+        )
+        max_floor_local = max(
+            _safe_int(existing.get("max_floor_local"), 0),
+            _safe_int(slot.get("max_floor_local"), 0),
+            _safe_int(slot.get("floor"), 0),
+        )
         current_progress = _safe_int(slot.get("max_progress"), 0)
         if current_progress <= 0:
             current_progress = max(0, (_safe_int(slot.get("act"), 0) - 1) * 100 + _safe_int(slot.get("floor"), 0))
+        slot["max_progress"] = current_progress
+        slot = _normalize_floor_fields(slot)
+        max_global_floor = max(_row_global_floor(existing), _row_global_floor(slot))
         max_progress = max(_safe_int(existing.get("max_progress"), 0), current_progress)
         merged = dict(existing)
         merged.update(slot)
         merged["max_floor"] = max_floor
+        merged["max_floor_local"] = max_floor_local
+        merged["max_global_floor"] = max_global_floor
         merged["max_progress"] = max_progress
         history_by_job[key] = merged
+        normalized_active_slots.append(slot)
+    active_slots = normalized_active_slots
 
     computed_top_sessions = sorted(history_by_job.values(), key=_score, reverse=True)[:50]
     merged_leaderboard_rows = [row for row in persisted_leaderboard if isinstance(row, dict)] + computed_top_sessions
@@ -1168,7 +1274,7 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         (_annotate_health(item) for item in history_by_job.values() if not item.get("active", False)),
         key=lambda item: (
             _safe_int(item.get("episode_index"), 0),
-            _safe_int(item.get("max_floor"), 0),
+            _row_global_floor(item),
             _safe_float(item.get("elapsed_seconds")) or 0.0,
         ),
         reverse=True,
@@ -1183,6 +1289,11 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
     resources = _collect_resource_summary(training)
     trend = _build_trend_summary(training, top_sessions)
+    completed_session_count = max(
+        sum(1 for item in history_by_job.values() if not item.get("active", False)),
+        _safe_int(training.get("episodes_finished"), 0),
+    )
+    seen_session_count = max(len(history_by_job), completed_session_count)
 
     return {
         "updated_at": training.get("updated_at"),
@@ -1192,8 +1303,8 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         "top_sessions": top_sessions,
         "slot_histories": slot_history_map,
         "checkpoints": checkpoints,
-        "seen_sessions": len(history_by_job),
-        "completed_sessions": sum(1 for item in history_by_job.values() if not item.get("active", False)),
+        "seen_sessions": seen_session_count,
+        "completed_sessions": completed_session_count,
         "defaults": _load_training_defaults(),
         "monitoring": {
             "resume_model_path": training.get("resume_model_path"),
@@ -1272,7 +1383,7 @@ def _compute_all_time_summary() -> dict[str, Any]:
                         continue
                     finished_ids.add(game_id)
                     seen_ids.add(game_id)
-                    best_floor = max(best_floor, int(row.get("max_floor", row.get("floor", 0)) or 0))
+                    best_floor = max(best_floor, _row_global_floor(_normalize_floor_fields(row)))
                     if row.get("victory"):
                         victories += 1
                     try:
@@ -1290,7 +1401,7 @@ def _compute_all_time_summary() -> dict[str, Any]:
                 if not game_id:
                     continue
                 seen_ids.add(game_id)
-                best_floor = max(best_floor, int(row.get("max_floor", 0) or 0))
+                best_floor = max(best_floor, _row_global_floor(_normalize_floor_fields(row)))
 
         for current_file in slots_dir.glob("slot_*.json") if slots_dir.exists() else []:
             row = _read_json(current_file)
@@ -2026,8 +2137,8 @@ def _build_trend_summary(training: dict[str, Any], top_sessions: list[dict[str, 
     rows.sort(key=lambda item: str(item.get("finished_at") or item.get("recorded_at") or ""), reverse=True)
     recent = _trend_window(rows, 0, 12)
     previous = _trend_window(rows, 12, 12)
-    recent_floor = _trend_mean(recent, "max_floor")
-    previous_floor = _trend_mean(previous, "max_floor")
+    recent_floor = round(sum(_row_global_floor(_normalize_floor_fields(item)) for item in recent) / len(recent), 2) if recent else 0.0
+    previous_floor = round(sum(_row_global_floor(_normalize_floor_fields(item)) for item in previous) / len(previous), 2) if previous else 0.0
     recent_reward = _trend_mean(recent, "episode_reward")
     previous_reward = _trend_mean(previous, "episode_reward")
     floor_delta = round(recent_floor - previous_floor, 2)
@@ -2423,6 +2534,8 @@ def _seed_run_state_from_snapshot(snapshot: dict[str, Any]) -> None:
     if run is None:
         return
     run["training"] = training
+    run["snapshot_seen_sessions"] = _safe_int(snapshot.get("seen_sessions"), 0)
+    run["snapshot_completed_sessions"] = _safe_int(snapshot.get("completed_sessions"), 0)
     for row in snapshot.get("active_slots") or []:
         if not isinstance(row, dict):
             continue
@@ -2432,6 +2545,14 @@ def _seed_run_state_from_snapshot(snapshot: dict[str, Any]) -> None:
     for slot_key, rows in (snapshot.get("slot_histories") or {}).items():
         if isinstance(rows, list):
             run["slot_histories"][str(slot_key)] = list(rows)[-50:]
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                game_id = str(row.get("game_id") or "")
+                if game_id:
+                    run["seen_game_ids"].add(game_id)
+                    if not bool(row.get("active", False)):
+                        run["finished_game_ids"].add(game_id)
     top_sessions = [dict(row) for row in (snapshot.get("top_sessions") or []) if isinstance(row, dict)]
     run["top_sessions"] = _telemetry_sort_top(top_sessions)
     for row in top_sessions:
@@ -2491,6 +2612,7 @@ def _telemetry_ingest_training(payload: dict[str, Any]) -> None:
 
 def _telemetry_ingest_slot_current(payload: dict[str, Any]) -> None:
     _ensure_telemetry_bootstrapped()
+    payload = _normalize_floor_fields(payload)
     with TELEMETRY_LOCK:
         run = _telemetry_get_run(payload)
         if run is None:
@@ -2506,6 +2628,7 @@ def _telemetry_ingest_slot_current(payload: dict[str, Any]) -> None:
 
 def _telemetry_ingest_slot_history(payload: dict[str, Any]) -> None:
     _ensure_telemetry_bootstrapped()
+    payload = _normalize_floor_fields(payload)
     with TELEMETRY_LOCK:
         run = _telemetry_get_run(payload)
         if run is None:
@@ -2529,7 +2652,7 @@ def _telemetry_ingest_session(payload: dict[str, Any]) -> None:
         run = _telemetry_get_run(payload)
         if run is None:
             return
-        summary = dict(payload.get("summary") or {})
+        summary = _normalize_floor_fields(dict(payload.get("summary") or {}))
         details = _compact_session_details_for_memory(dict(payload.get("details") or {}))
         leaderboard = dict(payload.get("leaderboard") or {})
         game_id = str(summary.get("game_id") or "")
@@ -2597,6 +2720,23 @@ def _build_snapshot_payload() -> dict[str, Any]:
         watchdog_status = deepcopy(TELEMETRY_STATE.get("watchdog_status") or {})
         session_supervisor_status = deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {})
     if memory_run is None:
+        latest_run = _latest_run_dir()
+        if latest_run is not None:
+            snapshot = _collect_run_snapshot(latest_run)
+            _seed_run_state_from_snapshot(snapshot)
+            with TELEMETRY_LOCK:
+                memory_run = _telemetry_current_run(require_active=False)
+            if memory_run is not None:
+                snapshot = _telemetry_snapshot_from_memory(memory_run)
+                training_status = str((snapshot.get("training") or {}).get("status") or "").lower()
+                if training_status not in {"running", "paused", "stopping"}:
+                    snapshot["training"] = dict(snapshot.get("training") or {})
+                    snapshot["training"]["status"] = "idle"
+                    snapshot["active_slots"] = []
+                snapshot["all_time_summary"] = all_time_summary
+                snapshot["historical_best"] = historical_best
+                snapshot["launcher_logs"] = launcher_logs
+                return snapshot
         problem_list = _build_problem_list(recent_incidents, [], active_game_ids=set(), runtime_healthy=False)
         defaults = _load_training_defaults()
         return {

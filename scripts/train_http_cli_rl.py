@@ -85,7 +85,7 @@ def _run_quality_is_bad(run_dir: Path) -> bool:
         if bool(row.get("active", False)):
             continue
         finished += 1
-        floor = float(row.get("max_floor", row.get("floor", 0)) or 0.0)
+        floor = float(row.get("max_global_floor", row.get("max_floor", row.get("floor", 0))) or 0.0)
         floor_sum += floor
         if floor >= 17:
             ge17 += 1

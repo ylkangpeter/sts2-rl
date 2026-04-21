@@ -149,6 +149,16 @@
     };
     function fmt(v) { return v === null || v === undefined || v === '' ? '-' : v; }
     function pct(v) { return (v ?? 0).toFixed(2) + '%'; }
+    function floorDisplay(row, maxField = false) {
+      const global = maxField ? row.max_global_floor : row.global_floor;
+      const fallback = maxField ? row.max_floor : row.floor;
+      const value = global ?? fallback;
+      const act = maxField ? (row.max_global_act ?? row.max_act ?? row.act) : row.act;
+      const local = maxField ? (row.max_global_act_floor ?? row.max_floor_local ?? row.max_floor) : row.floor;
+      const base = fmt(value);
+      if (act && local) return `${base} (A${act}F${local})`;
+      return base;
+    }
     function formatDateTime(value) {
       if (!value) return '-';
       const date = new Date(value);
@@ -189,6 +199,8 @@
           ? '-'
           : `${row.final_hp} / ${fmt(row.max_hp)}`,
         final_gold_display: fmt(row.final_gold),
+        floor_display: floorDisplay(row, false),
+        max_floor_display: floorDisplay(row, true),
       }));
     }
     function escapeHtml(v) {
@@ -422,7 +434,7 @@
       if (suspiciousCompleted.length) {
         pushAlert(
           'Suspicious completed runs',
-          suspiciousCompleted.map((item) => `seed=${fmt(item.seed)} flags=${fmt(item.flags_display)} floor=${fmt(item.max_floor)} hp=${fmt(item.final_hp ?? item.hp)} truncated=${fmt(item.truncated)} victory=${fmt(item.victory)}`).join('\\n'),
+          suspiciousCompleted.map((item) => `seed=${fmt(item.seed)} flags=${fmt(item.flags_display)} floor=${floorDisplay(item, true)} hp=${fmt(item.final_hp ?? item.hp)} truncated=${fmt(item.truncated)} victory=${fmt(item.victory)}`).join('\\n'),
           'danger',
           '',
           'state',
@@ -553,7 +565,7 @@
       return `<div class="slot-grid">${keys.map(key => {
         const rows = slotHistories[key] || [];
         const rewards = rows.map(r => Number(r.episode_reward || 0));
-        const floors = rows.map(r => Number(r.floor || 0));
+        const floors = rows.map(r => Number(r.global_floor || r.max_global_floor || r.floor || 0));
         const steps = rows.map(r => Number(r.episode_steps || 0));
         return `<div class="card" style="margin-bottom:12px">
           <div class="label">${key}</div>
@@ -649,7 +661,7 @@
         ['Boss', s.boss_name],
         ['Seed', s.seed],
         ['Act', s.act],
-        ['Max Floor', s.max_floor],
+        ['Max Floor', floorDisplay(s, true)],
         ['Final HP', `${fmt(s.final_hp)} / ${fmt(s.max_hp)}`],
         ['Final Gold', s.final_gold],
         ['Reward', s.episode_reward],
@@ -1069,7 +1081,7 @@
       renderTable(document.getElementById('activeTable'), [
         {key:'slot',label:'Slot'},
         {key:'episode_index',label:'Episode'},
-        {key:'floor',label:'Floor'},
+        {key:'floor_display',label:'Floor'},
         {key:'act',label:'Act'},
         {key:'boss_name',label:'Boss'},
         {key:'room_type',label:'Room'},
@@ -1107,7 +1119,7 @@
         {key:'slot',label:'Slot'},
         {key:'episode_index',label:'Episode'},
         {key:'boss_name',label:'Boss'},
-        {key:'max_floor',label:'Max Floor'},
+        {key:'max_floor_display',label:'Max Floor'},
         {key:'started_at_display',label:'Created At'},
         {key:'duration_display',label:'Duration'},
         {key:'final_hp_display',label:'Final HP'},
@@ -1138,7 +1150,7 @@
         {key:'experiment_name',label:'Experiment'},
         {key:'run_id',label:'Run'},
         {key:'boss_name',label:'Boss'},
-        {key:'max_floor',label:'Max Floor'},
+        {key:'max_floor_display',label:'Max Floor'},
         {key:'started_at_display',label:'Created At'},
         {key:'duration_display',label:'Duration'},
         {key:'final_hp_display',label:'Final HP'},

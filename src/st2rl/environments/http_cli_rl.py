@@ -171,6 +171,7 @@ class HttpCliRlEnv(gym.Env):
         context = (state.raw.get("context") if state is not None else {}) or {}
         act = int(context.get("act") or state.raw.get("act") or 0) if state is not None else 0
         floor = int(context.get("floor") or state.raw.get("floor") or 0) if state is not None else 0
+        global_floor = self._global_floor(act=act, floor=floor)
         boss_info = self._extract_boss_info(state)
         return {
             "slot": f"{self.config.seed_offset:02d}",
@@ -183,6 +184,8 @@ class HttpCliRlEnv(gym.Env):
             "decision": summary.get("decision"),
             "floor": floor,
             "act": act,
+            "global_floor": global_floor,
+            "max_global_floor": global_floor,
             "max_progress": self._progress_score(act=act, floor=floor),
             "act1_boss_attempt": self._is_act1_boss_state(state),
             "room_type": context.get("room_type"),
@@ -225,6 +228,17 @@ class HttpCliRlEnv(gym.Env):
         if act <= 0:
             return max(floor, 0)
         return (act - 1) * 100 + max(floor, 0)
+
+    def _global_floor(self, *, act: int, floor: int) -> int:
+        act_value = max(1, self._safe_number(act, 1))
+        floor_value = max(0, self._safe_number(floor, 0))
+        if act_value <= 1:
+            return floor_value
+        if act_value == 2:
+            return 18 + floor_value
+        if act_value == 3:
+            return 35 + floor_value
+        return 51 + floor_value + max(0, act_value - 4) * 17
 
     def _is_act1_boss_state(self, state: Optional[GameStateView]) -> bool:
         context = self._state_context(state)
@@ -770,6 +784,12 @@ class HttpCliRlEnv(gym.Env):
         node_progress.append((final_act, final_floor, str(final_context.get("room_type") or "")))
         max_floor = max((floor for _, floor, _ in node_progress), default=final_floor)
         max_act = max((act for act, _, _ in node_progress), default=final_act)
+        final_global_floor = self._global_floor(act=final_act, floor=final_floor)
+        max_global_act, max_global_act_floor, max_global_floor = max(
+            ((act, floor, self._global_floor(act=act, floor=floor)) for act, floor, _ in node_progress),
+            key=lambda item: item[2],
+            default=(final_act, final_floor, final_global_floor),
+        )
         max_progress = max(
             (self._progress_score(act=act, floor=floor) for act, floor, _ in node_progress),
             default=self._progress_score(act=final_act, floor=final_floor),
@@ -794,10 +814,15 @@ class HttpCliRlEnv(gym.Env):
             "max_floor": max_floor,
             "max_floor_local": max_floor,
             "max_act": max_act,
+            "max_global_floor": max_global_floor,
+            "max_global_act": max_global_act,
+            "max_global_act_floor": max_global_act_floor,
             "max_progress": max_progress,
             "act1_boss_attempt": act1_boss_attempt,
             "act1_boss_clear": act1_boss_clear,
             "act": final_act,
+            "final_floor": final_floor,
+            "final_global_floor": final_global_floor,
             "final_hp": self._safe_number(final.get("hp"), 0),
             "max_hp": self._safe_number(final.get("max_hp"), 0),
             "final_gold": self._safe_number(final.get("gold"), 0),
@@ -835,7 +860,12 @@ class HttpCliRlEnv(gym.Env):
             "max_floor",
             "max_floor_local",
             "max_act",
+            "max_global_floor",
+            "max_global_act",
+            "max_global_act_floor",
             "max_progress",
+            "final_floor",
+            "final_global_floor",
             "act1_boss_attempt",
             "act1_boss_clear",
         ):
