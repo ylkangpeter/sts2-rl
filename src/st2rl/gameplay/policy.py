@@ -75,11 +75,12 @@ class SimpleFlowPolicy:
 
         incoming_damage = self._enemy_intended_damage(state)
         block_gap = max(0, incoming_damage - state.block)
-        _, floor, _, _ = self._combat_context(state)
-        is_boss_floor = floor >= 16
+        act, floor, room_type, is_boss_room = self._combat_context(state)
+        is_boss_floor = floor >= 16 or is_boss_room
+        is_act2_boss = act >= 2 and is_boss_floor
         is_ceremonial_beast = self._is_ceremonial_beast_boss(state)
         is_kin = self._is_kin_boss(state)
-        is_targeted_boss = is_boss_floor or is_ceremonial_beast or is_kin
+        is_targeted_boss = is_boss_floor or is_act2_boss or is_ceremonial_beast or is_kin
         if is_targeted_boss and len(playable) > 1:
             safer_playable = [card for card in playable if not self._should_avoid_hp_loss_energy_card(state, card, block_gap)]
             if safer_playable:
@@ -146,6 +147,22 @@ class SimpleFlowPolicy:
                     if card_needs_enemy_target(block_card):
                         args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
                     return FlowAction("play_card", args)
+
+        if is_act2_boss and block_gap >= max(8, int(state.hp * 0.33)):
+            block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                block_scores = [
+                    (
+                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * 3.3,
+                        card,
+                    )
+                    for card in block_playable
+                ]
+                _block_score, block_card = max(block_scores, key=lambda item: item[0])
+                args = {"card_index": block_card["index"]}
+                if card_needs_enemy_target(block_card):
+                    args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
+                return FlowAction("play_card", args)
 
         card_scores = [(self._combat_card_score(state, item), item) for item in playable]
         best_score, card = max(card_scores, key=lambda item: item[0])
@@ -608,6 +625,9 @@ class SimpleFlowPolicy:
         return max(digits) if digits else -1
 
     def _potion_damage_amount(self, potion: dict[str, Any]) -> int:
+        potion_id = str(potion.get("id") or "").strip().upper()
+        if potion_id in {"POWDERED_DEMISE", "ASHWATER", "EXPLOSIVE_AMPOULE"}:
+            return 12
         vars_payload = potion.get("vars") or {}
         if isinstance(vars_payload, dict):
             values = []
@@ -740,22 +760,32 @@ class SimpleFlowPolicy:
             "TOUCH_OF_INSANITY",
         }
 
+    def _boss_setup_potion_role(self, potion: dict[str, Any]) -> str:
+        potion_id = str(potion.get("id") or "").strip().upper()
+        if potion_id in {"SWIFT_POTION", "SKILL_POTION", "COLORLESS_POTION", "DROPLET_OF_PRECOGNITION"}:
+            return "draw"
+        if potion_id in {"BLESSING_OF_THE_FORGE", "MAZALETHS_GIFT", "TOUCH_OF_INSANITY"}:
+            return "setup"
+        return "unknown"
+
     def _pick_combat_potion_action(self, state: GameStateView) -> FlowAction | None:
         incoming_damage = self._enemy_intended_damage(state)
         block_gap = max(0, incoming_damage - state.block)
         missing_hp = max(state.max_hp - state.hp, 0)
         hp_ratio = state.hp / max(1, state.max_hp)
-        _, floor, room_type, _ = self._combat_context(state)
-        is_boss_floor = floor >= 16
+        act, floor, room_type, is_boss_room = self._combat_context(state)
+        is_boss_floor = floor >= 16 or is_boss_room
+        is_act2_boss = act >= 2 and is_boss_floor
         is_elite_room = "elite" in room_type
         high_value_combat = is_boss_floor or is_elite_room
         late_act_pressure = floor >= 13
         early_boss_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
         early_high_value_turn = high_value_combat and (state.round in (None, 1, 2, 3))
+        early_setup_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
 
         best_choice: tuple[float, dict[str, Any]] | None = None
         best_self_choice: tuple[float, dict[str, Any]] | None = None
-        best_setup_choice: tuple[float, dict[str, Any]] | None = None
+        best_setup_choice: tuple[float, dict[str, Any], str] | None = None
         for potion in state.player.get("potions") or []:
             if not isinstance(potion, dict) or potion.get("index") is None:
                 continue
@@ -772,6 +802,8 @@ class SimpleFlowPolicy:
                     score = min(block_amount, block_gap) * 1.4
                     if incoming_damage >= state.hp:
                         score += 30.0
+                    elif is_act2_boss and block_gap >= 8:
+                        score += 14.0
                     elif is_boss_floor and block_gap >= 8:
                         score += 10.0
                     elif not high_value_combat:
@@ -812,16 +844,31 @@ class SimpleFlowPolicy:
                     if best_self_choice is None or score > best_self_choice[0]:
                         best_self_choice = (score, potion)
 
-            if self._is_known_boss_setup_potion(potion) and early_high_value_turn:
-                score = 16.0 + (8.0 if is_boss_floor else 0.0)
-                if incoming_damage <= 0:
+            if self._is_known_boss_setup_potion(potion) and early_setup_turn:
+                role = self._boss_setup_potion_role(potion)
+                score = 14.0 + (8.0 if is_boss_floor else 0.0)
+                if role == "draw":
+                    score += 6.0
+                    if is_act2_boss:
+                        score += 5.0
+                    if block_gap >= 10:
+                        score += min(block_gap, 20) * 1.15
+                        if self._hand_block_card_count(state) <= 1:
+                            score += 10.0
+                    elif is_act2_boss and block_gap >= 8:
+                        score += min(block_gap, 16) * 1.2
+                        if self._hand_block_card_count(state) <= 1:
+                            score += 8.0
+                    elif incoming_damage <= 0:
+                        score += 4.0
+                elif incoming_damage <= 0:
                     score += 6.0
                 elif block_gap <= 8 and hp_ratio >= 0.5:
                     score += 2.0
                 else:
                     score -= 6.0
                 if best_setup_choice is None or score > best_setup_choice[0]:
-                    best_setup_choice = (score, potion)
+                    best_setup_choice = (score, potion, role)
 
             if missing_hp <= 0:
                 continue
@@ -925,6 +972,7 @@ class SimpleFlowPolicy:
         if best_debuff_choice is not None and (
             incoming_damage >= state.hp
             or (high_value_combat and block_gap >= 8)
+            or (is_act2_boss and block_gap >= 5 and hp_ratio < 0.85)
             or (is_boss_floor and block_gap >= 6 and hp_ratio < 0.8)
         ):
             args = {"potion_index": best_debuff_choice[1].get("index", 0)}
@@ -933,8 +981,22 @@ class SimpleFlowPolicy:
             return FlowAction("use_potion", args)
 
         if best_setup_choice is not None and (
-            early_high_value_turn
-            and (incoming_damage <= 0 or (block_gap <= 8 and hp_ratio >= 0.5))
+            (
+                early_setup_turn
+                and (incoming_damage <= 0 or (block_gap <= 8 and hp_ratio >= 0.5))
+            )
+            or (
+                best_setup_choice[2] == "draw"
+                and is_boss_floor
+                and block_gap >= 10
+                and hp_ratio < 0.8
+            )
+            or (
+                best_setup_choice[2] == "draw"
+                and is_act2_boss
+                and block_gap >= 8
+                and hp_ratio < 0.85
+            )
         ):
             return FlowAction("use_potion", {"potion_index": best_setup_choice[1].get("index", 0)})
 
@@ -1028,21 +1090,24 @@ class SimpleFlowPolicy:
         attack_pressure = self._enemy_attack_pressure(state)
         incoming_damage = self._enemy_intended_damage(state)
         hp_ratio = state.hp / max(1, state.max_hp)
-        _, floor, _, _ = self._combat_context(state)
-        is_boss_floor = floor >= 16
+        act, floor, room_type, is_boss_room = self._combat_context(state)
+        is_boss_floor = floor >= 16 or is_boss_room
+        is_act2_boss = act >= 2 and is_boss_floor
         is_vantom = self._is_vantom_boss(state)
         is_insatiable = self._is_insatiable_boss(state)
         is_ceremonial_beast = self._is_ceremonial_beast_boss(state)
         is_kin = self._is_kin_boss(state)
-        is_targeted_boss = is_boss_floor or is_ceremonial_beast or is_kin
+        is_targeted_boss = is_boss_floor or is_act2_boss or is_ceremonial_beast or is_kin
         round_no = self._safe_int(state.round, 0)
         sandpit_turns = self._sandpit_turns(state) if is_insatiable else 0
         lowest_enemy_ehp = min(self._enemy_effective_hp(enemy) for enemy in enemies)
         block_gap = max(0, incoming_damage - state.block)
         lethal_pressure = block_gap >= state.hp
         can_tank = state.hp > incoming_damage * 2
-        boss_high_pressure = is_boss_floor and block_gap >= 10
-        boss_imminent_death = is_boss_floor and block_gap >= max(1, state.hp - 2)
+        boss_high_pressure = (is_boss_floor and block_gap >= 10) or (is_act2_boss and block_gap >= 8)
+        boss_imminent_death = (is_boss_floor and block_gap >= max(1, state.hp - 2)) or (
+            is_act2_boss and block_gap >= max(1, state.hp - 3)
+        )
         can_lethal_now = damage > 0 and damage >= lowest_enemy_ehp
 
         score = 0.0
@@ -1092,6 +1157,8 @@ class SimpleFlowPolicy:
                 score += min(block, 12) * (1.35 if hp_ratio < 0.55 else 1.0)
             else:
                 score += block * 0.25
+            if is_act2_boss and block_gap > 0:
+                score += min(block, block_gap) * 1.15 + 4.0
             if is_ceremonial_beast and 1 <= round_no <= 4 and incoming_damage <= 18 and damage <= 0:
                 score -= min(block, 12) * 1.2
             current_projected_hp = state.hp + state.block - incoming_damage
@@ -1125,6 +1192,8 @@ class SimpleFlowPolicy:
                     score += 8.0 + min(followup_count, 5) * 1.2
             if is_boss_floor:
                 score += min(draw_amount, 4) * 1.8
+            if is_act2_boss and block_gap > 0:
+                score += min(draw_amount, 3) * 3.0
         if "strength" in description or "力量" in description:
             score += 3.5
             if is_boss_floor and state.round in (None, 1, 2, 3):
@@ -1145,6 +1214,14 @@ class SimpleFlowPolicy:
                 score -= 7.0
         if "weak" in description or "虚弱" in description:
             score += 2.5
+            if block_gap > 0:
+                score += 10.0 + min(block_gap, 24) * 0.85
+                if is_targeted_boss:
+                    score += 6.0
+                if is_act2_boss:
+                    score += 6.0
+                if is_ceremonial_beast and hp_ratio < 0.55:
+                    score += 8.0
         if hp_loss > 0:
             absolute_hp_floor = hp_loss + (8 if is_boss_floor else 6)
             if state.hp <= absolute_hp_floor and not lethal_pressure:
@@ -1298,10 +1375,19 @@ class SimpleFlowPolicy:
                 score += min(block, block_gap) * 2.8 + 8.0
             if block <= 0 and not can_lethal_now:
                 score -= 16.0 + min(block_gap, 20) * 0.9
+                if is_ceremonial_beast and hp_ratio < 0.45:
+                    score -= 22.0
             if damage <= 0 and block <= 0 and hp_loss <= 0 and card_type != "power":
                 score -= 18.0
             if cost >= 2 and damage > 0 and block <= 0 and not can_lethal_now:
-                score -= 14.0
+                if "weak" in description or "虚弱" in description:
+                    score -= 2.0
+                else:
+                    score -= 14.0
+                if is_act2_boss:
+                    score -= 10.0
+                if is_ceremonial_beast and hp_ratio < 0.45:
+                    score -= 10.0
             if card_id in {"CARD.BLUDGEON", "CARD.HEAVY_BLADE", "CARD.PERFECTED_STRIKE"} and block <= 0 and not can_lethal_now:
                 score -= 16.0
 
