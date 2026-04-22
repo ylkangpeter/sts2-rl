@@ -208,6 +208,93 @@ def _best_healing_potion_action(state: GameStateView) -> Optional[FlowAction]:
     return FlowAction("use_potion", {"potion_index": potion.get("index", 0)})
 
 
+def _card_stat(card: Dict[str, Any], *names: str) -> int:
+    stats = card.get("stats") or {}
+    if not isinstance(stats, dict):
+        return 0
+    lowered = {str(key).lower(): value for key, value in stats.items()}
+    best = 0
+    for name in names:
+        best = max(best, _safe_int(lowered.get(name.lower()), 0) or 0)
+    return best
+
+
+def _card_draw(card: Dict[str, Any]) -> int:
+    description = str(card.get("description") or "").lower()
+    if "draw" in description or "抽" in description:
+        return _card_stat(card, "cards", "draw")
+    return _card_stat(card, "draw")
+
+
+def _card_energy_gain(card: Dict[str, Any]) -> int:
+    return _card_stat(card, "energy")
+
+
+def _card_damage(card: Dict[str, Any]) -> int:
+    return _card_stat(card, "damage")
+
+
+def _card_block(card: Dict[str, Any]) -> int:
+    return _card_stat(card, "block")
+
+
+def _enemy_effective_hp(enemy: Dict[str, Any]) -> int:
+    return max(0, (_safe_int(enemy.get("hp"), 0) or 0) + (_safe_int(enemy.get("block"), 0) or 0))
+
+
+def _best_enemy_target(enemies: list[Dict[str, Any]], damage_hint: int = 0) -> Dict[str, Any] | None:
+    if not enemies:
+        return None
+
+    def target_key(enemy: Dict[str, Any]) -> tuple[int, int, int, int]:
+        ehp = _enemy_effective_hp(enemy)
+        threat = _safe_int(enemy.get("intent_damage"), 0) or 0
+        lethal = 1 if damage_hint > 0 and damage_hint >= ehp else 0
+        return (
+            -lethal,
+            -threat,
+            ehp,
+            _safe_int(enemy.get("index"), 9999) or 9999,
+        )
+
+    return min(enemies, key=target_key)
+
+
+def _best_playable_card(playable: list[Dict[str, Any]], state: GameStateView) -> Dict[str, Any] | None:
+    if not playable:
+        return None
+    incoming_damage = sum((_safe_int(enemy.get("intent_damage"), 0) or 0) for enemy in state.living_enemies())
+
+    def card_key(card: Dict[str, Any]) -> tuple[float, int]:
+        damage = _card_damage(card)
+        block = _card_block(card)
+        draw = _card_draw(card)
+        energy = _card_energy_gain(card)
+        cost = _safe_int(card.get("cost"), 0) or 0
+        block_gap = max(0, incoming_damage - state.block)
+        prevented = min(block, block_gap)
+        score = damage * 2.0 + prevented * 1.6 + draw * 8.0 + energy * 9.0
+        if cost <= 0:
+            score += 3.0
+        else:
+            score -= cost * 0.5
+        return (-score, _safe_int(card.get("index"), 9999) or 9999)
+
+    return min(playable, key=card_key)
+
+
+def _first_valid_bundle(bundles: list[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not bundles:
+        return None
+    return min(
+        bundles,
+        key=lambda bundle: (
+            _safe_int(bundle.get("cost"), 0) or 0,
+            _safe_int(bundle.get("index"), 9999) or 9999,
+        ),
+    )
+
+
 @dataclass(slots=True)
 class HttpCliProtocolConfig:
     """Transport and session settings for the HTTP CLI protocol."""
@@ -525,10 +612,11 @@ class HttpCliProtocol(FlowProtocol):
 
             def _fallback_combat_action() -> FlowAction:
                 if playable:
-                    card = rng.choice(playable)
+                    card = _best_playable_card(playable, state) or playable[0]
                     fallback_args = {"card_index": card.get("index")}
                     if card_needs_enemy_target(card) and enemies:
-                        fallback_args["target_index"] = rng.choice(enemies).get("index")
+                        target = _best_enemy_target(enemies, _card_damage(card)) or enemies[0]
+                        fallback_args["target_index"] = target.get("index")
                     return FlowAction("play_card", fallback_args)
                 if healing_potion_action is not None:
                     return healing_potion_action
@@ -541,13 +629,14 @@ class HttpCliProtocol(FlowProtocol):
                 if card_index not in playable_by_index:
                     if not playable:
                         return FlowAction("end_turn")
-                    card = rng.choice(playable)
+                    card = _best_playable_card(playable, state) or playable[0]
                     safe.args = {"card_index": card.get("index")}
                 card = playable_by_index.get(safe.args.get("card_index"))
                 if card and card_needs_enemy_target(card):
                     valid_targets = {enemy.get("index") for enemy in enemies}
                     if safe.args.get("target_index") not in valid_targets and enemies:
-                        safe.args["target_index"] = rng.choice(enemies).get("index")
+                        target = _best_enemy_target(enemies, _card_damage(card)) or enemies[0]
+                        safe.args["target_index"] = target.get("index")
                 else:
                     safe.args.pop("target_index", None)
                 return safe
@@ -567,7 +656,8 @@ class HttpCliProtocol(FlowProtocol):
                 if potion_mode == "safe_enemy":
                     valid_targets = {enemy.get("index") for enemy in enemies}
                     if safe.args.get("target_index") not in valid_targets and enemies:
-                        safe.args["target_index"] = rng.choice(enemies).get("index")
+                        target = _best_enemy_target(enemies) or enemies[0]
+                        safe.args["target_index"] = target.get("index")
                 else:
                     safe.args.pop("target_index", None)
                 return safe
@@ -725,7 +815,8 @@ class HttpCliProtocol(FlowProtocol):
             if safe.name == "select_bundle" and safe.args.get("bundle_index") in valid:
                 return safe
             if state.bundles:
-                return FlowAction("select_bundle", {"bundle_index": rng.choice(state.bundles).get("index", 0)})
+                bundle = _first_valid_bundle(state.bundles) or state.bundles[0]
+                return FlowAction("select_bundle", {"bundle_index": bundle.get("index", 0)})
             return FlowAction("proceed")
 
         if state.decision == "card_select":

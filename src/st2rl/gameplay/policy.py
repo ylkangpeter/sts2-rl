@@ -976,13 +976,6 @@ class SimpleFlowPolicy:
         ):
             return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
 
-        buy_probability = self.config.shop_buy_probability
-        if state.gold >= self.config.shop_high_gold_threshold:
-            buy_probability = max(buy_probability, 0.8)
-        if rng.random() < buy_probability:
-            best_card = best_shop_card(state.cards, state.gold, list(state.player.get("deck") or []))
-            if best_card is not None:
-                return FlowAction("buy_card", {"card_index": best_card.get("index", 0)})
         return FlowAction("leave_shop")
 
     def _pick_event_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
@@ -1038,16 +1031,12 @@ class SimpleFlowPolicy:
         elif smith:
             return FlowAction("choose_option", {"option_index": smith.get("index", 0)})
 
-        pick = rng.choice(enabled)
-        return FlowAction("choose_option", {"option_index": pick.get("index", 0)})
+        return FlowAction("choose_option", {"option_index": enabled[0].get("index", 0)})
 
     def _pick_card_select_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         indices = [str(card.get("index", i)) for i, card in enumerate(state.cards)]
         if not indices:
             return FlowAction("skip_select")
-        if state.min_select == 0 and rng.random() < self.config.card_select_skip_probability:
-            return FlowAction("skip_select")
-
         pick_count = max(1, min(max(1, state.min_select), state.max_select, len(indices)))
         room_type = self._text((state.raw.get("context") or {}).get("room_type"))
         is_combat_select = any(token in room_type for token in ("monster", "elite", "boss", "combat"))
@@ -1066,14 +1055,18 @@ class SimpleFlowPolicy:
         if len(upgrade_targets) >= pick_count:
             return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in upgrade_targets)})
 
-        upper_bound = max(1, min(state.max_select, len(indices)))
-        lower_bound = max(1, state.min_select)
-        random_count = rng.randint(lower_bound, upper_bound)
-        picks = rng.sample(indices, k=random_count)
-        return FlowAction("select_cards", {"indices": ",".join(picks)})
+        if state.min_select == 0:
+            return FlowAction("skip_select")
+        return FlowAction("select_cards", {"indices": ",".join(indices[:pick_count])})
 
     def _pick_bundle_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         if not state.bundles:
             return FlowAction("proceed")
-        pick = rng.choice(state.bundles)
+        pick = min(
+            state.bundles,
+            key=lambda bundle: (
+                self._safe_int(bundle.get("cost"), 0),
+                self._safe_int(bundle.get("index"), 9999),
+            ),
+        )
         return FlowAction("select_bundle", {"bundle_index": pick.get("index", 0)})

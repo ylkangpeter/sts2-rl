@@ -334,8 +334,7 @@ class STS2Env(gym.Env):
             if reward and isinstance(reward, dict):
                 items = reward.get('items', [])
                 if items:
-                    # Choose a random reward card
-                    option_index = random.randint(0, len(items) - 1)
+                    option_index = 0
                     self.logger.info(f"Choosing reward card at index {option_index}...")
                     self.client.choose_reward_card(option_index)
                 else:
@@ -354,7 +353,7 @@ class STS2Env(gym.Env):
             if event and isinstance(event, dict):
                 options = event.get('options', [])
                 if options:
-                    option_index = random.randint(0, len(options) - 1)
+                    option_index = 0
                     self.logger.info(f"Choosing event option at index {option_index}...")
                     self.client.choose_event_option(option_index)
                 else:
@@ -377,7 +376,7 @@ class STS2Env(gym.Env):
             if rest and isinstance(rest, dict):
                 options = rest.get('options', [])
                 if options:
-                    option_index = random.randint(0, len(options) - 1)
+                    option_index = 0
                     self.logger.info(f"Choosing rest option at index {option_index}...")
                     self.client.choose_rest_option(option_index)
                 else:
@@ -400,7 +399,7 @@ class STS2Env(gym.Env):
             if chest and isinstance(chest, dict):
                 relics = chest.get('relics', [])
                 if relics:
-                    option_index = random.randint(0, len(relics) - 1)
+                    option_index = 0
                     self.logger.info(f"Choosing treasure relic at index {option_index}...")
                     self.client.choose_treasure_relic(option_index)
                 else:
@@ -418,8 +417,7 @@ class STS2Env(gym.Env):
             if selection and isinstance(selection, dict):
                 cards = selection.get('cards', [])
                 if cards:
-                    # Choose a random card
-                    option_index = random.randint(0, len(cards) - 1)
+                    option_index = 0
                     self.logger.info(f"Choosing card at index {option_index}...")
                     self.client.select_deck_card(option_index)
                 else:
