@@ -10,8 +10,11 @@ from st2rl.gameplay.types import GameStateView
 from st2rl.gameplay.knowledge_base import load_site_knowledge
 
 _NEGATIVE_TYPES = {"curse", "status"}
+_BASIC_STRIKE_IDS = {"CARD.STRIKE", "CARD.STRIKE_IRONCLAD"}
+_BASIC_DEFEND_IDS = {"CARD.DEFEND", "CARD.DEFEND_IRONCLAD"}
+_BASIC_STRIKE_NAMES = {"strike", "\u6253\u51fb"}
+_BASIC_DEFEND_NAMES = {"defend", "\u9632\u5fa1"}
 _BASIC_STRIKE_TOKENS = ("strike",)
-_BASIC_DEFEND_TOKENS = ("defend",)
 _EXHAUST_TOKENS = ("exhaust", "consume", "\u6d88\u8017")
 _UTILITY_TOKENS = (
     "draw",
@@ -298,6 +301,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
             return default
 
 
+def _state_act_floor(state: GameStateView | None) -> tuple[int, int]:
+    if state is None:
+        return 1, 0
+    context = state.raw.get("context") or {}
+    act = _safe_int(context.get("act") or state.raw.get("act"), 1) or 1
+    floor = _safe_int(context.get("floor") or state.raw.get("floor"), 0)
+    return act, floor
+
+
 def _stats_total(card: dict[str, Any]) -> int:
     stats = card.get("stats") or {}
     if not isinstance(stats, dict):
@@ -346,13 +358,18 @@ def _keywords(card: dict[str, Any]) -> tuple[str, ...]:
 
 
 def is_basic_strike(card: dict[str, Any]) -> bool:
-    text = f"{_text(card.get('name'))} {_text(card.get('id'))}"
-    return any(token in text for token in _BASIC_STRIKE_TOKENS)
+    card_id = _card_id(card)
+    if card_id == "CARD.POMMEL_STRIKE":
+        return False
+    name = _text(card.get("name"))
+    text = f"{name} {_text(card.get('id'))}"
+    return card_id in _BASIC_STRIKE_IDS or name in _BASIC_STRIKE_NAMES or any(token in text for token in _BASIC_STRIKE_TOKENS)
 
 
 def is_basic_defend(card: dict[str, Any]) -> bool:
-    text = f"{_text(card.get('name'))} {_text(card.get('id'))}"
-    return any(token in text for token in _BASIC_DEFEND_TOKENS)
+    card_id = _card_id(card)
+    name = _text(card.get("name"))
+    return card_id in _BASIC_DEFEND_IDS or name in _BASIC_DEFEND_NAMES
 
 
 def is_negative_card(card: dict[str, Any]) -> bool:
@@ -566,7 +583,13 @@ def _lookup_card_knowledge(card: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] | None = None) -> float:
+def estimate_card_reward_score(
+    card: dict[str, Any],
+    deck: list[dict[str, Any]] | None = None,
+    *,
+    act: int = 1,
+    floor: int = 0,
+) -> float:
     deck = [item for item in (deck or []) if isinstance(item, dict)]
     if _card_id(card) in _UNSUPPORTED_HEADLESS_CARD_IDS:
         return -100.0
@@ -632,6 +655,8 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
             score += 0.35
         if counts["burning_pact"] > 0:
             score += 1.0
+        if act == 1 and floor <= 10 and counts["draw"] <= 1 and counts["zero_cost"] <= 1:
+            score -= 0.8
     if card_id_upper == "CARD.BURNING_PACT":
         score += 0.9
         if basics["total"] >= 4:
@@ -669,6 +694,40 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
         score += 1.2
     if counts["bloodletting"] > 0 and any(token in _description(card) for token in ("draw", "\u62bd\u724c")):
         score += 0.5
+
+    if act == 1 and floor <= 6:
+        if card_id_upper == "CARD.UPPERCUT":
+            score += 1.4
+        elif card_id_upper == "CARD.ANGER":
+            score += 3.0
+        elif card_id_upper == "CARD.POMMEL_STRIKE" and counts["draw"] >= 1 and counts["energy"] <= 0:
+            score -= 1.0
+    if act == 1 and floor <= 14:
+        if card_id_upper == "CARD.ANGER":
+            score += 1.2
+        elif card_id_upper == "CARD.SHRUG_IT_OFF":
+            score += 0.7
+        elif card_id_upper in {"CARD.IRON_WAVE", "CARD.UNRELENTING"}:
+            score += 0.55
+        elif card_id_upper == "CARD.ARMAMENTS" and counts["attack"] <= counts["skill"]:
+            score -= 0.75
+
+    if act >= 2:
+        if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL", "CARD.ARMAMENTS"}:
+            score += 0.75
+        if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.BURNING_PACT", "CARD.BLOODLETTING", "CARD.HEADBUTT"}:
+            score += 0.55
+        if draw_amount > 0 or energy_amount > 0:
+            score += 0.45
+        if any(token in _description(card) for token in ("weak", "\u865a\u5f31", "vulnerable", "\u6613\u4f24")):
+            score += 0.35
+        if cost >= 2 and card_id_upper not in {"CARD.FLAME_BARRIER", "CARD.BLUDGEON"}:
+            score -= 0.45
+        if card_type == "attack" and draw_amount <= 0 and _card_id(card) not in _ELITE_FIGHTER_IDS:
+            score -= 0.25
+        if floor >= 8 and counts["block"] <= 4 and card_id_upper in _BLOCK_CARD_IDS:
+            score += 0.45
+
     score += _archetype_reward_bonus(card, deck)
     if deck_size >= 22 and cost >= 2 and counts["high_cost"] >= 4:
         score -= 0.5
@@ -681,6 +740,12 @@ def estimate_card_reward_score(card: dict[str, Any], deck: list[dict[str, Any]] 
     if card_id:
         duplicates = sum(1 for item in deck if _text(item.get("id")) == card_id)
         score -= min(duplicates, 3) * 0.35
+        if act == 1 and floor <= 6 and card_id_upper == "CARD.POMMEL_STRIKE" and duplicates >= 1:
+            score -= 2.0
+        if card_id_upper == "CARD.BLOODLETTING" and duplicates >= 1 and counts["burning_pact"] <= 0:
+            score -= 1.0
+        if act == 1 and card_id_upper == "CARD.ARMAMENTS" and duplicates >= 1:
+            score -= 1.2
 
     if _has_sparse_card_metadata(card):
         if cost <= 0:
@@ -695,7 +760,7 @@ def estimate_elite_readiness(deck: list[dict[str, Any]] | None, hp_ratio: float,
     cards = [item for item in (deck or []) if isinstance(item, dict)]
     counts = _deck_counts(cards)
     basics = _deck_basics(cards)
-    strong_cards = sum(1 for card in cards if _card_id(card) in _ELITE_FIGHTER_IDS or estimate_card_reward_score(card, cards) >= 2.4)
+    strong_cards = sum(1 for card in cards if _card_id(card) in _ELITE_FIGHTER_IDS or estimate_card_reward_score(card, cards, floor=floor) >= 2.4)
     defense_cards = sum(
         1
         for card in cards
@@ -723,6 +788,7 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
 
     context = state.raw.get("context") or {}
     floor = _safe_int(context.get("floor") or state.raw.get("floor"), 0)
+    act = _safe_int(context.get("act") or state.raw.get("act"), 1) or 1
     hp_ratio = state.hp / max(1, state.max_hp)
     deck = [card for card in (state.player.get("deck") or []) if isinstance(card, dict)]
     elite_readiness = estimate_elite_readiness(deck, hp_ratio, floor)
@@ -775,7 +841,19 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
         next_rooms = child_room_types(choice)
         value = 0.0
         if "elite" in room:
-            if floor <= 6:
+            if act == 2:
+                value = -6.2 + elite_readiness * 0.55
+                if floor <= 10:
+                    value -= 1.4
+                if hp_ratio < 0.9:
+                    value -= 2.2
+                if hp_ratio < 0.72:
+                    value -= 2.0
+            elif act >= 3:
+                value = -3.1 + elite_readiness * 0.85
+                if hp_ratio < 0.62:
+                    value -= 1.8
+            elif floor <= 6:
                 value = -5.2
             elif floor <= 8:
                 value = -3.4 + elite_readiness
@@ -791,6 +869,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value -= 3.0
         elif "rest" in room or "camp" in room or room == "r":
             value = 4.4 if hp_ratio < 0.6 else (3.4 if hp_ratio < 0.8 else 1.15)
+            if act == 2:
+                value += 1.8 if hp_ratio < 0.85 else 0.45
             if floor >= 11:
                 value += 2.35
             if floor >= 14:
@@ -803,17 +883,25 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value += 1.25
             if floor >= 13 and hp_ratio < 0.85:
                 value += 0.75
+            if act == 2 and state.gold >= 100:
+                value += 0.85
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
-            if floor <= 10 and hp_ratio >= 0.55:
+            if act == 2:
+                value = 2.45 if hp_ratio >= 0.55 else 1.55
+            elif floor <= 10 and hp_ratio >= 0.55:
                 value = 1.3
             elif floor <= 10:
                 value = 1.7
             else:
                 value = 2.25 if hp_ratio < 0.8 else 1.65
         elif "monster" in room or "combat" in room or room == "m":
-            if floor <= 10 and hp_ratio >= 0.55:
+            if act == 2:
+                value = 0.95 if hp_ratio >= 0.78 else -0.45
+                if floor <= 5 and hp_ratio >= 0.85:
+                    value += 0.45
+            elif floor <= 10 and hp_ratio >= 0.55:
                 value = 1.45
             elif floor <= 10:
                 value = 0.95
@@ -830,6 +918,12 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
         else:
             value = 1.0
         has_elite_next = any("elite" in next_room for next_room in next_rooms)
+        if act == 2 and has_elite_next:
+            value -= 2.4
+            if elite_readiness < 2.2:
+                value -= 1.6
+            if hp_ratio < 0.95:
+                value -= 1.6
         if has_elite_next and hp_ratio < 0.78 and elite_readiness < 1.35:
             value -= 1.8
         if has_elite_next and floor >= 10 and hp_ratio < 0.9:
@@ -851,12 +945,18 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
     return max(indexed, key=score)
 
 
-def choose_card_reward(cards: list[dict[str, Any]], deck: list[dict[str, Any]] | None, can_skip: bool) -> dict[str, Any] | None:
+def choose_card_reward(
+    cards: list[dict[str, Any]],
+    deck: list[dict[str, Any]] | None,
+    can_skip: bool,
+    state: GameStateView | None = None,
+) -> dict[str, Any] | None:
     indexed = [card for card in cards if isinstance(card, dict) and card.get("index") is not None]
     if not indexed:
         return None
+    act, floor = _state_act_floor(state)
     scored = sorted(
-        ((estimate_card_reward_score(card, deck), card) for card in indexed),
+        ((estimate_card_reward_score(card, deck, act=act, floor=floor), card) for card in indexed),
         key=lambda item: (-item[0], _safe_int(item[1].get("index"), 9999)),
     )
     best_score, best_card = scored[0]
@@ -951,13 +1051,14 @@ def should_prioritize_shop_purge(
     return False
 
 
-def choose_upgrade_targets(cards: list[dict[str, Any]], count: int = 1) -> list[dict[str, Any]]:
+def choose_upgrade_targets(cards: list[dict[str, Any]], count: int = 1, state: GameStateView | None = None) -> list[dict[str, Any]]:
     indexed = [card for card in cards if isinstance(card, dict) and card.get("index") is not None]
     if not indexed:
         return []
     deck = [card for card in cards if isinstance(card, dict)]
     archetype_scores = _deck_archetype_scores(deck)
     archetype_anchors = _deck_archetype_anchors(deck)
+    act, floor = _state_act_floor(state)
 
     def core_priority(card: dict[str, Any]) -> int:
         card_id = _card_id(card)
@@ -1000,7 +1101,7 @@ def choose_upgrade_targets(cards: list[dict[str, Any]], count: int = 1) -> list[
             1 if bool(card.get("upgraded")) else 0,
             0 if card.get("after_upgrade") else 1,
             -archetype_priority(card),
-            -estimate_card_reward_score(card, cards),
+            -estimate_card_reward_score(card, cards, act=act, floor=floor),
             _safe_int(card.get("cost"), 99),
             _safe_int(card.get("index"), 9999),
         )
@@ -1077,6 +1178,8 @@ def estimate_potion_score(potion: dict[str, Any]) -> float:
         score += 0.5
     if any(token in description for token in ("heal", "block", "strength", "\u6062\u590d", "\u683c\u6321", "\u529b\u91cf")):
         score += 0.5
+    if any(token in description for token in ("everyone", "all characters", "\u6240\u6709\u4eba")):
+        score -= 4.0
     return score
 
 

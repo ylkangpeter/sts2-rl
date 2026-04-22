@@ -1128,6 +1128,10 @@ def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], 
     client = runtime.get("client") or {}
     client_running = _is_managed_process_running(client)
 
+    if status in {"idle", "stopped", "finished", "error"} and not active_slots:
+        state["training_missing_since"] = None
+        return
+
     fresh_dashboard_activity = updated_age_seconds is not None and updated_age_seconds < max(config.no_training_grace_seconds, 30)
     if (status == "running" or active_slots) and fresh_dashboard_activity:
         num_envs = _safe_int(training.get("num_envs"), 0)
@@ -1190,6 +1194,12 @@ def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], 
 
 
 def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | None, config: WatchdogConfig, state: dict[str, Any]) -> None:
+    training = (snapshot or {}).get("training") or {}
+    status = str(training.get("status") or "").lower()
+    active_slots_for_status = (snapshot or {}).get("active_slots") or []
+    if status in {"idle", "stopped", "finished", "error"} and not active_slots_for_status:
+        return
+
     dashboard = runtime.get("dashboard") or {}
     if not _is_managed_process_running(dashboard):
         _restart_runtime(runtime, config, "dashboard_process_missing", state)
@@ -1277,6 +1287,15 @@ def _write_status(snapshot: dict[str, Any] | None, incidents: list[dict[str, Any
     _post_dashboard_best_effort("/api/telemetry/runtime/status", {**payload, "source": "watchdog"})
 
 
+def _training_is_intentionally_inactive(snapshot: dict[str, Any] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    training = snapshot.get("training") or {}
+    status = str(training.get("status") or "").lower()
+    active_slots = snapshot.get("active_slots") or []
+    return status in {"idle", "stopped", "finished", "error"} and not active_slots
+
+
 def main() -> None:
     WATCHDOG_ROOT.mkdir(parents=True, exist_ok=True)
     INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1297,15 +1316,18 @@ def main() -> None:
                 raise RuntimeError("dashboard returned non-dict payload")
 
             _refresh_run_scope(snapshot, state)
-            incidents.extend(_detect_active_slot_incidents(snapshot, config, state))
-            incidents.extend(_detect_history_incidents(snapshot, state))
+            if _training_is_intentionally_inactive(snapshot):
+                state["training_missing_since"] = None
+            else:
+                incidents.extend(_detect_active_slot_incidents(snapshot, config, state))
+                incidents.extend(_detect_history_incidents(snapshot, state))
 
-            for incident in incidents:
-                _record_incident(state, incident)
+                for incident in incidents:
+                    _record_incident(state, incident)
 
-            _handle_restartable_incidents(runtime, config, state, incidents)
-            _ensure_runtime_healthy(runtime, snapshot, config, state)
-            _ensure_training_running(runtime, snapshot, config, state)
+                _handle_restartable_incidents(runtime, config, state, incidents)
+                _ensure_runtime_healthy(runtime, snapshot, config, state)
+                _ensure_training_running(runtime, snapshot, config, state)
         except (URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError) as exc:
             incident = {
                 "type": "dashboard_unavailable",

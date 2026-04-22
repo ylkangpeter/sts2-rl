@@ -278,15 +278,30 @@ class SimpleFlowPolicy:
 
     def _enemy_attack_pressure(self, state: GameStateView) -> int:
         pressure = 0
-        for enemy in state.living_enemies():
+        enemies = state.living_enemies()
+        for enemy in enemies:
             if enemy.get("intends_attack"):
+                pressure += 1
+                continue
+            intent_text = self._text(enemy.get("intent"))
+            if any(token in intent_text for token in ("attack", "deathblow", "\u653b\u51fb")):
                 pressure += 1
                 continue
             for intent in enemy.get("intents") or []:
                 if self._intent_is_attack(intent):
                     pressure += 1
                     break
+        if pressure <= 0 and self._unknown_intent_damage_estimate(state, enemies) > 0:
+            return max(1, len(enemies))
         return pressure
+
+    def _enemy_has_known_intent(self, enemy: dict[str, Any]) -> bool:
+        if enemy.get("intends_attack") is not None:
+            return True
+        if enemy.get("intents"):
+            return True
+        intent_text = self._text(enemy.get("intent"))
+        return bool(intent_text and intent_text not in {"none", "null", "unknown"})
 
     def _intent_is_attack(self, intent: Any) -> bool:
         intent_type = self._text((intent or {}).get("type") if isinstance(intent, dict) else intent)
@@ -308,12 +323,31 @@ class SimpleFlowPolicy:
 
     def _enemy_intended_damage(self, state: GameStateView) -> int:
         total = 0
-        for enemy in state.living_enemies():
+        enemies = state.living_enemies()
+        for enemy in enemies:
             for intent in enemy.get("intents") or []:
                 if not isinstance(intent, dict) or not self._intent_is_attack(intent):
                     continue
                 total += self._intent_damage(intent)
-        return total
+        if total > 0:
+            return total
+        return self._unknown_intent_damage_estimate(state, enemies)
+
+    def _unknown_intent_damage_estimate(self, state: GameStateView, enemies: list[dict[str, Any]]) -> int:
+        if not enemies or any(self._enemy_has_known_intent(enemy) for enemy in enemies):
+            return 0
+        act, floor, room_type, is_boss_room = self._combat_context(state)
+        if act <= 1:
+            return 0
+        if is_boss_room or floor >= 16:
+            base = 52 if act == 2 else 58
+            return base + max(0, len(enemies) - 1) * 8
+        if "elite" in room_type:
+            base = 34 if act == 2 else 38
+            return base + max(0, len(enemies) - 1) * 5
+        if act >= 2:
+            return 20 + max(0, len(enemies) - 1) * 4
+        return 0
 
     def _combat_context(self, state: GameStateView) -> tuple[int, int, str, bool]:
         context = state.raw.get("context") or {}
@@ -389,6 +423,13 @@ class SimpleFlowPolicy:
             return 0
         digits = [int(item) for item in re.findall(r"\d+", text)]
         return max(digits) if digits else 0
+
+    def _potion_self_damage_amount(self, potion: dict[str, Any]) -> int:
+        text = f"{potion.get('name') or ''} {potion.get('description') or ''}"
+        lowered = text.lower()
+        if not any(token in lowered for token in ("everyone", "all characters")) and "\u6240\u6709\u4eba" not in text:
+            return 0
+        return self._potion_damage_amount(potion)
 
     def _potion_block_amount(self, potion: dict[str, Any]) -> int:
         vars_payload = potion.get("vars") or {}
@@ -576,11 +617,20 @@ class SimpleFlowPolicy:
             potion_damage = self._potion_damage_amount(potion)
             if potion_damage <= 0:
                 continue
+            self_damage = self._potion_self_damage_amount(potion)
+            if self_damage > 0:
+                enemies = state.living_enemies()
+                kills_all_enemies = bool(enemies) and all(potion_damage >= self._enemy_effective_hp(enemy) for enemy in enemies)
+                if state.hp <= self_damage or not kills_all_enemies:
+                    continue
             target = self._pick_damage_target(state.living_enemies(), potion_damage)
             if target is None:
                 continue
             target_ehp = self._enemy_effective_hp(target)
             score = float(potion_damage)
+            if self_damage > 0:
+                score -= self_damage * 2.5
+                score += 45.0
             if potion_damage >= target_ehp:
                 score += 30.0 + self._enemy_threat(target) * 1.5
             if incoming_damage >= state.hp:
@@ -788,6 +838,15 @@ class SimpleFlowPolicy:
                         score -= 22.0
                     if incoming_damage <= state.block and followup_quality < 7.0:
                         score -= 14.0
+                if is_boss_floor and not lethal_pressure:
+                    followup_quality = self._playable_followup_quality(state, card)
+                    projected_hp = state.hp - hp_loss + state.block - incoming_damage
+                    if projected_hp < max(18, int(state.max_hp * 0.22)) and followup_quality < 7.0:
+                        score -= 18.0
+                    if hp_ratio < 0.68 and followup_quality < 5.5:
+                        score -= 10.0
+                    if incoming_damage <= state.block and followup_quality < 8.0:
+                        score -= 8.0
                 if state.hp <= hp_loss + 14 and not can_convert_hp:
                     score -= 18.0
             else:
@@ -860,6 +919,8 @@ class SimpleFlowPolicy:
                 score += 4.0
         if any(token in card_name for token in ("thunderclap", "雷霆", "anger", "愤怒", "bludgeon", "重锤")):
             score += 4.0
+        if card_id == "CARD.ANGER" and is_boss_floor:
+            score += 6.0
         if "grapple" in card_name or "擒拿" in card_name:
             score -= 5.0
         if "rampage" in card_name or "暴走" in card_name:
@@ -879,7 +940,7 @@ class SimpleFlowPolicy:
 
     def _pick_card_reward_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         deck = list(state.player.get("deck") or [])
-        choice = choose_card_reward(state.cards, deck, state.can_skip)
+        choice = choose_card_reward(state.cards, deck, state.can_skip, state)
         if choice is not None:
             return FlowAction("choose_card_reward", {"card_index": choice.get("index", 0)})
         return FlowAction("skip_reward")
@@ -958,7 +1019,7 @@ class SimpleFlowPolicy:
         elif floor <= 8:
             heal_threshold = max(heal_threshold, 0.7)
         elif floor >= 14:
-            heal_threshold = max(heal_threshold, 0.78)
+            heal_threshold = max(heal_threshold, 0.88)
         elif floor >= 12:
             heal_threshold = max(heal_threshold, 0.72)
         if hp_ratio < max(0.4, heal_threshold):
@@ -1001,7 +1062,7 @@ class SimpleFlowPolicy:
             if len(exhaust_targets) >= pick_count:
                 return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in exhaust_targets)})
 
-        upgrade_targets = choose_upgrade_targets(state.cards, pick_count)
+        upgrade_targets = choose_upgrade_targets(state.cards, pick_count, state)
         if len(upgrade_targets) >= pick_count:
             return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in upgrade_targets)})
 

@@ -7,6 +7,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,12 @@ def _parse_args() -> argparse.Namespace:
         help="Minimum terminal floor required for historical seed inclusion.",
     )
     parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=0,
+        help="Maximum historical seeds to include in auto mode; 0 means all matching seeds.",
+    )
+    parser.add_argument(
         "--focused-high-floor-threshold",
         type=int,
         default=17,
@@ -103,6 +110,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="How many fresh random seeds to generate per run in auto mode.",
+    )
+    parser.add_argument(
+        "--random-run-tag",
+        type=str,
+        default="",
+        help="Optional tag for reproducible random seed generation within one before/after gate run.",
     )
     parser.add_argument("--out", type=Path, default=None, help="Optional JSON output path.")
     parser.add_argument("--character", type=str, default="Ironclad")
@@ -240,7 +253,7 @@ def _row_has_terminal_outcome(row: dict[str, Any]) -> bool:
     return bool(row.get("game_over") or row.get("terminated") or row.get("truncated"))
 
 
-def _collect_historical_seeds(root: Path, *, min_floor: int) -> list[str]:
+def _collect_historical_seeds(root: Path, *, min_floor: int, limit: int = 0) -> list[str]:
     best_by_seed: dict[str, tuple[int, str]] = {}
     for row in _iter_history_rows(root):
         seed = str(row.get("seed") or "").strip()
@@ -254,6 +267,8 @@ def _collect_historical_seeds(root: Path, *, min_floor: int) -> list[str]:
         if current is None or (floor, recorded_at) > current:
             best_by_seed[seed] = (floor, recorded_at)
     ranked = sorted(best_by_seed.items(), key=lambda item: (-item[1][0], item[1][1], item[0]))
+    if limit > 0:
+        ranked = ranked[:limit]
     return [seed for seed, _meta in ranked]
 
 
@@ -289,12 +304,12 @@ def _collect_focused_historical_seeds(
     return ranked(high_by_seed, high_floor_limit), ranked(anomaly_by_seed, anomaly_limit)
 
 
-def _generate_random_seeds(count: int) -> list[str]:
+def _generate_random_seeds(count: int, run_tag: str = "") -> list[str]:
     count = max(0, int(count))
     if count <= 0:
         return []
-    run_tag = time.strftime("%Y%m%d_%H%M%S")
-    rng = random.Random()
+    run_tag = str(run_tag or "").strip() or time.strftime("%Y%m%d_%H%M%S")
+    rng = random.Random(run_tag)
     return [f"bt_rand_{run_tag}_{index:03d}_{rng.randrange(10_000, 1_000_000)}" for index in range(1, count + 1)]
 
 
@@ -351,8 +366,9 @@ def _build_datasets(args: argparse.Namespace) -> list[dict[str, Any]]:
     historical_seeds = _collect_historical_seeds(
         args.history_root,
         min_floor=max(1, int(args.history_floor_threshold)),
+        limit=max(0, int(args.history_limit)),
     )
-    random_seeds = _generate_random_seeds(args.random_count)
+    random_seeds = _generate_random_seeds(args.random_count, str(args.random_run_tag or ""))
 
     datasets = [
         {
@@ -393,6 +409,23 @@ def _state_global_floor(state: GameStateView) -> int:
     return _global_floor(_state_act(state), _state_floor(state))
 
 
+def _invalid_progression_reason(state: GameStateView) -> str:
+    act = _state_act(state)
+    floor = _state_floor(state)
+    global_floor = _state_global_floor(state)
+    if act < 1:
+        return f"invalid_floor_progression:A{act}F{floor}/G{global_floor}"
+    if act > 4:
+        return f"invalid_floor_progression:A{act}F{floor}/G{global_floor}"
+    max_floor_by_act = {1: 17, 2: 18, 3: 18, 4: 1}
+    max_floor = max_floor_by_act.get(act, 17)
+    if floor > max_floor:
+        return f"invalid_floor_progression:A{act}F{floor}/G{global_floor}"
+    if global_floor > 54:
+        return f"invalid_floor_progression:A{act}F{floor}/G{global_floor}"
+    return ""
+
+
 def _update_floor_peak(state: GameStateView, peak: dict[str, int]) -> dict[str, int]:
     act = _state_act(state)
     floor = _state_floor(state)
@@ -417,7 +450,7 @@ def _boss_cleared(before: GameStateView, after: GameStateView) -> bool:
         return True
     if after.decision in {"card_reward", "map_node", "map_select"} and not after.living_enemies():
         return True
-    return _is_boss_state(after) and after.decision != "combat_play" and not after.living_enemies()
+    return False
 
 
 def _final_hp(state: GameStateView) -> int:
@@ -434,6 +467,8 @@ def _replay_cached_seed(
 ) -> dict[str, Any] | None:
     rng = random.Random(seed)
     state = protocol.adapt_state(cached.initial_state)
+    if _invalid_progression_reason(state):
+        return None
     steps = 0
     max_floor = _state_floor(state)
     max_global_floor = _state_global_floor(state)
@@ -467,6 +502,8 @@ def _replay_cached_seed(
         if is_boss and previous_boss_act in act_boss_attempt:
             act_boss_attempt[previous_boss_act] = True
         state = protocol.adapt_state(result.state)
+        if _invalid_progression_reason(state):
+            return None
         cleared_boss = _boss_cleared(previous_state, state)
         boss_clear = boss_clear or cleared_boss
         if cleared_boss and previous_boss_act in act_boss_clear:
@@ -564,6 +601,10 @@ def _run_single_seed(
         raw_state = start.raw_state or protocol.get_state(game_id)
         initial_state = raw_state
         state = protocol.adapt_state(raw_state)
+        invalid_progression = _invalid_progression_reason(state)
+        if invalid_progression:
+            outcome["error"] = invalid_progression
+            return outcome
         max_floor = max(max_floor, _state_floor(state))
         peak = _update_floor_peak(state, peak)
         max_global_floor = peak["global_floor"]
@@ -606,6 +647,10 @@ def _run_single_seed(
             )
             raw_state = result.state or state.raw
             state = protocol.adapt_state(raw_state)
+            invalid_progression = _invalid_progression_reason(state)
+            if invalid_progression:
+                outcome["error"] = invalid_progression
+                break
             cleared_boss = _boss_cleared(previous_state, state)
             outcome["boss_clear"] = bool(outcome["boss_clear"] or cleared_boss)
             if cleared_boss and 1 <= previous_boss_act <= 3:
@@ -754,22 +799,40 @@ def _run_dataset(
                 flush=True,
             )
     else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(run_indexed_seed, index, seed, None): index
-                for index, seed in enumerate(seeds, start=1)
-            }
-            for completed_count, future in enumerate(as_completed(futures), start=1):
-                index, row = future.result()
-                rows_by_index[index] = row
+        completed_lock = threading.Lock()
+        completed_count = 0
+        slot_batches: list[list[tuple[int, str]]] = [[] for _ in range(worker_count)]
+        for index, seed in enumerate(seeds, start=1):
+            slot_batches[(index - 1) % worker_count].append((index, seed))
+
+        def run_slot_batch(slot: int, batch: list[tuple[int, str]]) -> list[tuple[int, dict[str, Any]]]:
+            nonlocal completed_count
+            slot_rows: list[tuple[int, dict[str, Any]]] = []
+            for index, seed in batch:
+                _, row = run_indexed_seed(index, seed, slot)
+                slot_rows.append((index, row))
+                with completed_lock:
+                    completed_count += 1
+                    current_count = completed_count
                 print(
-                    f"[{name} {completed_count:03d}/{len(seeds):03d}] index={index:03d} seed={row['seed']} "
+                    f"[{name} {current_count:03d}/{len(seeds):03d}] index={index:03d} seed={row['seed']} "
                     f"success={row['success']} victory={row['victory']} "
                     f"final=A{row.get('final_act', 1)}F{row.get('final_floor', row['max_floor'])}/G{row.get('final_global_floor', row['max_floor'])} "
                     f"max=A{row.get('max_act', row.get('final_act', 1))}F{row.get('max_act_floor', row['max_floor'])}/G{row.get('max_global_floor', row['max_floor'])} "
                     f"steps={row['steps']} cache={bool(row.get('cache_hit'))} err={row['error']}",
                     flush=True,
                 )
+            return slot_rows
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(run_slot_batch, slot, batch)
+                for slot, batch in enumerate(slot_batches)
+                if batch
+            ]
+            for future in as_completed(futures):
+                for index, row in future.result():
+                    rows_by_index[index] = row
     rows = [rows_by_index[index] for index in sorted(rows_by_index)]
     return {
         "name": name,
@@ -822,12 +885,14 @@ def main() -> None:
             "timeout_seconds": args.timeout_seconds,
             "history_root": str(args.history_root),
             "history_floor_threshold": int(args.history_floor_threshold),
+            "history_limit": int(args.history_limit),
             "focused_high_floor_threshold": int(args.focused_high_floor_threshold),
             "focused_anomaly_floor_threshold": int(args.focused_anomaly_floor_threshold),
             "focused_high_floor_limit": int(args.focused_high_floor_limit),
             "focused_anomaly_limit": int(args.focused_anomaly_limit),
             "curated_seeds_file": str(args.seeds_file),
             "random_count": int(args.random_count),
+            "random_run_tag": str(args.random_run_tag or ""),
             "workers": max(1, int(args.workers)),
             "cache_enabled": cache is not None,
             "cache_namespace": cache_namespace,

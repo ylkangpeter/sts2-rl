@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import random
+import threading
 from pathlib import Path
 from statistics import mean
 import sys
@@ -400,19 +401,36 @@ def main() -> None:
     results: list[dict[str, Any]] = []
     args.out.parent.mkdir(parents=True, exist_ok=True)
     worker_count = max(1, args.workers)
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {
-            executor.submit(_trace_seed, seed_row, args, 0 if worker_count == 1 else None): seed_row
-            for index, seed_row in enumerate(seed_rows)
-        }
-        for index, future in enumerate(as_completed(future_map), 1):
-            row = future.result()
-            results.append(row)
+    completed_lock = threading.Lock()
+    completed_count = 0
+    slot_batches: list[list[dict[str, Any]]] = [[] for _ in range(worker_count)]
+    for index, seed_row in enumerate(seed_rows):
+        slot_batches[index % worker_count].append(seed_row)
+
+    def run_slot_batch(slot: int, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        nonlocal completed_count
+        slot_results: list[dict[str, Any]] = []
+        for seed_row in batch:
+            row = _trace_seed(seed_row, args, slot)
+            slot_results.append(row)
+            with completed_lock:
+                completed_count += 1
+                current_count = completed_count
             print(
-                f"[{index:03d}/{len(seed_rows):03d}] seed={row.get('seed')} "
+                f"[{current_count:03d}/{len(seed_rows):03d}] seed={row.get('seed')} "
                 f"boss={row.get('boss')} clear={row.get('boss_clear')} "
                 f"entry_hp={row.get('entry_hp')} err={row.get('error') or ''}"
             )
+        return slot_results
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(run_slot_batch, slot, batch)
+            for slot, batch in enumerate(slot_batches)
+            if batch
+        ]
+        for future in as_completed(futures):
+            results.extend(future.result())
 
     payload = {
         "config": {

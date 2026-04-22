@@ -1557,11 +1557,11 @@ def _session_supervisor_config() -> dict[str, Any]:
     return _runtime_node("session_supervisor")
 
 
-def _support_node_names() -> list[str]:
+def _support_node_names(*, include_disabled: bool = False) -> list[str]:
     names = ["service"]
-    if bool(_watchdog_config().get("enabled", False)):
+    if include_disabled or bool(_watchdog_config().get("enabled", False)):
         names.append("watchdog")
-    if bool(_session_supervisor_config().get("enabled", False)):
+    if include_disabled or bool(_session_supervisor_config().get("enabled", False)):
         names.append("session_supervisor")
     return names
 
@@ -1731,6 +1731,7 @@ def _find_service_process_ids() -> list[int]:
         str(service.get("process_match") or "").strip(),
         Path(str(service.get("script") or "")).name.strip(),
         "http_game_service.py",
+        "run_sts2_cli_service.py",
     ]
     for pattern in patterns:
         if not pattern:
@@ -1938,11 +1939,11 @@ def _stop_support_stack() -> dict[str, Any]:
         cleanup_result = _cleanup_and_shutdown_service_workers()
     results["service_cleanup"] = cleanup_result
 
-    for name in _support_node_names():
-        pids = _managed_process_ids(name)
+    for name in _support_node_names(include_disabled=True):
+        pids = _find_service_process_ids() if name == "service" else _managed_process_ids(name)
         terminated = _terminate_processes(pids) if pids else []
         remaining = _wait_for_process_exit(
-            lambda name=name: _managed_process_ids(name),
+            (lambda: _find_service_process_ids()) if name == "service" else (lambda name=name: _managed_process_ids(name)),
             timeout_seconds=6.0,
             poll_interval_seconds=0.4,
         ) if terminated else []

@@ -65,6 +65,9 @@ UNSUPPORTED_HEADLESS_CARD_IDS = {
 
 def _combat_potion_mode(potion: Dict[str, Any]) -> str:
     target_type = str(potion.get("target_type") or "").strip().lower()
+    description = str(potion.get("description") or "").strip().lower()
+    if any(token in description for token in ("everyone", "all characters", "\u6240\u6709\u4eba")):
+        return "unsafe"
     if not target_type:
         return "unsafe"
     if "allenemies" in target_type or "all_enemies" in target_type:
@@ -223,6 +226,7 @@ class HttpCliProtocol(FlowProtocol):
     def __init__(self, config: HttpCliProtocolConfig | None = None):
         self.config = config or HttpCliProtocolConfig()
         self._session_local = threading.local()
+        self._start_lock = threading.Lock()
 
     def _get_session(self) -> requests.Session:
         session = getattr(self._session_local, "session", None)
@@ -393,27 +397,28 @@ class HttpCliProtocol(FlowProtocol):
         return result.get("status") == "success"
 
     def start_game(self, character: str, seed: str, worker_slot: int | None = None) -> ProtocolStartResult:
-        payload = {"character": character, "seed": seed}
-        if worker_slot is not None:
-            payload["worker_slot"] = int(worker_slot)
-        game_dir = self._detect_game_dir()
-        if game_dir:
-            payload["game_dir"] = game_dir
+        with self._start_lock:
+            payload = {"character": character, "seed": seed}
+            if worker_slot is not None:
+                payload["worker_slot"] = int(worker_slot)
+            game_dir = self._detect_game_dir()
+            if game_dir:
+                payload["game_dir"] = game_dir
 
-        attempts = 12 if worker_slot is not None else 1
-        last_error: Dict[str, Any] | None = None
-        for attempt in range(attempts):
-            data = self._request("POST", "/start", payload=payload, retries=5)
-            if data.get("status") == "success":
-                return ProtocolStartResult(game_id=data["game_id"], raw_state=data.get("state") or {})
+            attempts = 12 if worker_slot is not None else 1
+            last_error: Dict[str, Any] | None = None
+            for attempt in range(attempts):
+                data = self._request("POST", "/start", payload=payload, retries=5)
+                if data.get("status") == "success":
+                    return ProtocolStartResult(game_id=data["game_id"], raw_state=data.get("state") or {})
 
-            last_error = data
-            message = str(data.get("message") or "")
-            if worker_slot is None or attempt >= attempts - 1 or "busy" not in message.lower():
-                break
-            if not self._close_worker_slot_game(int(worker_slot)):
-                self._reset_worker_slot(int(worker_slot))
-            time.sleep(self.config.close_retry_delay_seconds)
+                last_error = data
+                message = str(data.get("message") or "")
+                if worker_slot is None or attempt >= attempts - 1 or "busy" not in message.lower():
+                    break
+                if not self._close_worker_slot_game(int(worker_slot)):
+                    self._reset_worker_slot(int(worker_slot))
+                time.sleep(self.config.close_retry_delay_seconds)
 
         raise RuntimeError(f"Start game failed: {last_error}")
 
@@ -527,13 +532,6 @@ class HttpCliProtocol(FlowProtocol):
                     return FlowAction("play_card", fallback_args)
                 if healing_potion_action is not None:
                     return healing_potion_action
-                safe_potions = [potion for potion in player_potions if _combat_potion_mode(potion) != "unsafe"]
-                if safe_potions:
-                    potion = rng.choice(safe_potions)
-                    fallback_args = {"potion_index": potion.get("index", 0)}
-                    if _combat_potion_mode(potion) == "safe_enemy" and enemies:
-                        fallback_args["target_index"] = rng.choice(enemies).get("index")
-                    return FlowAction("use_potion", fallback_args)
                 if not enemies:
                     return FlowAction("proceed")
                 return FlowAction("end_turn")
@@ -560,10 +558,7 @@ class HttpCliProtocol(FlowProtocol):
                 if potion is None:
                     if healing_potion_action is not None:
                         return healing_potion_action
-                    if not valid_potions:
-                        return FlowAction("end_turn")
-                    potion = rng.choice(list(valid_potions.values()))
-                    safe.args = {"potion_index": potion.get("index")}
+                    return _fallback_combat_action()
                 if _is_beneficial_healing_potion(state, potion):
                     return FlowAction("use_potion", {"potion_index": potion.get("index", 0)})
                 potion_mode = _combat_potion_mode(potion)
@@ -580,14 +575,14 @@ class HttpCliProtocol(FlowProtocol):
             if safe.name == "proceed":
                 if force_proceed or not enemies:
                     return FlowAction("proceed")
-                if playable or healing_potion_action is not None or player_potions:
+                if playable or healing_potion_action is not None:
                     return _fallback_combat_action()
                 return FlowAction("end_turn")
 
             if safe.name == "end_turn":
                 if allow_end_turn:
                     return FlowAction("end_turn")
-                if playable or player_potions:
+                if playable or healing_potion_action is not None:
                     return _fallback_combat_action()
                 if not enemies:
                     return FlowAction("proceed")
@@ -603,7 +598,7 @@ class HttpCliProtocol(FlowProtocol):
 
         if state.decision == "card_reward":
             if state.cards:
-                picked = choose_card_reward(state.cards, list(state.player.get("deck") or []), state.can_skip)
+                picked = choose_card_reward(state.cards, list(state.player.get("deck") or []), state.can_skip, state)
                 if picked is not None:
                     return FlowAction("choose_card_reward", {"card_index": picked.get("index", 0)})
             return FlowAction("skip_reward")
@@ -704,8 +699,20 @@ class HttpCliProtocol(FlowProtocol):
                     ),
                     None,
                 )
-                floor = _safe_int((state.raw.get("context") or {}).get("floor"), 0) or 0
-                heal_threshold = 0.7 if floor <= 8 else 0.62
+                context = state.raw.get("context") or {}
+                act = _safe_int(context.get("act"), 0) or 0
+                floor = _safe_int(context.get("floor"), 0) or 0
+                heal_threshold = 0.62
+                if act >= 2:
+                    heal_threshold = max(heal_threshold, 0.82)
+                    if floor >= 12:
+                        heal_threshold = max(heal_threshold, 0.88)
+                elif floor <= 8:
+                    heal_threshold = max(heal_threshold, 0.7)
+                elif floor >= 14:
+                    heal_threshold = max(heal_threshold, 0.88)
+                elif floor >= 12:
+                    heal_threshold = max(heal_threshold, 0.72)
                 if state.hp / max(1, state.max_hp) < heal_threshold and heal is not None:
                     return FlowAction("choose_option", {"option_index": heal.get("index", 0)})
                 if smith is not None:
@@ -748,7 +755,7 @@ class HttpCliProtocol(FlowProtocol):
                     event_targets = choose_purge_targets(state.cards, pick_count)
                     if len(event_targets) >= pick_count:
                         return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in event_targets)})
-                upgrade_targets = choose_upgrade_targets(state.cards, pick_count)
+                upgrade_targets = choose_upgrade_targets(state.cards, pick_count, state)
                 if len(upgrade_targets) >= pick_count:
                     return FlowAction("select_cards", {"indices": ",".join(str(card.get("index", 0)) for card in upgrade_targets)})
                 return None

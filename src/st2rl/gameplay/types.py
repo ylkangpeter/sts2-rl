@@ -56,6 +56,9 @@ class GameStateView:
         raw_decision = str(state.get("decision") or "")
         decision = decision_alias.get(raw_decision, raw_decision) if decision_alias else raw_decision
         player = dict(state.get("player") or {})
+        hp = int(player.get("hp") or 0)
+        max_hp = int(player.get("max_hp") or 0)
+        defeated = bool(player and max_hp > 0 and hp <= 0)
         return cls(
             raw=state,
             decision=decision,
@@ -81,7 +84,7 @@ class GameStateView:
             min_select=int(state.get("min_select", 1) or 0),
             max_select=int(state.get("max_select", 1) or 0),
             selection_prompt=str(state.get("selection_prompt") or state.get("prompt") or ""),
-            game_over=bool(state.get("game_over") or raw_decision == "game_over" or decision == "game_over"),
+            game_over=bool(state.get("game_over") or raw_decision == "game_over" or decision == "game_over" or defeated),
             victory=bool(state.get("victory", False)),
         )
 
