@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
+from st2rl.gameplay.combat_stagnation import build_combat_stagnation_profile
 from st2rl.gameplay.config import FlowRunnerConfig
 from st2rl.gameplay.policy import SimpleFlowPolicy
 from st2rl.gameplay.types import FlowAction, FlowRunResult, FlowRunSummary, GameStateView
@@ -164,11 +165,20 @@ class FlowRunner:
                 else:
                     no_action_combat_stagnant_steps = 0
 
-                if no_action_combat_stagnant_steps == self.config.no_action_combat_proceed_threshold:
+                profile = build_combat_stagnation_profile(
+                    state,
+                    no_action_proceed_threshold=self.config.no_action_combat_proceed_threshold,
+                    no_action_abort_threshold=self.config.no_action_combat_abort_threshold,
+                    stuck_warn_threshold=self.config.stuck_warn_threshold,
+                    stuck_abort_threshold=self.config.stuck_abort_threshold,
+                )
+
+                if no_action_combat_stagnant_steps == profile.no_action_proceed_threshold:
                     self.logger.warning(
-                        "%s no-action combat repeated %s times; trying forced proceed recovery",
+                        "%s no-action combat repeated %s times (profile=%s); trying forced proceed recovery",
                         tag,
                         no_action_combat_stagnant_steps,
+                        profile.profile_name,
                     )
                     forced_proceed = FlowAction("proceed", {"_force_if_stuck": True})
                     forced_result = self.protocol.step(game_id, self.protocol.sanitize_action(state, forced_proceed, rng))
@@ -180,12 +190,13 @@ class FlowRunner:
                         no_action_combat_stagnant_steps = 0
                         continue
 
-                if stagnant_steps == self.config.stuck_warn_threshold:
+                if stagnant_steps == profile.stuck_warn_threshold:
                     self.logger.warning(
-                        "%s state appears stuck for %s steps at decision=%s; trying forced end_turn/proceed recovery",
+                        "%s state appears stuck for %s steps at decision=%s profile=%s; trying forced end_turn/proceed recovery",
                         tag,
                         stagnant_steps,
                         state.decision,
+                        profile.profile_name,
                     )
                     if state.decision == "combat_play" and not state.playable_cards():
                         forced_action = FlowAction("proceed", {"_force_if_stuck": True})
@@ -195,16 +206,18 @@ class FlowRunner:
                         forced_action = FlowAction("proceed")
                     self.protocol.step(game_id, self.protocol.sanitize_action(state, forced_action, rng))
 
-                if no_action_combat_stagnant_steps == self.config.no_action_combat_abort_threshold:
+                if state.decision == "combat_play" and no_action_combat_stagnant_steps >= profile.no_action_abort_threshold:
                     raise RuntimeError(
                         f"{tag} no-action combat deadlock detected after "
-                        f"{no_action_combat_stagnant_steps} repeated states: {state.summary()}"
+                        f"{no_action_combat_stagnant_steps} repeated states "
+                        f"(profile={profile.profile_name} encounter='{profile.enemy_key}'): {state.summary()}"
                     )
 
-                if stagnant_steps >= self.config.stuck_abort_threshold:
+                if stagnant_steps >= profile.stuck_abort_threshold:
                     raise RuntimeError(
                         f"{tag} stuck loop detected at decision={state.decision} "
-                        f"for {stagnant_steps} repeated states: {state.summary()}"
+                        f"for {stagnant_steps} repeated states "
+                        f"(profile={profile.profile_name} encounter='{profile.enemy_key}'): {state.summary()}"
                     )
 
                 self._log_step_end(tag, steps, state, reward, total_reward, seed)

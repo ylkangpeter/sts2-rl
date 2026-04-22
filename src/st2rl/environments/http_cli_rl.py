@@ -13,6 +13,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from st2rl.gameplay.combat_stagnation import CombatStagnationProfile, build_combat_stagnation_profile
 from st2rl.gameplay.config import FlowPolicyConfig
 from st2rl.gameplay.knowledge_matcher import DEFAULT_MISMATCH_LOG_PATH, KnowledgeMatcher
 from st2rl.gameplay.policy import SimpleFlowPolicy
@@ -918,8 +919,10 @@ class HttpCliRlEnv(gym.Env):
             flags.append("truncated_without_game_over")
         if isinstance(elapsed_seconds, (int, float)) and float(elapsed_seconds) > 600:
             flags.append("overlong_episode")
-        if self._termination_reason in {"protocol_deadlock", "stuck_abort", "step_exception", "fatal_protocol_error"}:
-            flags.append(str(self._termination_reason))
+        reason = str(self._termination_reason or "")
+        reason_key = reason.split(":", 1)[0]
+        if reason_key in {"protocol_deadlock", "stuck_abort", "no_action_combat_abort", "step_exception", "fatal_protocol_error"}:
+            flags.append(reason_key)
         return list(dict.fromkeys(flags))
 
     def _record_episode_anomaly(self, summary: dict[str, Any]) -> None:
@@ -1193,11 +1196,31 @@ class HttpCliRlEnv(gym.Env):
         else:
             self._no_action_combat_stagnant_steps = 0
 
+    def _combat_stagnation_profile(self, state: Optional[GameStateView]) -> CombatStagnationProfile:
+        return build_combat_stagnation_profile(
+            state,
+            no_action_proceed_threshold=self.config.no_action_combat_proceed_threshold,
+            no_action_abort_threshold=self.config.no_action_combat_abort_threshold,
+            stuck_warn_threshold=self.config.stuck_warn_threshold,
+            stuck_abort_threshold=self.config.stuck_abort_threshold,
+        )
+
+    def _stagnation_abort_reason(self, state: Optional[GameStateView]) -> Optional[str]:
+        if state is None:
+            return None
+        profile = self._combat_stagnation_profile(state)
+        if state.decision == "combat_play" and self._no_action_combat_stagnant_steps >= profile.no_action_abort_threshold:
+            return f"no_action_combat_abort:{profile.profile_name}"
+        if self._stagnant_steps >= profile.stuck_abort_threshold:
+            return f"stuck_abort:{profile.profile_name}"
+        return None
+
     def _force_progress_if_needed(self) -> Tuple[bool, float]:
         if self._state is None or self._game_id is None:
             return False, 0.0
 
-        if self._no_action_combat_stagnant_steps == self.config.no_action_combat_proceed_threshold:
+        profile = self._combat_stagnation_profile(self._state)
+        if self._no_action_combat_stagnant_steps == profile.no_action_proceed_threshold:
             forced = FlowAction("proceed", {"_force_if_stuck": True})
             result = self.protocol.step(self._game_id, self.protocol.sanitize_action(self._state, forced, self._flow_policy_rng))
             if result.status == "success" and result.state:
@@ -1209,7 +1232,7 @@ class HttpCliRlEnv(gym.Env):
                 self._no_action_combat_stagnant_steps = 0
                 return True, 0.0
 
-        if self._stagnant_steps >= self.config.stuck_abort_threshold:
+        if self._stagnant_steps >= profile.stuck_abort_threshold:
             return False, self.reward_tracker.on_stuck()
 
         return False, 0.0
@@ -1542,6 +1565,18 @@ class HttpCliRlEnv(gym.Env):
             if progressed:
                 self._protocol_error_streak = 0
                 self._deadlock_error_streak = 0
+            profile = self._combat_stagnation_profile(self._state)
+            if self._stagnant_steps == profile.stuck_warn_threshold:
+                self.logger.warning(
+                    "State appears stuck: slot=%s seed=%s game_id=%s decision=%s stagnant=%s profile=%s encounter=%s",
+                    self.config.seed_offset,
+                    self._seed,
+                    self._game_id,
+                    self._state.decision if self._state is not None else None,
+                    self._stagnant_steps,
+                    profile.profile_name,
+                    profile.enemy_key,
+                )
 
             forced_progress, forced_reward = self._force_progress_if_needed()
             reward += forced_reward
@@ -1554,9 +1589,10 @@ class HttpCliRlEnv(gym.Env):
             if progressed:
                 self._step_count += 1
 
-            if self._stagnant_steps >= self.config.stuck_abort_threshold:
+            stagnation_abort_reason = self._stagnation_abort_reason(self._state)
+            if stagnation_abort_reason:
                 abort_episode = True
-                termination_reason = termination_reason or "stuck_abort"
+                termination_reason = termination_reason or stagnation_abort_reason
 
             terminated = bool(self._state.game_over)
             truncated = truncated or abort_episode or bool(self.config.max_steps is not None and self._step_count >= self.config.max_steps)
@@ -1588,6 +1624,7 @@ class HttpCliRlEnv(gym.Env):
             }
             if termination_reason:
                 info["termination_reason"] = termination_reason
+                info["termination_reason_group"] = termination_reason.split(":", 1)[0]
             self._write_current_slot(active=not (terminated or truncated), force=bool(terminated or truncated))
             if terminated or truncated:
                 self._record_episode_summary(terminated=terminated, truncated=truncated)
