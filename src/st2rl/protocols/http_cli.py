@@ -295,6 +295,72 @@ def _first_valid_bundle(bundles: list[Dict[str, Any]]) -> Dict[str, Any] | None:
     )
 
 
+def _card_choice_text(card: Dict[str, Any]) -> str:
+    return " ".join(
+        str(card.get(key) or "").strip().lower()
+        for key in ("id", "card_id", "name", "description", "type")
+    )
+
+
+def _is_curse_choice_state(state: GameStateView) -> bool:
+    cards = [card for card in state.cards if isinstance(card, dict)]
+    if not cards or state.min_select > 1:
+        return False
+    if len(cards) > 4:
+        return False
+    room_type = str((state.raw.get("context") or {}).get("room_type") or "").strip().lower()
+    if not any(token in room_type for token in ("monster", "elite", "boss", "combat")):
+        return False
+    curse_like = 0
+    for card in cards:
+        text = _card_choice_text(card)
+        card_type = str(card.get("type") or "").strip().lower()
+        if card_type == "curse" or any(
+            token in text
+            for token in (
+                "curse",
+                "诅咒",
+                "decay",
+                "瓦解",
+                "衰朽",
+                "sloth",
+                "lazy",
+                "懒惰",
+                "corruption",
+                "腐化",
+            )
+        ):
+            curse_like += 1
+    return curse_like >= max(1, len(cards) - 1)
+
+
+def _curse_choice_score(card: Dict[str, Any]) -> float:
+    text = _card_choice_text(card)
+    score = 0.0
+    if any(token in text for token in ("decay", "瓦解", "衰朽", "每回合结束时失去生命", "end of turn lose")):
+        score += 90.0
+    if any(token in text for token in ("sloth", "lazy", "懒惰", "每回合最多打3张", "最多打出3张", "play up to 3")):
+        score -= 180.0
+    if any(token in text for token in ("writhe", "心灵腐化", "corruption", "腐化")):
+        score -= 30.0
+    return score
+
+
+def _pick_preferred_curse_card(state: GameStateView) -> Dict[str, Any] | None:
+    if not _is_curse_choice_state(state):
+        return None
+    cards = [card for card in state.cards if isinstance(card, dict)]
+    if not cards:
+        return None
+    return max(
+        cards,
+        key=lambda card: (
+            _curse_choice_score(card),
+            -(_safe_int(card.get("index"), 9999) or 9999),
+        ),
+    )
+
+
 @dataclass(slots=True)
 class HttpCliProtocolConfig:
     """Transport and session settings for the HTTP CLI protocol."""
@@ -561,6 +627,20 @@ class HttpCliProtocol(FlowProtocol):
         ):
             return FlowAction("end_turn", {"_policy_allow_end_turn": True})
         if any(
+            token in lower_message
+            for token in (
+                "too many cards",
+                "play up to 3 cards",
+                "cannot play more than 3",
+                "max cards per turn",
+                "lazy",
+                "sloth",
+                "懒惰",
+                "最多打",
+            )
+        ):
+            return FlowAction("end_turn", {"_policy_allow_end_turn": True})
+        if any(
             token in message
             for token in (
                 "Buy relic failed",
@@ -578,10 +658,27 @@ class HttpCliProtocol(FlowProtocol):
         ):
             return FlowAction("leave_shop", {"_force_if_stuck": True})
         if "No pending card selection" in message:
-            return FlowAction("proceed")
+            return FlowAction("proceed", {"_force_if_stuck": True})
         if state.decision in ("map_node", "map_select") and "No pending card selection" in message:
-            return FlowAction("proceed")
+            return FlowAction("proceed", {"_force_if_stuck": True})
         return None
+
+    def should_resync_after_error(self, error_payload: Dict[str, Any], state: Optional[GameStateView] = None) -> bool:
+        message = str(error_payload.get("message") or "").lower()
+        if any(
+            token in message
+            for token in (
+                "no pending card selection",
+                "not in combat",
+                "invalid card index",
+                "cannot play card",
+                "card could not be played",
+            )
+        ):
+            return True
+        if state is not None and state.decision == "card_select" and "selection" in message:
+            return True
+        return False
 
     def sanitize_action(self, state: GameStateView, action: FlowAction, rng: Any) -> FlowAction:
         safe = FlowAction(action.name, dict(action.args))
@@ -834,6 +931,9 @@ class HttpCliProtocol(FlowProtocol):
             def _recommended_select_action() -> FlowAction | None:
                 if not state.cards:
                     return None
+                preferred_curse = _pick_preferred_curse_card(state)
+                if preferred_curse is not None:
+                    return FlowAction("select_cards", {"indices": str(preferred_curse.get("index", 0))})
                 if is_shop_context(state):
                     purge_targets = choose_purge_targets(state.cards, pick_count)
                     if len(purge_targets) >= pick_count:

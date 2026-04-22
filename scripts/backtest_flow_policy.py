@@ -564,6 +564,8 @@ def _run_single_seed(
     state: GameStateView | None = None
     initial_state: dict[str, Any] | None = None
     transitions: list[dict[str, Any]] = []
+    recovery_count = 0
+    resync_count = 0
     outcome: dict[str, Any] = {
         "seed": seed,
         "success": False,
@@ -587,6 +589,8 @@ def _run_single_seed(
         "act2_boss_clear": False,
         "act3_boss_attempt": False,
         "act3_boss_clear": False,
+        "recovery_count": 0,
+        "resync_count": 0,
     }
     if cache is not None:
         cached = cache.load(seed=seed, character=character)
@@ -621,12 +625,40 @@ def _run_single_seed(
                 outcome[f"act{previous_boss_act}_boss_attempt"] = True
             result = protocol.step(game_id, action)
             if result.status != "success":
+                recovery_count += 1
+                if protocol.should_resync_after_error(result.raw, state):
+                    try:
+                        raw_state = protocol.get_state(game_id)
+                        state = protocol.adapt_state(raw_state)
+                        invalid_progression = _invalid_progression_reason(state)
+                        if invalid_progression:
+                            outcome["error"] = invalid_progression
+                            break
+                        resync_count += 1
+                        steps += 1
+                        continue
+                    except Exception:
+                        pass
                 recover = protocol.recover_action_from_error(result.raw, state) or FlowAction("proceed")
                 action = protocol.sanitize_action(state, recover, rng)
                 before_hash = state_hash(state.raw)
                 previous_state = state
                 retry = protocol.step(game_id, action)
                 if retry.status != "success":
+                    recovery_count += 1
+                    if protocol.should_resync_after_error(retry.raw, state):
+                        try:
+                            raw_state = protocol.get_state(game_id)
+                            state = protocol.adapt_state(raw_state)
+                            invalid_progression = _invalid_progression_reason(state)
+                            if invalid_progression:
+                                outcome["error"] = invalid_progression
+                                break
+                            resync_count += 1
+                            steps += 1
+                            continue
+                        except Exception:
+                            pass
                     outcome["error"] = str(retry.message or result.message or "step_failed")
                     raw_state = result.last_state or state.raw
                     state = protocol.adapt_state(raw_state)
@@ -673,12 +705,14 @@ def _run_single_seed(
                 "max_act_floor": peak["floor"],
                 "max_global_floor": max_global_floor,
                 "final_hp": _final_hp(state) if state else 0,
+                "recovery_count": recovery_count,
+                "resync_count": resync_count,
             }
         )
         if state is not None and steps >= max_steps and not state.game_over:
             outcome["error"] = f"max_steps_exceeded:{max_steps}"
             outcome["success"] = False
-        if cache is not None and initial_state is not None and outcome.get("success"):
+        if cache is not None and initial_state is not None and outcome.get("success") and recovery_count == 0 and resync_count == 0:
             cache.store(
                 seed=seed,
                 character=character,

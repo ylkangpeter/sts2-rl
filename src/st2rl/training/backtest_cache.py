@@ -86,6 +86,18 @@ def source_digest(repo_root: Path) -> str:
     cli_root = repo_root.parent / "sts2-cli"
     if cli_root.exists():
         digest.update(_git_rev(cli_root).encode("utf-8"))
+        cli_paths = [
+            cli_root / "python" / "http_game_service.py",
+            cli_root / "src" / "Sts2Headless" / "RunSimulator.cs",
+        ]
+        for path in cli_paths:
+            digest.update(str(path.relative_to(cli_root)).encode("utf-8"))
+            digest.update(b"\0")
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<missing>")
+            digest.update(b"\0")
     return digest.hexdigest()[:16]
 
 

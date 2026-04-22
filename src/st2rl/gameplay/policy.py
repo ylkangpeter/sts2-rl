@@ -1502,6 +1502,10 @@ class SimpleFlowPolicy:
         return FlowAction("choose_option", {"option_index": enabled[0].get("index", 0)})
 
     def _pick_card_select_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
+        curse_choice = self._pick_preferred_curse_choice(state)
+        if curse_choice is not None:
+            return curse_choice
+
         indices = [str(card.get("index", i)) for i, card in enumerate(state.cards)]
         if not indices:
             return FlowAction("skip_select")
@@ -1526,6 +1530,70 @@ class SimpleFlowPolicy:
         if state.min_select == 0:
             return FlowAction("skip_select")
         return FlowAction("select_cards", {"indices": ",".join(indices[:pick_count])})
+
+    def _card_choice_text(self, card: dict[str, Any]) -> str:
+        return self._text(
+            " ".join(
+                str(card.get(key) or "")
+                for key in ("id", "card_id", "name", "description", "type")
+            )
+        )
+
+    def _is_curse_choice_state(self, state: GameStateView) -> bool:
+        cards = [card for card in state.cards if isinstance(card, dict)]
+        if not cards or state.min_select > 1:
+            return False
+        if len(cards) > 4:
+            return False
+        room_type = self._text((state.raw.get("context") or {}).get("room_type"))
+        if not any(token in room_type for token in ("monster", "elite", "boss", "combat")):
+            return False
+        curse_like = 0
+        for card in cards:
+            text = self._card_choice_text(card)
+            if self._text(card.get("type")) == "curse" or any(
+                token in text
+                for token in (
+                    "curse",
+                    "诅咒",
+                    "瓦解",
+                    "衰朽",
+                    "decay",
+                    "sloth",
+                    "lazy",
+                    "懒惰",
+                    "corruption",
+                    "腐化",
+                )
+            ):
+                curse_like += 1
+        return curse_like >= max(1, len(cards) - 1)
+
+    def _curse_choice_score(self, card: dict[str, Any]) -> float:
+        text = self._card_choice_text(card)
+        score = 0.0
+        if any(token in text for token in ("decay", "瓦解", "衰朽", "每回合结束时失去生命", "end of turn lose")):
+            score += 90.0
+        if any(token in text for token in ("sloth", "lazy", "懒惰", "每回合最多打3张", "最多打出3张", "play up to 3")):
+            score -= 180.0
+        if any(token in text for token in ("writhe", "心灵腐化", "corruption", "腐化")):
+            score -= 30.0
+        return score
+
+    def _pick_preferred_curse_choice(self, state: GameStateView) -> FlowAction | None:
+        if not self._is_curse_choice_state(state):
+            return None
+        cards = [card for card in state.cards if isinstance(card, dict)]
+        if not cards:
+            return None
+        best = max(
+            cards,
+            key=lambda card: (
+                self._curse_choice_score(card),
+                -self._safe_int(card.get("index"), 9999),
+            ),
+        )
+        return FlowAction("select_cards", {"indices": str(best.get("index", 0))})
 
     def _pick_bundle_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         if not state.bundles:

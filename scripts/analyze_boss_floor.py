@@ -218,6 +218,13 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
                 boss_rows.append(_combat_snapshot(previous, policy, action, step))
             result = protocol.step(game_id, action)
             if result.status != "success":
+                if protocol.should_resync_after_error(result.raw, state):
+                    try:
+                        raw_state = protocol.get_state(game_id)
+                        state = protocol.adapt_state(raw_state)
+                        continue
+                    except Exception:
+                        pass
                 recover = protocol.recover_action_from_error(result.raw, previous)
                 if recover is None:
                     error = str(result.message or "step_failed")
@@ -225,6 +232,13 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
                 action = protocol.sanitize_action(previous, recover, rng)
                 result = protocol.step(game_id, action)
                 if result.status != "success":
+                    if protocol.should_resync_after_error(result.raw, previous):
+                        try:
+                            raw_state = protocol.get_state(game_id)
+                            state = protocol.adapt_state(raw_state)
+                            continue
+                        except Exception:
+                            pass
                     error = str(result.message or "retry_failed")
                     break
             state = protocol.adapt_state(result.state or previous.raw)
