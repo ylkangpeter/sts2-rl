@@ -25,6 +25,18 @@ The `training client` and `game server` may each manage their own internal worke
   2. locate and fix the bug,
   3. restart the full runtime cleanly.
 
+## Protocol Timeout Guardrail
+
+- For `HttpCliProtocol` transport requests, keep the HTTP timeout cap at `10s` by default.
+- Do not relax or broaden this timeout cap without explicit operator approval.
+- When timeouts occur, prefer resync/retry/state-recovery fixes over increasing timeout limits.
+
+## Runtime Status Source Of Truth
+
+- Training/dashboard running-state checks must use live dashboard status (`/api/state` and actual dashboard page behavior) as the primary source of truth.
+- Do not conclude runtime is healthy/running from disk snapshots (`training_status.json`), stale PID fields, or cached history alone.
+- If disk status and live dashboard status disagree, treat live dashboard status as authoritative and surface the mismatch explicitly.
+
 ## Data Flow Expectations
 
 - Live dashboard data should primarily come from in-memory state and client/server HTTP communication.
@@ -94,6 +106,13 @@ Training is considered healthy only when all of the following hold:
   2. overall merged metrics should improve over baseline.
 - Evaluation is distribution-level, not per-seed mandatory dominance. Do not require every single seed to outperform baseline.
 - If any dataset regresses, rollback or retune before resuming long training.
+
+## High-Floor Boss/Elite Strategy Requirement
+
+- Policy optimization priority should focus on high-floor combat quality, especially elite and boss fights in Act 1/2/3.
+- Strategy design should be encounter-specific whenever possible: use explicit per-enemy (and phase/mechanic-aware) handling instead of only broad generic principles.
+- For combat-policy changes, include focused deterministic seed evidence that is relevant to the targeted elite/boss encounters, not only merged aggregate metrics.
+- Backtest review output should include targeted boss/elite slices so operators can verify whether encounter-specific handling is actually improving outcomes.
 
 ## Repository-Specific Notes
 

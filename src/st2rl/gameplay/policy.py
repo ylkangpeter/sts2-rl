@@ -79,10 +79,17 @@ class SimpleFlowPolicy:
         is_elite_room = "elite" in room_type
         is_boss_floor = floor >= 16 or is_boss_room
         is_act2_boss = act >= 2 and is_boss_floor
+        is_vantom = self._is_vantom_boss(state)
         is_ceremonial_beast = self._is_ceremonial_beast_boss(state)
         is_kin = self._is_kin_boss(state)
+        is_insatiable = self._is_insatiable_boss(state)
         is_knowledge_demon = self._is_knowledge_demon_boss(state)
+        is_crusher_rocket = self._is_crusher_rocket_boss(state)
         is_decimillipede = self._is_decimillipede_elite(state)
+        is_entomancer = self._is_entomancer_elite(state)
+        is_infested_prism = self._is_infested_prism_elite(state)
+        is_hard_act2_elite = act >= 2 and is_elite_room and (is_decimillipede or is_entomancer or is_infested_prism)
+        round_no = self._safe_int(state.round, 0)
         is_targeted_boss = is_boss_floor or is_act2_boss or is_ceremonial_beast or is_kin or is_knowledge_demon
         high_value_combat = is_targeted_boss or is_elite_room
         if is_targeted_boss and len(playable) > 1:
@@ -143,6 +150,96 @@ class SimpleFlowPolicy:
             ]
             if aggressive_playable:
                 playable = aggressive_playable
+
+        if is_crusher_rocket and round_no <= 2 and len(playable) > 1:
+            urgent_playable = [
+                card
+                for card in playable
+                if self._card_damage(card) > 0
+                or self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if urgent_playable:
+                playable = urgent_playable
+
+        if (is_crusher_rocket or is_insatiable) and round_no <= 3 and block_gap > 0 and len(playable) > 1:
+            survival_playable = [
+                card
+                for card in playable
+                if self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+                or (self._card_damage(card) > 0 and self._card_block(card) > 0)
+            ]
+            if survival_playable:
+                playable = survival_playable
+
+        if is_knowledge_demon and round_no <= 2 and block_gap > 0 and len(playable) > 1:
+            stable_playable = [
+                card
+                for card in playable
+                if self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if stable_playable:
+                playable = stable_playable
+
+        if (is_knowledge_demon or is_insatiable) and round_no <= 6 and block_gap > 0 and len(playable) > 1:
+            no_hp_loss_playable = [card for card in playable if self._card_hp_loss(card) <= 0]
+            if no_hp_loss_playable:
+                playable = no_hp_loss_playable
+
+        if (is_knowledge_demon or is_insatiable or is_crusher_rocket) and len(playable) > 1:
+            hard_safe_playable = [
+                card
+                for card in playable
+                if not self._should_hard_block_hp_loss_card(state, card, incoming_damage, block_gap)
+            ]
+            if hard_safe_playable:
+                playable = hard_safe_playable
+            elif any(self._card_hp_loss(card) > 0 for card in playable):
+                return FlowAction("end_turn", {"_policy_allow_end_turn": True})
+
+        if is_hard_act2_elite and round_no <= 2 and block_gap > 0 and len(playable) > 1:
+            tempo_playable = [
+                card
+                for card in playable
+                if self._card_damage(card) > 0
+                or self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if tempo_playable:
+                playable = tempo_playable
+
+        if (is_vantom or is_kin) and round_no <= 4 and len(playable) > 1 and block_gap <= max(6, int(state.hp * 0.18)):
+            aggressive_playable = [
+                card
+                for card in playable
+                if self._card_damage(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if aggressive_playable:
+                playable = aggressive_playable
+
+        if is_crusher_rocket and round_no <= 2 and block_gap >= max(6, int(state.hp * 0.2)):
+            block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                block_scores = [
+                    (
+                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * 4.0,
+                        card,
+                    )
+                    for card in block_playable
+                ]
+                _block_score, block_card = max(block_scores, key=lambda item: item[0])
+                args = {"card_index": block_card["index"]}
+                if card_needs_enemy_target(block_card):
+                    args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
+                return FlowAction("play_card", args)
 
         if is_targeted_boss and block_gap >= max(10, int(state.hp * 0.45)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
@@ -222,6 +319,19 @@ class SimpleFlowPolicy:
                 damage_playable = [item for item in playable if self._card_damage(item) > 0]
                 if damage_playable:
                     card = max(damage_playable, key=lambda item: self._combat_card_score(state, item) + self._card_damage(item) * 3.5)
+                else:
+                    return FlowAction("end_turn", {"_policy_allow_end_turn": True})
+            elif is_knowledge_demon or is_insatiable:
+                pressure_playable = [
+                    item
+                    for item in playable
+                    if self._card_damage(item) > 0
+                    or self._text(item.get("type")) == "power"
+                    or self._card_draw(item) > 0
+                    or self._card_energy_gain(item) > 0
+                ]
+                if pressure_playable:
+                    card = max(pressure_playable, key=lambda item: self._combat_card_score(state, item))
                 else:
                     return FlowAction("end_turn", {"_policy_allow_end_turn": True})
             else:
@@ -506,6 +616,35 @@ class SimpleFlowPolicy:
         is_boss_room = room_type == "boss" or "boss" in room_type
         return act, floor, room_type, is_boss_room
 
+    def _upcoming_boss_key(self, state: GameStateView) -> str:
+        context = state.raw.get("context") or {}
+        boss = context.get("boss")
+        parts: list[str] = []
+        if isinstance(boss, dict):
+            parts.extend(
+                str(boss.get(key) or "")
+                for key in ("id", "name", "boss_id", "boss_name")
+            )
+        parts.extend(
+            str(context.get(key) or "")
+            for key in ("boss_id", "boss_name")
+        )
+        return self._text(" ".join(parts))
+
+    def _is_hard_act1_boss_context(self, state: GameStateView) -> bool:
+        key = self._upcoming_boss_key(state)
+        return any(
+            token in key
+            for token in (
+                "vantom",
+                "kin",
+                "ceremonial",
+                "墨影",
+                "同族",
+                "仪式兽",
+            )
+        )
+
     def _should_avoid_hp_loss_energy_card(self, state: GameStateView, card: dict[str, Any], block_gap: int) -> bool:
         hp_loss = self._card_hp_loss(card)
         if hp_loss <= 0:
@@ -614,6 +753,47 @@ class SimpleFlowPolicy:
             return True
         return False
 
+    def _should_hard_block_hp_loss_card(
+        self,
+        state: GameStateView,
+        card: dict[str, Any],
+        incoming_damage: int,
+        block_gap: int,
+    ) -> bool:
+        hp_loss = self._card_hp_loss(card)
+        if hp_loss <= 0:
+            return False
+        is_knowledge_demon = self._is_knowledge_demon_boss(state)
+        is_insatiable = self._is_insatiable_boss(state)
+        is_crusher_rocket = self._is_crusher_rocket_boss(state)
+        if not (is_knowledge_demon or is_insatiable or is_crusher_rocket):
+            return False
+
+        round_no = self._safe_int(state.round, 0)
+        if state.hp <= hp_loss + 10:
+            return True
+        if block_gap > 0 and state.hp <= max(30, int(state.max_hp * 0.7)):
+            return True
+        if is_knowledge_demon and round_no >= 5:
+            return True
+        if is_insatiable and round_no >= 4 and state.hp <= max(36, int(state.max_hp * 0.78)):
+            return True
+        if is_crusher_rocket and round_no <= 3 and block_gap > 0:
+            return True
+
+        card_id = str(card.get("id") or "").strip().upper()
+        if card_id in {"CARD.BLOODLETTING", "CARD.OFFERING"}:
+            followup_count, spendable_cost = self._playable_followup_pressure(state, card)
+            if block_gap > 0:
+                return True
+            if followup_count < 3 or spendable_cost <= state.energy:
+                return True
+            if incoming_damage > 0 and round_no >= 4:
+                return True
+            if state.hp <= max(40, int(state.max_hp * 0.72)):
+                return True
+        return False
+
     def _enemy_key(self, state: GameStateView) -> str:
         return " ".join(
             self._text(enemy.get("id") or enemy.get("name") or "")
@@ -648,9 +828,37 @@ class SimpleFlowPolicy:
         key = self._enemy_key(state)
         return "knowledge_demon" in key or "knowledge demon" in key or "知识恶魔" in key
 
+    def _is_crusher_rocket_boss(self, state: GameStateView) -> bool:
+        key = self._enemy_key(state)
+        return ("crusher" in key and "rocket" in key) or "粉碎者" in key or "火箭" in key
+
     def _is_decimillipede_elite(self, state: GameStateView) -> bool:
         key = self._enemy_key(state)
         return "decimillipede" in key or "segment_front" in key or "segment_middle" in key or "segment_back" in key
+
+    def _is_entomancer_elite(self, state: GameStateView) -> bool:
+        key = self._enemy_key(state)
+        return "entomancer" in key or "虫术" in key
+
+    def _is_infested_prism_elite(self, state: GameStateView) -> bool:
+        key = self._enemy_key(state)
+        return "infested_prism" in key or "infested prism" in key or "棱镜" in key
+
+    def _enemy_power_amount(self, state: GameStateView, *tokens: str) -> int:
+        lookup = tuple(self._text(token) for token in tokens if token)
+        if not lookup:
+            return 0
+        best = 0
+        for enemy in state.living_enemies():
+            for power in enemy.get("powers") or []:
+                if not isinstance(power, dict):
+                    continue
+                power_key = self._text(power.get("id") or power.get("name"))
+                if not any(token in power_key for token in lookup):
+                    continue
+                amount = self._safe_int(power.get("amount"), 0)
+                best = max(best, amount if amount > 0 else 1)
+        return best
 
     def _sandpit_turns(self, state: GameStateView) -> int:
         for enemy in state.living_enemies():
@@ -810,6 +1018,18 @@ class SimpleFlowPolicy:
             score += 6.0
         return score
 
+    def _is_enemy_target_type(self, target_type: Any) -> bool:
+        text = self._text(target_type)
+        return (
+            "enemy" in text
+            or "enemie" in text
+            or "anyenemy" in text
+            or "allenemy" in text
+            or "allenemies" in text
+            or "all_enemy" in text
+            or "敌人" in text
+        )
+
     def _is_known_boss_setup_potion(self, potion: dict[str, Any]) -> bool:
         potion_id = str(potion.get("id") or "").strip().upper()
         return potion_id in {
@@ -839,6 +1059,17 @@ class SimpleFlowPolicy:
         is_boss_floor = floor >= 16 or is_boss_room
         is_act2_boss = act >= 2 and is_boss_floor
         is_elite_room = "elite" in room_type
+        is_vantom = self._is_vantom_boss(state)
+        is_kin = self._is_kin_boss(state)
+        is_ceremonial_beast = self._is_ceremonial_beast_boss(state)
+        is_insatiable = self._is_insatiable_boss(state)
+        is_knowledge_demon = self._is_knowledge_demon_boss(state)
+        is_crusher_rocket = self._is_crusher_rocket_boss(state)
+        is_decimillipede = self._is_decimillipede_elite(state)
+        is_entomancer = self._is_entomancer_elite(state)
+        is_infested_prism = self._is_infested_prism_elite(state)
+        is_hard_act2_elite = act >= 2 and is_elite_room and (is_decimillipede or is_entomancer or is_infested_prism)
+        is_hard_act1_boss = act <= 1 and (is_vantom or is_kin or is_ceremonial_beast)
         high_value_combat = is_boss_floor or is_elite_room
         late_act_pressure = floor >= 13
         early_boss_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
@@ -855,7 +1086,7 @@ class SimpleFlowPolicy:
             if potion_id == "POTION.DISTILLED_CHAOS":
                 continue
             target_type = self._text(potion.get("target_type"))
-            if "enemy" in target_type:
+            if self._is_enemy_target_type(target_type):
                 continue
 
             block_amount = self._potion_block_amount(potion)
@@ -960,7 +1191,7 @@ class SimpleFlowPolicy:
             if potion_id == "POTION.DISTILLED_CHAOS":
                 continue
             target_type = self._text(potion.get("target_type"))
-            if "enemy" not in target_type:
+            if not self._is_enemy_target_type(target_type):
                 continue
             potion_damage = self._potion_damage_amount(potion)
             if potion_damage <= 0:
@@ -996,7 +1227,7 @@ class SimpleFlowPolicy:
             if potion_id == "POTION.DISTILLED_CHAOS":
                 continue
             target_type = self._text(potion.get("target_type"))
-            if "enemy" not in target_type:
+            if not self._is_enemy_target_type(target_type):
                 continue
             if self._potion_damage_amount(potion) > 0:
                 continue
@@ -1024,6 +1255,12 @@ class SimpleFlowPolicy:
             or (not high_value_combat and hp_ratio < 0.35 and best_attack_choice[0] >= 35.0)
             or (high_value_combat and hp_ratio < 0.35)
             or (high_value_combat and best_attack_choice[0] >= 35.0)
+            or (is_hard_act1_boss and early_boss_turn and best_attack_choice[0] >= 20.0)
+            or (is_act2_boss and early_boss_turn and best_attack_choice[0] >= 22.0)
+            or (is_crusher_rocket and early_boss_turn and best_attack_choice[0] >= 16.0)
+            or (is_hard_act2_elite and early_high_value_turn and best_attack_choice[0] >= 18.0)
+            or (is_knowledge_demon and early_boss_turn and best_attack_choice[0] >= 18.0)
+            or (is_insatiable and early_boss_turn and best_attack_choice[0] >= 18.0)
             or (early_high_value_turn and self._potion_damage_amount(best_attack_choice[1]) >= 10)
         ):
             args = {"potion_index": best_attack_choice[1].get("index", 0)}
@@ -1036,6 +1273,9 @@ class SimpleFlowPolicy:
             or (high_value_combat and block_gap >= 8)
             or (is_act2_boss and block_gap >= 5 and hp_ratio < 0.85)
             or (is_boss_floor and block_gap >= 6 and hp_ratio < 0.8)
+            or (is_hard_act1_boss and early_boss_turn and block_gap >= 4)
+            or (is_crusher_rocket and early_boss_turn and block_gap >= 4)
+            or (is_hard_act2_elite and block_gap >= 6)
         ):
             args = {"potion_index": best_debuff_choice[1].get("index", 0)}
             if "all" not in self._text(best_debuff_choice[1].get("target_type")) and best_debuff_choice[2] is not None:
@@ -1066,6 +1306,10 @@ class SimpleFlowPolicy:
             incoming_damage >= state.hp
             or (high_value_combat and best_self_choice[0] >= 22.0)
             or (early_high_value_turn and best_self_choice[0] >= 16.0)
+            or (is_hard_act1_boss and early_boss_turn and best_self_choice[0] >= 14.0 and block_gap <= 8)
+            or (is_act2_boss and early_boss_turn and best_self_choice[0] >= 13.0 and block_gap >= 4)
+            or (is_crusher_rocket and early_boss_turn and best_self_choice[0] >= 12.0)
+            or (is_hard_act2_elite and early_high_value_turn and best_self_choice[0] >= 12.0 and block_gap >= 4)
         ):
             return FlowAction("use_potion", {"potion_index": best_self_choice[1].get("index", 0)})
 
@@ -1104,6 +1348,31 @@ class SimpleFlowPolicy:
     ) -> dict[str, Any]:
         damage = self._card_damage(card)
         _, floor, room_type, is_boss_room = self._combat_context(state)
+        round_no = self._safe_int(state.round, 0)
+        if floor >= 16 and is_boss_room and self._is_crusher_rocket_boss(state) and len(enemies) > 1 and damage > 0:
+            def duo_target_score(enemy: dict[str, Any]) -> tuple[float, int, int, int]:
+                enemy_id = self._text(enemy.get("id") or enemy.get("name"))
+                is_rocket = 1 if "rocket" in enemy_id or "火箭" in enemy_id else 0
+                is_crusher = 1 if "crusher" in enemy_id or "粉碎者" in enemy_id else 0
+                effective_hp = self._enemy_effective_hp(enemy)
+                lethal = 1 if damage >= effective_hp else 0
+                threat = self._enemy_threat(enemy)
+                round_bias = 0
+                if round_no <= 3:
+                    if is_rocket:
+                        round_bias += 55
+                    if is_crusher:
+                        round_bias += 10
+                elif is_rocket:
+                    round_bias += 35
+                return (
+                    lethal * 8000.0 + threat * 42.0 + round_bias + min(damage, effective_hp) * 4.0 - effective_hp * 2.8,
+                    threat,
+                    -effective_hp,
+                    -self._safe_int(enemy.get("index"), 0),
+                )
+
+            return max(enemies, key=duo_target_score)
         if "elite" in room_type and self._is_decimillipede_elite(state) and len(enemies) > 1 and damage > 0:
             def segment_target_score(enemy: dict[str, Any]) -> tuple[int, int, int, int, int]:
                 enemy_id = self._text(enemy.get("id") or enemy.get("name"))
@@ -1177,7 +1446,13 @@ class SimpleFlowPolicy:
         is_ceremonial_beast = self._is_ceremonial_beast_boss(state)
         is_kin = self._is_kin_boss(state)
         is_knowledge_demon = self._is_knowledge_demon_boss(state)
+        is_crusher_rocket = self._is_crusher_rocket_boss(state)
         is_decimillipede = self._is_decimillipede_elite(state)
+        is_entomancer = self._is_entomancer_elite(state)
+        is_infested_prism = self._is_infested_prism_elite(state)
+        is_hard_act2_elite = act >= 2 and is_elite_room and (is_decimillipede or is_entomancer or is_infested_prism)
+        is_hard_act1_boss = act <= 1 and (is_vantom or is_kin or is_ceremonial_beast)
+        vantom_slippery = is_vantom and self._enemy_power_amount(state, "slippery", "滑溜") > 0
         is_targeted_boss = is_boss_floor or is_act2_boss or is_ceremonial_beast or is_kin or is_knowledge_demon
         high_value_combat = is_targeted_boss or is_elite_room
         round_no = self._safe_int(state.round, 0)
@@ -1230,10 +1505,29 @@ class SimpleFlowPolicy:
                         score += 12.0
             if is_vantom:
                 score += damage * 2.2
+                if vantom_slippery:
+                    if cost >= 2 and damage >= 10:
+                        score -= damage * 5.0 + 35.0
+                    elif cost <= 1:
+                        score += 8.0
+                    if card_id in {"CARD.BLUDGEON", "CARD.HEAVY_BLADE", "CARD.PERFECTED_STRIKE"}:
+                        score -= 60.0
             if is_knowledge_demon and round_no <= 2:
                 score += damage * 1.1
             if is_decimillipede:
                 score += damage * 0.85
+            if is_hard_act2_elite and round_no <= 3:
+                score += damage * 0.9 + 4.0
+            if is_crusher_rocket:
+                if round_no <= 2:
+                    if block_gap > 0 and not can_lethal_now:
+                        score += damage * 0.45 - 4.0
+                    else:
+                        score += damage * 1.15 + 6.0
+                else:
+                    score += damage * 0.55
+            if is_hard_act1_boss and round_no <= 4:
+                score += damage * 1.05 + 5.0
             if damage >= lowest_enemy_ehp:
                 score += 18.0
             if "vulnerable" in description or "易伤" in description:
@@ -1253,10 +1547,20 @@ class SimpleFlowPolicy:
                 score -= min(block, 12) * 1.2
             if is_knowledge_demon and incoming_damage <= 0 and round_no <= 2 and damage <= 0:
                 score -= min(block, 14) * 1.8
+            if is_hard_act2_elite and block_gap > 0:
+                score += min(block, block_gap) * 0.95
+            if is_crusher_rocket and round_no <= 2 and block_gap > 0:
+                score += min(block, block_gap) * 3.1 + 4.0
+            if is_hard_act1_boss and round_no <= 4 and incoming_damage <= state.block + 6 and damage <= 0:
+                score -= min(block, 16) * 2.0
             current_projected_hp = state.hp + state.block - incoming_damage
             projected_hp_after_block = state.hp + state.block + block - incoming_damage
             prevented = max(0, min(block, incoming_damage - state.block))
             score += prevented * 1.8
+            if is_hard_act2_elite and prevented > 0:
+                score += prevented * 1.35
+            if is_crusher_rocket and round_no <= 2 and prevented > 0:
+                score += prevented * 3.2
             if incoming_damage > 0 and projected_hp_after_block > current_projected_hp:
                 score += 2.0
             if current_projected_hp <= 0 < projected_hp_after_block:
@@ -1280,6 +1584,12 @@ class SimpleFlowPolicy:
             score += self._guaranteed_draw_followup_bonus(state, card)
             if is_knowledge_demon and round_no <= 2:
                 score += min(draw_amount, 3) * 2.2
+            if is_hard_act2_elite and round_no <= 2:
+                score += min(draw_amount, 3) * 1.6
+            if is_crusher_rocket and round_no <= 2 and block_gap > 0:
+                score += min(draw_amount, 3) * 2.6
+            if is_hard_act1_boss and round_no <= 3:
+                score += min(draw_amount, 3) * 1.9
             if is_boss_floor and cost <= 1 and state.energy >= cost:
                 followup_count, spendable_cost = self._playable_followup_pressure(state, card)
                 if followup_count >= 2 and spendable_cost > max(0, state.energy - cost):
@@ -1300,6 +1610,12 @@ class SimpleFlowPolicy:
             score += usable_energy * 4.0 + min(followup_count, 4) * 0.8
             if is_knowledge_demon and round_no <= 2 and incoming_damage <= 0:
                 score += usable_energy * 4.0 + min(followup_count, 4) * 1.8
+            if is_hard_act2_elite and round_no <= 2:
+                score += usable_energy * 1.9 + min(followup_count, 4) * 0.9
+            if is_crusher_rocket and round_no <= 2:
+                score += usable_energy * 2.8 + min(followup_count, 4) * 1.3
+            if is_hard_act1_boss and round_no <= 3 and incoming_damage <= state.block + 6:
+                score += usable_energy * 2.8 + min(followup_count, 4) * 1.2
             if is_boss_floor and cost == 0 and usable_energy > 0:
                 score += 12.0 + usable_energy * 3.0
             if is_boss_floor and usable_energy > 0 and spendable_cost >= state.energy + 2:
@@ -1322,6 +1638,16 @@ class SimpleFlowPolicy:
             absolute_hp_floor = hp_loss + (8 if is_boss_floor else 6)
             if state.hp <= absolute_hp_floor and not lethal_pressure:
                 score -= 45.0
+            if is_insatiable and round_no <= 6:
+                score -= hp_loss * 4.4
+            if is_knowledge_demon and round_no <= 6:
+                score -= hp_loss * (4.2 if block_gap > 0 else 2.6)
+            if (is_knowledge_demon or is_insatiable) and round_no >= 5:
+                score -= hp_loss * 8.5 + 24.0
+                if block_gap > 0:
+                    score -= 26.0
+            if is_crusher_rocket and round_no <= 3:
+                score -= hp_loss * 5.8 + 10.0
             if energy_gain > 0:
                 followup_count, spendable_cost = self._playable_followup_pressure(state, card)
                 can_convert_hp = followup_count >= 2 and spendable_cost > state.energy
@@ -1383,8 +1709,31 @@ class SimpleFlowPolicy:
                     score -= 3.0
             if is_vantom:
                 score += 5.0
+            if is_hard_act2_elite and round_no <= 3:
+                score += 5.5
+            if is_crusher_rocket and round_no <= 2:
+                if block_gap > 0 and not can_lethal_now:
+                    score -= 8.0
+                else:
+                    score += 4.0
+            if is_hard_act1_boss and round_no <= 4:
+                score += 6.0
         elif card_type == "skill":
             score += 0.5
+            if is_hard_act2_elite and round_no <= 2 and block_gap > 0 and damage <= 0 and block <= 0:
+                score -= 6.0
+            if (
+                is_crusher_rocket
+                and round_no <= 2
+                and block_gap >= 6
+                and damage <= 0
+                and block <= 0
+                and draw_amount <= 0
+                and energy_gain <= 0
+            ):
+                score -= 16.0
+            if is_hard_act1_boss and round_no <= 4 and incoming_damage <= state.block + 6 and damage <= 0:
+                score -= 6.0
         elif card_type == "power":
             if lethal_pressure:
                 score -= 12.0
@@ -1394,6 +1743,14 @@ class SimpleFlowPolicy:
                 score += 2.0 if state.round in (None, 1, 2, 3) else -1.0
             if is_ceremonial_beast and 1 <= round_no <= 3 and incoming_damage <= 22:
                 score += 8.0
+            if is_insatiable and round_no <= 2 and incoming_damage <= 0:
+                score += 4.0
+            if is_hard_act2_elite and round_no <= 2 and block_gap >= 6 and damage <= 0:
+                score -= 12.0
+            if is_crusher_rocket and round_no <= 2 and block_gap >= 4 and damage <= 0:
+                score -= 20.0
+            if is_hard_act1_boss and round_no <= 2 and incoming_damage > state.block + 6 and damage <= 0:
+                score -= 12.0
             if is_boss_floor and not lethal_pressure:
                 if state.round in (None, 1, 2):
                     score += 11.0
@@ -1448,6 +1805,25 @@ class SimpleFlowPolicy:
                     score += 45.0
                 else:
                     score -= 22.0
+            if is_knowledge_demon:
+                hard_block = (
+                    block_gap > 0
+                    or hp_ratio < 0.68
+                    or followup_count < 3
+                    or spendable_cost <= state.energy
+                    or (incoming_damage <= 0 and round_no >= 5)
+                )
+                if hard_block:
+                    return -400.0
+            if is_crusher_rocket or is_insatiable:
+                hard_block = (
+                    block_gap > 0
+                    or state.hp <= max(40, int(state.max_hp * 0.7))
+                    or followup_count < 3
+                    or spendable_cost <= state.energy
+                )
+                if hard_block:
+                    return -260.0
             if is_ceremonial_beast or is_kin:
                 hard_block = (
                     block_gap > 0
@@ -1482,6 +1858,10 @@ class SimpleFlowPolicy:
                 score -= 16.0 + min(block_gap, 20) * 0.9
                 if is_ceremonial_beast and hp_ratio < 0.45:
                     score -= 22.0
+                if is_crusher_rocket and round_no <= 3:
+                    score -= 18.0
+                if is_insatiable and round_no <= 6:
+                    score -= 8.0
             if damage <= 0 and block <= 0 and hp_loss <= 0 and card_type != "power":
                 score -= 18.0
             if cost >= 2 and damage > 0 and block <= 0 and not can_lethal_now:
@@ -1578,6 +1958,7 @@ class SimpleFlowPolicy:
         heal_threshold = self.config.rest_heal_threshold
         floor = self._safe_int((state.raw.get("context") or {}).get("floor"), 0)
         act = self._safe_int((state.raw.get("context") or {}).get("act"), 0)
+        hard_act1_boss = act == 1 and self._is_hard_act1_boss_context(state)
         if act >= 2:
             heal_threshold = max(heal_threshold, 0.82)
             if floor >= 12:
@@ -1588,6 +1969,8 @@ class SimpleFlowPolicy:
             heal_threshold = max(heal_threshold, 0.88)
         elif floor >= 12:
             heal_threshold = max(heal_threshold, 0.72)
+        if hard_act1_boss:
+            heal_threshold = max(heal_threshold, 0.9 if floor < 14 else 0.93)
         if hp_ratio < max(0.4, heal_threshold):
             heal = next(
                 (

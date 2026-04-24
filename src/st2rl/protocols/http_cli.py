@@ -378,21 +378,19 @@ class HttpCliProtocol(FlowProtocol):
 
     def __init__(self, config: HttpCliProtocolConfig | None = None):
         self.config = config or HttpCliProtocolConfig()
-        self._session_local = threading.local()
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+        self._session_lock = threading.Lock()
+        self._pending_event_select: dict[str, Any] | None = None
         self._start_lock = threading.Lock()
 
     def _get_session(self) -> requests.Session:
-        session = getattr(self._session_local, "session", None)
-        if session is None:
-            session = requests.Session()
-            adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            self._session_local.session = session
-        return session
+        return self._session
 
     def _clear_pending_event_select(self) -> None:
-        self._session_local.pending_event_select = None
+        self._pending_event_select = None
 
     def _remember_pending_event_select(self, state: GameStateView, action: FlowAction) -> None:
         if action.name != "choose_option":
@@ -409,13 +407,13 @@ class HttpCliProtocol(FlowProtocol):
             str(selected.get(key) or "")
             for key in ("option_id", "name", "label", "title", "description", "text_key")
         ).lower()
-        self._session_local.pending_event_select = {
+        self._pending_event_select = {
             "floor": _safe_int((state.raw.get("context") or {}).get("floor"), 0),
             "text": text,
         }
 
     def _pending_event_select_text(self, state: GameStateView) -> str:
-        pending = getattr(self._session_local, "pending_event_select", None)
+        pending = self._pending_event_select
         if not isinstance(pending, dict):
             return ""
         current_floor = _safe_int((state.raw.get("context") or {}).get("floor"), 0)
@@ -439,12 +437,13 @@ class HttpCliProtocol(FlowProtocol):
             response: Optional[requests.Response] = None
             try:
                 timeout = max(1, min(int(self.config.timeout_seconds), 10))
-                if method == "GET":
-                    response = session.get(url, timeout=timeout)
-                elif method == "POST":
-                    response = session.post(url, json=payload, timeout=timeout)
-                else:
-                    raise ValueError(f"Unsupported method: {method}")
+                with self._session_lock:
+                    if method == "GET":
+                        response = session.get(url, timeout=timeout)
+                    elif method == "POST":
+                        response = session.post(url, json=payload, timeout=timeout)
+                    else:
+                        raise ValueError(f"Unsupported method: {method}")
 
                 try:
                     data = response.json()
@@ -673,6 +672,20 @@ class HttpCliProtocol(FlowProtocol):
                 "invalid card index",
                 "cannot play card",
                 "card could not be played",
+            )
+        ):
+            return True
+        if any(
+            token in message
+            for token in (
+                "timed out",
+                "timeout",
+                "request failed",
+                "connection refused",
+                "connection reset",
+                "connection aborted",
+                "read timed out",
+                "connect timeout",
             )
         ):
             return True

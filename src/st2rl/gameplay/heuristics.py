@@ -789,6 +789,16 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
     context = state.raw.get("context") or {}
     floor = _safe_int(context.get("floor") or state.raw.get("floor"), 0)
     act = _safe_int(context.get("act") or state.raw.get("act"), 1) or 1
+    boss_payload = context.get("boss")
+    boss_text_parts: list[str] = []
+    if isinstance(boss_payload, dict):
+        boss_text_parts.extend(str(boss_payload.get(key) or "") for key in ("id", "name", "boss_id", "boss_name"))
+    boss_text_parts.extend(str(context.get(key) or "") for key in ("boss_id", "boss_name"))
+    boss_key = _text(" ".join(boss_text_parts))
+    hard_act1_boss = act == 1 and any(
+        token in boss_key
+        for token in ("vantom", "kin", "ceremonial", "墨影", "同族", "仪式兽")
+    )
     hp_ratio = state.hp / max(1, state.max_hp)
     deck = [card for card in (state.player.get("deck") or []) if isinstance(card, dict)]
     elite_readiness = estimate_elite_readiness(deck, hp_ratio, floor)
@@ -867,6 +877,10 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value -= 2.6
             if floor >= 13 and hp_ratio < 0.9:
                 value -= 3.0
+            if hard_act1_boss and floor >= 9:
+                value -= 2.2
+            if hard_act1_boss and floor >= 12 and hp_ratio < 0.92:
+                value -= 2.0
         elif "rest" in room or "camp" in room or room == "r":
             value = 4.4 if hp_ratio < 0.6 else (3.4 if hp_ratio < 0.8 else 1.15)
             if act == 2:
@@ -875,6 +889,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value += 2.35
             if floor >= 14:
                 value += 1.35
+            if hard_act1_boss and floor >= 10:
+                value += 1.45 if hp_ratio < 0.92 else 0.7
         elif "shop" in room or room in {"merchant", "$", "s"}:
             value = 2.65 if state.gold >= 150 else (0.35 if state.gold < 110 else 1.95)
             if purge_target is not None and state.gold >= 75:
@@ -885,6 +901,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value += 0.75
             if act == 2 and state.gold >= 100:
                 value += 0.85
+            if hard_act1_boss and floor >= 10 and hp_ratio < 0.9:
+                value += 0.9
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
@@ -913,6 +931,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value -= 1.35
             if floor >= 14 and hp_ratio < 0.85:
                 value -= 1.1
+            if hard_act1_boss and floor >= 11 and hp_ratio < 0.9:
+                value -= 0.95
         elif "boss" in room or room == "b":
             value = 4.0
         else:
@@ -932,6 +952,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             value -= 2.5
             if hp_ratio < 0.97:
                 value -= 3.5
+        if hard_act1_boss and has_elite_next and floor >= 10:
+            value -= 1.8
         if any("elite" in next_room for next_room in next_rooms) and ("rest" in room or "shop" in room):
             value += 0.35
         if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):

@@ -31,6 +31,8 @@
     .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
     .card { background:linear-gradient(180deg,var(--panel-strong),var(--panel)); border:1px solid var(--line); border-radius:16px; padding:14px 16px; box-shadow:var(--shadow); }
     .card.wide { grid-column:1 / -1; }
+    .dist-wrap { margin-top:10px; border:1px solid var(--line-soft); border-radius:12px; background:rgba(0,0,0,0.12); padding:8px; overflow:auto; }
+    .dist-empty { color:var(--muted); padding:10px 4px; }
     .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
     .value { font-size:28px; font-weight:800; margin-top:6px; color:var(--accent); }
     .sub { color:var(--muted); margin-top:4px; }
@@ -549,6 +551,7 @@
         { label: 'Trend', value: kpi(trend.recent_floor_mean ?? '-', trend.degrading ? 'metric-warn' : 'metric-good'), sub: `Prev floor ${kpi(trend.previous_floor_mean ?? '-')} | Delta ${kpi(trend.floor_delta ?? '-', trend.degrading ? 'metric-warn' : 'metric-good')}` },
         { label: 'Resume', value: kpi(resumeStatus, t.resume_load_status === 'fallback_fresh' ? 'metric-warn' : 'metric-good'), sub: `${resumePath}${resumeFailure}` },
         { label: 'Health', value: kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), sub: `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}` },
+        { label: 'Floor Distribution', value: kpi((monitoring.floor_distribution || {}).total ?? 0, 'metric-good'), sub: renderFloorDistribution(monitoring.floor_distribution || {}), className: 'wide' },
         { label: 'Memory (All Processes)', value: kpi(fmtMb(resources.total_working_set_mb)), sub: memoryCardSub, className: 'wide' },
       ];
       return cards.map((card) => `<div class="card ${card.className || ''}"><div class="label">${card.label}</div><div class="value">${card.value}</div><div class="sub">${card.sub}</div></div>`).join('');
@@ -569,6 +572,85 @@
         return `${x},${y}`;
       }).join(' ');
       return `<svg width="220" height="54" viewBox="0 0 220 54"><polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" /></svg>`;
+    }
+    function renderFloorDistribution(distribution) {
+      const points = Array.isArray(distribution?.points) ? distribution.points : [];
+      if (!points.length) return '<div class="dist-empty">No completed episodes yet.</div>';
+      const width = 1160;
+      const height = 280;
+      const padLeft = 56;
+      const padRight = 22;
+      const padTop = 14;
+      const padBottom = 34;
+      const plotWidth = width - padLeft - padRight;
+      const plotHeight = height - padTop - padBottom;
+      const maxFloor = Math.max(1, Number(distribution?.max_floor || points.length));
+      const maxCount = Math.max(1, ...points.map((item) => Number(item?.count || 0)));
+      const xOf = (floor) => {
+        if (maxFloor <= 1) return padLeft;
+        return padLeft + ((Number(floor) - 1) / (maxFloor - 1)) * plotWidth;
+      };
+      const yOf = (count) => padTop + plotHeight - (Number(count) / maxCount) * plotHeight;
+      const barWidth = Math.max(2, Math.min(16, plotWidth / Math.max(1, points.length) - 1));
+      const actColor = (floor) => {
+        const f = Number(floor || 0);
+        if (f <= 17) return { fill: 'rgba(108,192,139,0.78)', stroke: 'rgba(108,192,139,0.98)', label: 'Act1' };
+        if (f <= 34) return { fill: 'rgba(225,177,90,0.78)', stroke: 'rgba(225,177,90,0.98)', label: 'Act2' };
+        if (f <= 51) return { fill: 'rgba(127,185,255,0.78)', stroke: 'rgba(127,185,255,0.98)', label: 'Act3' };
+        return { fill: 'rgba(222,115,115,0.78)', stroke: 'rgba(222,115,115,0.98)', label: 'Act4+' };
+      };
+      const bars = points.map((item) => {
+        const floor = Number(item?.floor || 0);
+        const count = Number(item?.count || 0);
+        const x = xOf(floor) - barWidth / 2;
+        const y = yOf(count);
+        const h = Math.max(0, padTop + plotHeight - y);
+        const color = actColor(floor);
+        return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${h.toFixed(2)}" fill="${color.fill}" stroke="${color.stroke}" />`;
+      }).join('');
+      const yTicks = 5;
+      const yGuides = Array.from({ length: yTicks + 1 }, (_, index) => {
+        const count = Math.round((maxCount * (yTicks - index)) / yTicks);
+        const y = yOf(count);
+        return `<g>
+          <line x1="${padLeft}" y1="${y.toFixed(2)}" x2="${(padLeft + plotWidth).toFixed(2)}" y2="${y.toFixed(2)}" stroke="rgba(154,165,180,0.25)" stroke-width="1" />
+          <text x="${padLeft - 8}" y="${(y + 4).toFixed(2)}" fill="#9aa5b4" text-anchor="end" font-size="11">${count}</text>
+        </g>`;
+      }).join('');
+      const xTicks = [];
+      for (let floor = 1; floor <= maxFloor; floor += 5) xTicks.push(floor);
+      if (xTicks[xTicks.length - 1] !== maxFloor) xTicks.push(maxFloor);
+      const xLabels = xTicks.map((floor) => {
+        const x = xOf(floor);
+        return `<g>
+          <line x1="${x.toFixed(2)}" y1="${(padTop + plotHeight).toFixed(2)}" x2="${x.toFixed(2)}" y2="${(padTop + plotHeight + 5).toFixed(2)}" stroke="#9aa5b4" stroke-width="1" />
+          <text x="${x.toFixed(2)}" y="${(padTop + plotHeight + 18).toFixed(2)}" fill="#9aa5b4" text-anchor="middle" font-size="11">${floor}</text>
+        </g>`;
+      }).join('');
+      const actMarkers = (Array.isArray(distribution?.act_markers) ? distribution.act_markers : []).map((marker, idx) => {
+        const x = xOf(marker);
+        const color = actColor(marker);
+        return `<g>
+          <line x1="${x.toFixed(2)}" y1="${padTop}" x2="${x.toFixed(2)}" y2="${(padTop + plotHeight).toFixed(2)}" stroke="${color.stroke}" stroke-width="1.5" stroke-dasharray="5 4" />
+          <text x="${(x + 4).toFixed(2)}" y="${(padTop + 14 + idx * 14).toFixed(2)}" fill="${color.stroke}" font-size="11">A${idx + 1} End (${marker})</text>
+        </g>`;
+      }).join('');
+      const total = Number(distribution?.total || 0);
+      return `
+        <div class="sub">Completed episodes: ${total} | Max floor seen: ${maxFloor} | <span class="pill" style="background:rgba(108,192,139,0.18);color:#6cc08b">Act1</span> <span class="pill" style="background:rgba(225,177,90,0.18);color:#e1b15a">Act2</span> <span class="pill" style="background:rgba(127,185,255,0.18);color:#7fb9ff">Act3</span> <span class="pill" style="background:rgba(222,115,115,0.18);color:#de7373">Act4+</span></div>
+        <div class="dist-wrap">
+          <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+            ${yGuides}
+            <line x1="${padLeft}" y1="${padTop}" x2="${padLeft}" y2="${(padTop + plotHeight).toFixed(2)}" stroke="#9aa5b4" stroke-width="1.2" />
+            <line x1="${padLeft}" y1="${(padTop + plotHeight).toFixed(2)}" x2="${(padLeft + plotWidth).toFixed(2)}" y2="${(padTop + plotHeight).toFixed(2)}" stroke="#9aa5b4" stroke-width="1.2" />
+            ${actMarkers}
+            ${bars}
+            ${xLabels}
+            <text x="${(padLeft + plotWidth / 2).toFixed(2)}" y="${(height - 6).toFixed(2)}" fill="#9aa5b4" text-anchor="middle" font-size="12">Global Floor</text>
+            <text x="14" y="${(padTop + plotHeight / 2).toFixed(2)}" fill="#9aa5b4" text-anchor="middle" font-size="12" transform="rotate(-90 14 ${(padTop + plotHeight / 2).toFixed(2)})">Episodes</text>
+          </svg>
+        </div>
+      `;
     }
     function renderSlotCharts(slotHistories) {
       const keys = Object.keys(slotHistories || {}).sort();

@@ -851,6 +851,73 @@ def _normalize_floor_fields(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _session_row_key(row: dict[str, Any]) -> str:
+    game_id = str(row.get("game_id") or "").strip()
+    if game_id:
+        return game_id
+    slot = str(row.get("slot") or "").strip()
+    episode = _safe_int(row.get("episode_index"), 0)
+    seed = str(row.get("seed") or "").strip()
+    return f"{slot}-{episode}-{seed}"
+
+
+def _merge_session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = _normalize_floor_fields(raw)
+        key = _session_row_key(row)
+        existing = _normalize_floor_fields(merged.get(key, {}))
+        max_floor = max(
+            _safe_int(existing.get("max_floor"), 0),
+            _safe_int(row.get("max_floor"), 0),
+            _safe_int(row.get("final_floor") or row.get("floor"), 0),
+        )
+        max_floor_local = max(
+            _safe_int(existing.get("max_floor_local"), 0),
+            _safe_int(row.get("max_floor_local"), 0),
+            _safe_int(row.get("final_floor") or row.get("floor"), 0),
+        )
+        max_global_floor = max(_row_global_floor(existing), _row_global_floor(row))
+        max_progress = max(_safe_int(existing.get("max_progress"), 0), _safe_int(row.get("max_progress"), 0))
+        item = dict(existing)
+        item.update(row)
+        item["max_floor"] = max_floor
+        item["max_floor_local"] = max_floor_local
+        item["max_global_floor"] = max_global_floor
+        item["max_progress"] = max_progress
+        merged[key] = item
+    return list(merged.values())
+
+
+def _build_floor_distribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    merged_rows = _merge_session_rows(rows)
+    completed = [row for row in merged_rows if not bool(row.get("active", False))]
+    floors = [max(0, _row_global_floor(_normalize_floor_fields(row))) for row in completed]
+    floors = [value for value in floors if value > 0]
+    if not floors:
+        return {
+            "total": 0,
+            "max_floor": 0,
+            "max_count": 0,
+            "points": [],
+            "act_markers": [17, 34, 51],
+        }
+    max_floor = max(floors)
+    counts = [0] * max_floor
+    for value in floors:
+        counts[value - 1] += 1
+    points = [{"floor": index + 1, "count": count} for index, count in enumerate(counts)]
+    return {
+        "total": len(floors),
+        "max_floor": max_floor,
+        "max_count": max(counts) if counts else 0,
+        "points": points,
+        "act_markers": [marker for marker in [17, 34, 51] if marker <= max_floor],
+    }
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None or value == "":
@@ -962,6 +1029,10 @@ def _telemetry_mark_run_idle(*, run_id: str = "", run_dir: str = "", clear_slots
         training = dict(target_run.get("training") or {})
         training["status"] = "idle"
         training["updated_at"] = _now_iso()
+        training["process_pid"] = 0
+        training["process_count"] = 0
+        training["thread_count"] = 0
+        training["fps"] = 0.0
         target_run["training"] = training
         if clear_slots:
             target_run["active_slots"] = {}
@@ -1065,6 +1136,14 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
     training = deepcopy(run.get("training") or {})
     resources = _collect_resource_summary(training)
     trend = _build_trend_summary(training, top_sessions)
+    floor_distribution_rows: list[dict[str, Any]] = [dict(row) for row in top_sessions]
+    for rows in (run.get("slot_histories") or {}).values():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                floor_distribution_rows.append(dict(row))
+    floor_distribution = _build_floor_distribution(floor_distribution_rows)
     return {
         "updated_at": training.get("updated_at"),
         "run_dir": run.get("run_dir"),
@@ -1089,6 +1168,7 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
             "problem_list": problem_list,
             "resources": resources,
             "trend": trend,
+            "floor_distribution": floor_distribution,
             "watchdog_status": deepcopy(TELEMETRY_STATE.get("watchdog_status") or {}),
             "session_supervisor_status": deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {}),
         },
@@ -1240,7 +1320,9 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     merged_leaderboard_rows = [row for row in persisted_leaderboard if isinstance(row, dict)] + computed_top_sessions
     top_sessions = _telemetry_sort_top(merged_leaderboard_rows, limit=50)
     top_sessions = _enrich_rows_with_boss(run_dir, top_sessions)
-    active_slots = _enrich_active_slots_with_live_boss(_enrich_rows_with_boss(run_dir, active_slots))
+    # Avoid high-frequency per-slot live boss HTTP calls in snapshot refresh.
+    # These requests contend with training traffic and can stall step throughput.
+    active_slots = _enrich_rows_with_boss(run_dir, active_slots)
     active_slots = [_annotate_health(item) for item in active_slots]
     top_sessions = [_annotate_health(item) for item in top_sessions]
 
@@ -1289,6 +1371,7 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
     resources = _collect_resource_summary(training)
     trend = _build_trend_summary(training, top_sessions)
+    floor_distribution = _build_floor_distribution(list(history_by_job.values()))
     completed_session_count = max(
         sum(1 for item in history_by_job.values() if not item.get("active", False)),
         _safe_int(training.get("episodes_finished"), 0),
@@ -1319,6 +1402,7 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             "problem_list": problem_list,
             "resources": resources,
             "trend": trend,
+            "floor_distribution": floor_distribution,
             "watchdog_status": _read_json(WATCHDOG_STATUS_PATH),
             "session_supervisor_status": _read_json(SESSION_SUPERVISOR_STATUS_PATH),
         },
@@ -1623,11 +1707,12 @@ def _pid_from_file(name: str) -> int | None:
 
 def _managed_process_ids(name: str) -> list[int]:
     pid = _pid_from_file(name)
-    if pid is not None:
-        return [pid]
     node = _runtime_node(name)
     candidates: list[int] = []
     seen: set[int] = set()
+    if pid is not None:
+        seen.add(pid)
+        candidates.append(pid)
     patterns = [str(node.get("process_match") or "").strip()]
     script_name = Path(str(node.get("script") or "")).name.strip()
     if script_name:
@@ -1688,6 +1773,7 @@ def _windows_process_rows(*, force_refresh: bool = False) -> list[dict[str, Any]
                 "-NoProfile",
                 "-Command",
                 "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -in @('python.exe','pythonw.exe','dotnet.exe') } | "
                 "Select-Object ProcessId,ParentProcessId,Name,CommandLine,WorkingSetSize,PageFileUsage,ThreadCount | "
                 "ConvertTo-Json -Depth 3 -Compress",
             ],
@@ -1713,11 +1799,51 @@ def _windows_process_rows(*, force_refresh: bool = False) -> list[dict[str, Any]
     return rows
 
 
+def _process_resource_stats_by_pid(pid: int) -> dict[str, Any]:
+    if pid <= 0:
+        return {}
+    try:
+        raw = subprocess.check_output(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"Get-Process -Id {int(pid)} | "
+                "Select-Object Id,ProcessName,WorkingSet64,PrivateMemorySize64,@{Name='ThreadCount';Expression={$_.Threads.Count}} | "
+                "ConvertTo-Json -Depth 4 -Compress",
+            ],
+            text=True,
+            cwd=str(ROOT),
+            timeout=10,
+            **_windows_process_kwargs(),
+        )
+        row = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(row, dict):
+        return {}
+    thread_count = _safe_int(row.get("ThreadCount"), 0)
+    return {
+        "pid": pid,
+        "name": str(row.get("ProcessName") or ""),
+        "working_set_mb": round(float(_safe_int(row.get("WorkingSet64"), 0)) / (1024 * 1024), 1),
+        "private_mb": round(float(_safe_int(row.get("PrivateMemorySize64"), 0)) / (1024 * 1024), 1),
+        "threads": thread_count,
+    }
+
+
 def _find_training_process_ids() -> list[int]:
     pid = _pid_from_file("client")
+    candidates: list[int] = []
+    seen: set[int] = set()
     if pid is not None:
-        return [pid]
-    return _find_python_process_ids("train_http_cli_rl.py")
+        seen.add(pid)
+        candidates.append(pid)
+    for current_pid in _find_python_process_ids("train_http_cli_rl.py"):
+        if current_pid not in seen:
+            seen.add(current_pid)
+            candidates.append(current_pid)
+    return candidates
 
 
 def _find_service_process_ids() -> list[int]:
@@ -1886,7 +2012,24 @@ def _ensure_generic_process_ready(name: str, node: dict[str, Any], *, default_ro
         return {"ok": True, "enabled": False, "started": False}
     existing_pids = _managed_process_ids(name)
     if existing_pids:
-        return {"ok": True, "enabled": True, "started": False, "pids": existing_pids}
+        if len(existing_pids) == 1:
+            return {"ok": True, "enabled": True, "started": False, "pids": existing_pids}
+        terminated = _terminate_processes(existing_pids)
+        remaining = _wait_for_process_exit(
+            lambda name=name: _managed_process_ids(name),
+            timeout_seconds=6.0,
+            poll_interval_seconds=0.4,
+        )
+        if remaining:
+            return {
+                "ok": False,
+                "enabled": True,
+                "started": False,
+                "message": f"duplicate {name} processes could not be cleaned",
+                "pids": remaining,
+                "terminated_pids": terminated,
+            }
+        _clear_pid(name)
     start_result = _start_managed_process(name, node, default_root=default_root)
     if not start_result.get("ok"):
         return {
@@ -2017,7 +2160,7 @@ def _process_resource_stats(pid: int, windows_rows: list[dict[str, Any]] | None 
             "private_mb": round(private_mb, 1),
             "threads": _safe_int(row.get("ThreadCount"), 0),
         }
-    return {}
+    return _process_resource_stats_by_pid(pid)
 
 
 def _collect_resource_summary(training: dict[str, Any]) -> dict[str, Any]:
@@ -2242,26 +2385,29 @@ def _build_problem_list(
         if not key:
             continue
         discovered_at = _incident_time(row.get("recorded_at") or row.get("file_updated_at"))
-        resolved = bool(row.get("resolution_status") or row.get("resolution_action"))
+        resolved_explicit = bool(row.get("resolution_status") or row.get("resolution_action"))
+        resolved_inferred = False
         incident_type = str(row.get("type") or "")
-        if not resolved:
+        if not resolved_explicit:
             if game_id and game_id not in active_game_ids:
-                resolved = True
+                resolved_inferred = True
             elif not game_id and runtime_healthy and incident_type in {
                 "dashboard_unavailable",
                 "service_unavailable",
                 "service_unhealthy",
                 "training_client_missing",
             }:
-                resolved = True
-        resolved_at = discovered_at if resolved else ""
+                resolved_inferred = True
+        resolved = resolved_explicit or resolved_inferred
+        resolved_at = discovered_at if resolved_explicit else ""
+        status = "resolved" if resolved_explicit else ("inferred_resolved" if resolved_inferred else "open")
         reason = str(row.get("reason") or row.get("flags_display") or row.get("type") or "")
         current = problems.get(key) or {
             "key": key,
             "seed": seed,
             "game_id": game_id,
             "run_id": str(row.get("run_id") or ""),
-            "status": "resolved" if resolved else "open",
+            "status": status,
             "discovered_at": discovered_at,
             "resolved_at": resolved_at,
             "reason": reason,
@@ -2275,15 +2421,17 @@ def _build_problem_list(
             current["discovered_at"] = discovered_at
         if resolved_at and (not current.get("resolved_at") or resolved_at > str(current.get("resolved_at"))):
             current["resolved_at"] = resolved_at
-        if resolved:
+        if resolved_explicit:
             current["status"] = "resolved"
+        elif resolved_inferred and current.get("status") != "resolved":
+            current["status"] = "inferred_resolved"
         current.setdefault("sources", []).append(
             {
                 "source": str(row.get("source") or ""),
-                    "type": incident_type,
+                "type": incident_type,
                 "reason": reason,
                 "recorded_at": discovered_at,
-                "resolution_status": str(row.get("resolution_status") or row.get("resolution_action") or ""),
+                "resolution_status": str(row.get("resolution_status") or row.get("resolution_action") or ("inferred" if resolved_inferred else "")),
             }
         )
         problems[key] = current
@@ -2300,9 +2448,9 @@ def _build_problem_list(
             "seed": seed,
             "game_id": game_id,
             "run_id": str(row.get("run_id") or ""),
-            "status": "resolved",
+            "status": "needs_review",
             "discovered_at": discovered_at,
-            "resolved_at": discovered_at,
+            "resolved_at": "",
             "reason": str(row.get("flags_display") or row.get("termination_reason") or "suspicious_completed"),
             "sources": [
                 {
@@ -2483,7 +2631,7 @@ def _stop_training_process() -> dict[str, Any]:
     run_dir = _active_run_dir()
     existing_pids = _find_training_process_ids()
     live_service_games = _service_game_rows()
-    support_pids = {name: _managed_process_ids(name) for name in _support_node_names()}
+    support_pids = {name: _managed_process_ids(name) for name in _support_node_names(include_disabled=True)}
     if run_dir is None and not existing_pids and not live_service_games and not any(support_pids.values()):
         return {"ok": False, "message": "no active training"}
 
@@ -2791,10 +2939,32 @@ def _build_snapshot_payload() -> dict[str, Any]:
             memory_run = _telemetry_current_run(require_active=False)
 
     snapshot = _telemetry_snapshot_from_memory(memory_run)
+    snapshot_training = dict(snapshot.get("training") or {})
+    snapshot_status = str(snapshot_training.get("status") or "").lower()
+    snapshot_updated_age = _seconds_since(snapshot_training.get("updated_at"))
+    if (
+        snapshot_status in {"running", "paused", "stopping"}
+        and not live_training_pids
+        and not live_service_games
+        and snapshot_updated_age is not None
+        and snapshot_updated_age >= 10
+    ):
+        snapshot_training["status"] = "idle"
+        snapshot_training["process_pid"] = 0
+        snapshot_training["process_count"] = 0
+        snapshot_training["thread_count"] = 0
+        snapshot_training["fps"] = 0.0
+        snapshot["training"] = snapshot_training
+        snapshot["active_slots"] = []
+
     training_status = str((snapshot.get("training") or {}).get("status") or "").lower()
     if training_status not in {"running", "paused", "stopping"}:
         snapshot["training"] = dict(snapshot.get("training") or {})
         snapshot["training"]["status"] = "idle"
+        snapshot["training"]["process_pid"] = 0
+        snapshot["training"]["process_count"] = 0
+        snapshot["training"]["thread_count"] = 0
+        snapshot["training"]["fps"] = 0.0
         snapshot["active_slots"] = []
     snapshot["all_time_summary"] = all_time_summary
     snapshot["historical_best"] = historical_best

@@ -1306,6 +1306,26 @@ class HttpCliRlEnv(gym.Env):
 
         return False
 
+    def _resync_state_after_protocol_error(self, before_marker: str, *, attempts: int = 2) -> bool:
+        if self._game_id is None:
+            return False
+        for _ in range(max(1, attempts)):
+            try:
+                raw_state = self.protocol.get_state(self._game_id)
+            except Exception:
+                time.sleep(max(0.01, self.config.recovery_delay_seconds))
+                continue
+            candidate = self.protocol.adapt_state(raw_state)
+            self._state = candidate
+            self.reward_tracker.reset(candidate)
+            # Any successful state fetch after protocol failure is useful to continue;
+            # if progress moved, also reset protocol/deadlock streaks immediately.
+            if self._progress_marker(candidate) != before_marker:
+                self._protocol_error_streak = 0
+                self._deadlock_error_streak = 0
+            return True
+        return False
+
     def _zero_observation(self) -> np.ndarray:
         return np.zeros(self.observation_space.shape, dtype=np.float32)
 
@@ -1461,7 +1481,9 @@ class HttpCliRlEnv(gym.Env):
                 self._protocol_error_streak += 1
                 if self._is_deadlock_error(result.raw):
                     self._deadlock_error_streak += 1
-                if self._should_poll_for_async_combat_progress(before_state, sanitized) and self._poll_for_async_combat_progress(before_marker):
+                if self.protocol.should_resync_after_error(result.raw, self._state) and self._resync_state_after_protocol_error(before_marker):
+                    result = type(result)(status="success", state=self._state.raw if self._state is not None else None)
+                elif self._should_poll_for_async_combat_progress(before_state, sanitized) and self._poll_for_async_combat_progress(before_marker):
                     result = type(result)(status="success", state=self._state.raw if self._state is not None else None)
                 else:
                     reward += self.reward_tracker.on_invalid_action()
@@ -1475,7 +1497,10 @@ class HttpCliRlEnv(gym.Env):
                         if self._is_deadlock_error(retry.raw):
                             self._deadlock_error_streak += 1
                             self._remember_deadlock_card(before_state, sanitized)
-                        if self._should_poll_for_async_combat_progress(self._state, recovery) and self._poll_for_async_combat_progress(before_marker):
+                        if self.protocol.should_resync_after_error(retry.raw, self._state) and self._resync_state_after_protocol_error(before_marker):
+                            result = type(result)(status="success", state=self._state.raw if self._state is not None else None)
+                            reward += self.reward_tracker.on_invalid_action()
+                        elif self._should_poll_for_async_combat_progress(self._state, recovery) and self._poll_for_async_combat_progress(before_marker):
                             result = type(result)(status="success", state=self._state.raw if self._state is not None else None)
                         else:
                             should_probe_state = not (

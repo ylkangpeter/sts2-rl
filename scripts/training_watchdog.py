@@ -43,6 +43,7 @@ class WatchdogConfig:
     restart_cooldown_seconds: int = 180
     no_training_grace_seconds: int = 45
     total_timesteps: int = 1_000_000
+    intervention_enabled: bool = False
 
 
 def _now() -> datetime:
@@ -135,6 +136,7 @@ def _watchdog_config() -> WatchdogConfig:
         restart_cooldown_seconds=max(30, _safe_int(payload.get("restart_cooldown_seconds"), 180)),
         no_training_grace_seconds=max(10, _safe_int(payload.get("no_training_grace_seconds"), 45)),
         total_timesteps=max(1, _safe_int(payload.get("total_timesteps"), int(defaults.get("total_timesteps") or 1_000_000))),
+        intervention_enabled=bool(payload.get("intervention_enabled", False)),
     )
 
 
@@ -1068,6 +1070,9 @@ def _stop_service(runtime: dict[str, Any]) -> None:
 
 
 def _restart_runtime(runtime: dict[str, Any], config: WatchdogConfig, reason: str, state: dict[str, Any]) -> None:
+    if not config.intervention_enabled:
+        print(f"[watchdog] intervention disabled; restart suppressed: {reason}", flush=True)
+        return
     if not _restart_allowed(state, config):
         print(f"[watchdog] restart skipped due to cooldown: {reason}", flush=True)
         return
@@ -1178,6 +1183,10 @@ def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], 
     if (_now() - since).total_seconds() < config.no_training_grace_seconds:
         return
 
+    if not config.intervention_enabled:
+        print("[watchdog] intervention disabled; training start suppressed", flush=True)
+        return
+
     print("[watchdog] no active training detected; starting client", flush=True)
     try:
         desired_num_envs = _recommended_num_envs(runtime, state, snapshot)
@@ -1269,11 +1278,15 @@ def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | 
 
     session_supervisor = runtime.get("session_supervisor") or {}
     if not _is_managed_process_running(session_supervisor):
-        print("[watchdog] session_supervisor missing; starting session_supervisor only", flush=True)
-        _start_managed_process("session_supervisor", session_supervisor, runtime)
+        if not config.intervention_enabled:
+            print("[watchdog] intervention disabled; session_supervisor start suppressed", flush=True)
+        else:
+            print("[watchdog] session_supervisor missing; starting session_supervisor only", flush=True)
+            _start_managed_process("session_supervisor", session_supervisor, runtime)
 
 
 def _write_status(snapshot: dict[str, Any] | None, incidents: list[dict[str, Any]], state: dict[str, Any]) -> None:
+    config = _watchdog_config()
     payload = {
         "updated_at": _now_iso(),
         "run_id": ((snapshot or {}).get("training") or {}).get("run_id") if snapshot else None,
@@ -1282,6 +1295,7 @@ def _write_status(snapshot: dict[str, Any] | None, incidents: list[dict[str, Any
         "last_restart_at": state.get("last_restart_at"),
         "restart_count": state.get("restart_count"),
         "target_num_envs": state.get("current_num_envs"),
+        "intervention_enabled": bool(config.intervention_enabled),
     }
     _write_json(STATUS_PATH, payload)
     _post_dashboard_best_effort("/api/telemetry/runtime/status", {**payload, "source": "watchdog"})
