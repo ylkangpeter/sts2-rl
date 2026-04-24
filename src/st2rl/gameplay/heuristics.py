@@ -310,6 +310,35 @@ def _state_act_floor(state: GameStateView | None) -> tuple[int, int]:
     return act, floor
 
 
+def _boss_key_from_context(context: dict[str, Any]) -> str:
+    boss_payload = context.get("boss")
+    boss_text_parts: list[str] = []
+    if isinstance(boss_payload, dict):
+        boss_text_parts.extend(str(boss_payload.get(key) or "") for key in ("id", "name", "boss_id", "boss_name"))
+    boss_text_parts.extend(str(context.get(key) or "") for key in ("boss_id", "boss_name"))
+    return _text(" ".join(boss_text_parts))
+
+
+def _state_boss_key(state: GameStateView | None) -> str:
+    if state is None:
+        return ""
+    context = state.raw.get("context") or {}
+    if not isinstance(context, dict):
+        return ""
+    return _boss_key_from_context(context)
+
+
+def _act1_boss_profile_key(boss_key: str) -> str:
+    key = _text(boss_key)
+    if any(token in key for token in ("vantom", "墨影")):
+        return "vantom"
+    if any(token in key for token in ("kin", "同族")):
+        return "kin"
+    if any(token in key for token in ("ceremonial", "仪式兽")):
+        return "ceremonial"
+    return ""
+
+
 def _stats_total(card: dict[str, Any]) -> int:
     stats = card.get("stats") or {}
     if not isinstance(stats, dict):
@@ -589,6 +618,7 @@ def estimate_card_reward_score(
     *,
     act: int = 1,
     floor: int = 0,
+    boss_key: str = "",
 ) -> float:
     deck = [item for item in (deck or []) if isinstance(item, dict)]
     if _card_id(card) in _UNSUPPORTED_HEADLESS_CARD_IDS:
@@ -644,6 +674,7 @@ def estimate_card_reward_score(
     card_id_upper = _card_id(card)
     block_deficit = deck_size >= 12 and counts["block"] <= max(2, counts["attack"] // 3)
     thick_deck = deck_size >= 22
+    act1_boss_profile = _act1_boss_profile_key(boss_key) if act == 1 else ""
 
     if card_id_upper == "CARD.BLOODLETTING":
         score += 1.0
@@ -711,6 +742,28 @@ def estimate_card_reward_score(
             score += 0.55
         elif card_id_upper == "CARD.ARMAMENTS" and counts["attack"] <= counts["skill"]:
             score -= 0.75
+    if act == 1 and floor >= 9 and act1_boss_profile:
+        if act1_boss_profile == "vantom":
+            if card_id_upper in {"CARD.ANGER", "CARD.POMMEL_STRIKE", "CARD.THUNDERCLAP", "CARD.BATTLE_TRANCE"}:
+                score += 1.35
+            if draw_amount > 0 or energy_amount > 0:
+                score += 0.55
+            if cost >= 2 and card_id_upper in {"CARD.BLUDGEON", "CARD.PERFECTED_STRIKE", "CARD.HEAVY_BLADE"}:
+                score -= 1.8
+        elif act1_boss_profile == "kin":
+            if card_id_upper in {"CARD.ANGER", "CARD.THUNDERCLAP", "CARD.UPPERCUT", "CARD.POMMEL_STRIKE"}:
+                score += 1.1
+            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT"}:
+                score += 0.65
+            if card_type == "attack" and cost >= 2 and draw_amount <= 0:
+                score -= 0.55
+        elif act1_boss_profile == "ceremonial":
+            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
+                score += 1.2
+            if card_id_upper in {"CARD.UPPERCUT", "CARD.BATTLE_TRANCE", "CARD.POMMEL_STRIKE"}:
+                score += 0.65
+            if card_id_upper in {"CARD.BLOODLETTING", "CARD.OFFERING", "CARD.HEMOKINESIS"}:
+                score -= 0.9
 
     if act >= 2:
         if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL", "CARD.ARMAMENTS"}:
@@ -789,16 +842,9 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
     context = state.raw.get("context") or {}
     floor = _safe_int(context.get("floor") or state.raw.get("floor"), 0)
     act = _safe_int(context.get("act") or state.raw.get("act"), 1) or 1
-    boss_payload = context.get("boss")
-    boss_text_parts: list[str] = []
-    if isinstance(boss_payload, dict):
-        boss_text_parts.extend(str(boss_payload.get(key) or "") for key in ("id", "name", "boss_id", "boss_name"))
-    boss_text_parts.extend(str(context.get(key) or "") for key in ("boss_id", "boss_name"))
-    boss_key = _text(" ".join(boss_text_parts))
-    hard_act1_boss = act == 1 and any(
-        token in boss_key
-        for token in ("vantom", "kin", "ceremonial", "墨影", "同族", "仪式兽")
-    )
+    boss_key = _boss_key_from_context(context if isinstance(context, dict) else {})
+    act1_boss_profile = _act1_boss_profile_key(boss_key) if act == 1 else ""
+    hard_act1_boss = bool(act1_boss_profile)
     hp_ratio = state.hp / max(1, state.max_hp)
     deck = [card for card in (state.player.get("deck") or []) if isinstance(card, dict)]
     elite_readiness = estimate_elite_readiness(deck, hp_ratio, floor)
@@ -881,6 +927,12 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value -= 2.2
             if hard_act1_boss and floor >= 12 and hp_ratio < 0.92:
                 value -= 2.0
+            if floor >= 10 and act1_boss_profile == "ceremonial":
+                value -= 1.1
+            if floor >= 10 and act1_boss_profile == "kin":
+                value -= 0.8
+            if floor >= 11 and act1_boss_profile == "vantom" and hp_ratio < 0.9:
+                value -= 0.85
         elif "rest" in room or "camp" in room or room == "r":
             value = 4.4 if hp_ratio < 0.6 else (3.4 if hp_ratio < 0.8 else 1.15)
             if act == 2:
@@ -891,6 +943,10 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value += 1.35
             if hard_act1_boss and floor >= 10:
                 value += 1.45 if hp_ratio < 0.92 else 0.7
+            if act1_boss_profile == "ceremonial" and floor >= 10:
+                value += 0.9
+            if act1_boss_profile == "kin" and floor >= 11:
+                value += 0.7
         elif "shop" in room or room in {"merchant", "$", "s"}:
             value = 2.65 if state.gold >= 150 else (0.35 if state.gold < 110 else 1.95)
             if purge_target is not None and state.gold >= 75:
@@ -903,6 +959,10 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value += 0.85
             if hard_act1_boss and floor >= 10 and hp_ratio < 0.9:
                 value += 0.9
+            if act1_boss_profile in {"ceremonial", "kin"} and floor >= 10 and state.gold >= 90:
+                value += 0.6
+            if act1_boss_profile == "vantom" and floor >= 9 and state.gold >= 80:
+                value += 0.35
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
@@ -954,6 +1014,10 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value -= 3.5
         if hard_act1_boss and has_elite_next and floor >= 10:
             value -= 1.8
+        if act1_boss_profile == "ceremonial" and has_elite_next and floor >= 10 and hp_ratio < 0.94:
+            value -= 1.2
+        if act1_boss_profile == "kin" and has_elite_next and floor >= 11:
+            value -= 0.95
         if any("elite" in next_room for next_room in next_rooms) and ("rest" in room or "shop" in room):
             value += 0.35
         if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):
@@ -977,8 +1041,9 @@ def choose_card_reward(
     if not indexed:
         return None
     act, floor = _state_act_floor(state)
+    boss_key = _state_boss_key(state)
     scored = sorted(
-        ((estimate_card_reward_score(card, deck, act=act, floor=floor), card) for card in indexed),
+        ((estimate_card_reward_score(card, deck, act=act, floor=floor, boss_key=boss_key), card) for card in indexed),
         key=lambda item: (-item[0], _safe_int(item[1].get("index"), 9999)),
     )
     best_score, best_card = scored[0]

@@ -91,7 +91,53 @@ class SimpleFlowPolicy:
         is_hard_act2_elite = act >= 2 and is_elite_room and (is_decimillipede or is_entomancer or is_infested_prism)
         round_no = self._safe_int(state.round, 0)
         is_targeted_boss = is_boss_floor or is_act2_boss or is_ceremonial_beast or is_kin or is_knowledge_demon
+        is_hard_act1_boss = act <= 1 and is_boss_floor and (is_vantom or is_ceremonial_beast or is_kin)
+        vantom_slippery = is_vantom and self._enemy_power_amount(state, "slippery", "滑溜") > 0
         high_value_combat = is_targeted_boss or is_elite_room
+        if is_kin and len(enemies) > 1:
+            follower_targets = [
+                enemy
+                for enemy in enemies
+                if "follower" in self._text(enemy.get("id") or enemy.get("name"))
+                or "同族教徒" in self._text(enemy.get("id") or enemy.get("name"))
+            ]
+            lethal_follower_plays: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+            for card in playable:
+                damage = self._card_damage(card)
+                if damage <= 0:
+                    continue
+                for follower in follower_targets:
+                    follower_ehp = self._enemy_effective_hp(follower)
+                    if damage < follower_ehp:
+                        continue
+                    lethal_follower_plays.append(
+                        (
+                            self._combat_card_score(state, card) + min(damage, follower_ehp) * 8.0,
+                            card,
+                            follower,
+                        )
+                    )
+            if lethal_follower_plays:
+                _score, lethal_card, lethal_target = max(lethal_follower_plays, key=lambda item: item[0])
+                return FlowAction(
+                    "play_card",
+                    {
+                        "card_index": lethal_card["index"],
+                        "target_index": lethal_target.get("index", enemies[0]["index"]),
+                    },
+                )
+
+        if vantom_slippery and len(playable) > 1:
+            low_commit_playable = [
+                card
+                for card in playable
+                if self._safe_int(card.get("cost"), 0) <= 1
+                or self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if low_commit_playable:
+                playable = low_commit_playable
         if is_targeted_boss and len(playable) > 1:
             safer_playable = [card for card in playable if not self._should_avoid_hp_loss_energy_card(state, card, block_gap)]
             if safer_playable:
@@ -225,6 +271,18 @@ class SimpleFlowPolicy:
             if aggressive_playable:
                 playable = aggressive_playable
 
+        if is_kin and len(enemies) > 1 and round_no <= 5 and len(playable) > 1:
+            kin_tempo_playable = [
+                card
+                for card in playable
+                if self._card_damage(card) > 0
+                or self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if kin_tempo_playable:
+                playable = kin_tempo_playable
+
         if is_crusher_rocket and round_no <= 2 and block_gap >= max(6, int(state.hp * 0.2)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
             if block_playable:
@@ -257,6 +315,39 @@ class SimpleFlowPolicy:
                     args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
                 return FlowAction("play_card", args)
 
+        if is_hard_act1_boss and block_gap >= max(5, int(state.hp * 0.18)):
+            block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                act1_block_weight = 2.8 if is_ceremonial_beast else (2.4 if is_kin else 2.2)
+                block_scores = [
+                    (
+                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * act1_block_weight,
+                        card,
+                    )
+                    for card in block_playable
+                ]
+                _block_score, block_card = max(block_scores, key=lambda item: item[0])
+                args = {"card_index": block_card["index"]}
+                if card_needs_enemy_target(block_card):
+                    args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
+                return FlowAction("play_card", args)
+
+        if is_kin and len(enemies) > 1 and block_gap >= max(4, int(state.hp * 0.14)):
+            block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                block_scores = [
+                    (
+                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * 3.6,
+                        card,
+                    )
+                    for card in block_playable
+                ]
+                _block_score, block_card = max(block_scores, key=lambda item: item[0])
+                args = {"card_index": block_card["index"]}
+                if card_needs_enemy_target(block_card):
+                    args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
+                return FlowAction("play_card", args)
+
         if is_targeted_boss and (is_ceremonial_beast or is_kin):
             urgent_gap = max(6, int(state.hp * 0.28))
             if block_gap >= urgent_gap:
@@ -274,6 +365,22 @@ class SimpleFlowPolicy:
                     if card_needs_enemy_target(block_card):
                         args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
                     return FlowAction("play_card", args)
+
+        if is_ceremonial_beast and round_no <= 5 and block_gap >= max(4, int(state.hp * 0.14)):
+            block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                block_scores = [
+                    (
+                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * 3.4,
+                        card,
+                    )
+                    for card in block_playable
+                ]
+                _block_score, block_card = max(block_scores, key=lambda item: item[0])
+                args = {"card_index": block_card["index"]}
+                if card_needs_enemy_target(block_card):
+                    args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
+                return FlowAction("play_card", args)
 
         if is_act2_boss and block_gap >= max(8, int(state.hp * 0.33)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
@@ -644,6 +751,16 @@ class SimpleFlowPolicy:
                 "仪式兽",
             )
         )
+
+    def _upcoming_act1_boss_profile(self, state: GameStateView) -> str:
+        key = self._upcoming_boss_key(state)
+        if "vantom" in key or "墨影" in key:
+            return "vantom"
+        if "kin" in key or "同族" in key:
+            return "kin"
+        if "ceremonial" in key or "仪式兽" in key:
+            return "ceremonial"
+        return ""
 
     def _should_avoid_hp_loss_energy_card(self, state: GameStateView, card: dict[str, Any], block_gap: int) -> bool:
         hp_loss = self._card_hp_loss(card)
@@ -1919,6 +2036,8 @@ class SimpleFlowPolicy:
         best_potion = best_shop_potion(state.potions, state.gold)
         context = state.raw.get("context") or {}
         floor = self._safe_int(context.get("floor") or state.raw.get("floor"), 0)
+        act = self._safe_int(context.get("act") or state.raw.get("act"), 0)
+        upcoming_act1_boss = self._upcoming_act1_boss_profile(state) if act == 1 else ""
         player_potions = [potion for potion in (state.player.get("potions") or []) if isinstance(potion, dict)]
         potion_slots_total = self._safe_int(state.player.get("potion_slots_total"), 3)
         has_potion_space = len(player_potions) < max(1, potion_slots_total)
@@ -1926,6 +2045,8 @@ class SimpleFlowPolicy:
             state.gold >= self.config.shop_high_gold_threshold
             or floor >= 10
             or state.hp / max(1, state.max_hp) < 0.65
+            or (upcoming_act1_boss in {"ceremonial", "kin"} and floor >= 10)
+            or (upcoming_act1_boss == "vantom" and floor >= 12)
         ):
             return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
 
@@ -1959,6 +2080,7 @@ class SimpleFlowPolicy:
         floor = self._safe_int((state.raw.get("context") or {}).get("floor"), 0)
         act = self._safe_int((state.raw.get("context") or {}).get("act"), 0)
         hard_act1_boss = act == 1 and self._is_hard_act1_boss_context(state)
+        upcoming_act1_boss = self._upcoming_act1_boss_profile(state) if act == 1 else ""
         if act >= 2:
             heal_threshold = max(heal_threshold, 0.82)
             if floor >= 12:
@@ -1971,6 +2093,12 @@ class SimpleFlowPolicy:
             heal_threshold = max(heal_threshold, 0.72)
         if hard_act1_boss:
             heal_threshold = max(heal_threshold, 0.9 if floor < 14 else 0.93)
+        if upcoming_act1_boss == "ceremonial":
+            heal_threshold = max(heal_threshold, 0.92 if floor < 13 else 0.95)
+        elif upcoming_act1_boss == "kin":
+            heal_threshold = max(heal_threshold, 0.9 if floor < 13 else 0.94)
+        elif upcoming_act1_boss == "vantom":
+            heal_threshold = max(heal_threshold, 0.88 if floor < 13 else 0.92)
         if hp_ratio < max(0.4, heal_threshold):
             heal = next(
                 (
