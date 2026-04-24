@@ -283,6 +283,34 @@ def _all_run_dirs() -> list[Path]:
     return candidates
 
 
+def _resolve_run_dir_path(value: Any) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (ROOT / path).resolve()
+    if path.exists() and path.is_dir():
+        return path
+    return None
+
+
+def _collect_checkpoints(run_dir: Path | None) -> list[dict[str, Any]]:
+    if run_dir is None:
+        return []
+    checkpoints: list[dict[str, Any]] = []
+    for model_file in sorted(run_dir.glob("*.zip"), key=lambda item: item.stat().st_mtime, reverse=True):
+        checkpoints.append(
+            {
+                "name": model_file.name,
+                "path": str(model_file),
+                "size_mb": round(model_file.stat().st_size / (1024 * 1024), 2),
+                "updated_at": model_file.stat().st_mtime,
+            }
+        )
+    return checkpoints
+
+
 def _training_payload(run_dir: Path) -> dict[str, Any]:
     data = _read_json(run_dir / "dashboard" / "training_status.json")
     return data if isinstance(data, dict) else {}
@@ -848,6 +876,13 @@ def _normalize_floor_fields(row: dict[str, Any]) -> dict[str, Any]:
     max_global_floor = _row_global_floor(item)
     if max_global_floor > 0:
         item["max_global_floor"] = max_global_floor
+    if (
+        not item.get("finished_at")
+        and not bool(item.get("active", False))
+        and (bool(item.get("terminated")) or bool(item.get("game_over")) or bool(item.get("victory")))
+        and item.get("recorded_at")
+    ):
+        item["finished_at"] = item.get("recorded_at")
     return item
 
 
@@ -859,6 +894,16 @@ def _session_row_key(row: dict[str, Any]) -> str:
     episode = _safe_int(row.get("episode_index"), 0)
     seed = str(row.get("seed") or "").strip()
     return f"{slot}-{episode}-{seed}"
+
+
+def _normalize_slot_history_key(slot_value: Any) -> str:
+    raw = str(slot_value or "").strip().lower()
+    if not raw:
+        return ""
+    suffix = raw[5:] if raw.startswith("slot_") else raw
+    if suffix.isdigit():
+        return f"slot_{int(suffix):02d}"
+    return raw
 
 
 def _merge_session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1144,6 +1189,7 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
             if isinstance(row, dict):
                 floor_distribution_rows.append(dict(row))
     floor_distribution = _build_floor_distribution(floor_distribution_rows)
+    run_dir_path = _resolve_run_dir_path(run.get("run_dir"))
     return {
         "updated_at": training.get("updated_at"),
         "run_dir": run.get("run_dir"),
@@ -1151,7 +1197,7 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
         "active_slots": active_slots,
         "top_sessions": top_sessions,
         "slot_histories": deepcopy(run.get("slot_histories") or {}),
-        "checkpoints": [],
+        "checkpoints": _collect_checkpoints(run_dir_path),
         "seen_sessions": max(len(run.get("seen_game_ids") or set()), _safe_int(run.get("snapshot_seen_sessions"), 0)),
         "completed_sessions": max(len(run.get("finished_game_ids") or set()), _safe_int(run.get("snapshot_completed_sessions"), 0)),
         "defaults": _load_training_defaults(),
@@ -1341,16 +1387,7 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             or item.get("game_id") in detailed_ids
         )
 
-    checkpoints = []
-    for model_file in sorted(run_dir.glob("*.zip"), key=lambda item: item.stat().st_mtime, reverse=True):
-        checkpoints.append(
-            {
-                "name": model_file.name,
-                "path": str(model_file),
-                "size_mb": round(model_file.stat().st_size / (1024 * 1024), 2),
-                "updated_at": model_file.stat().st_mtime,
-            }
-        )
+    checkpoints = _collect_checkpoints(run_dir)
 
     suspicious_completed = sorted(
         (_annotate_health(item) for item in history_by_job.values() if not item.get("active", False)),
@@ -2688,12 +2725,15 @@ def _seed_run_state_from_snapshot(snapshot: dict[str, Any]) -> None:
     for row in snapshot.get("active_slots") or []:
         if not isinstance(row, dict):
             continue
-        run["active_slots"][str(row.get("slot") or "")] = dict(row)
+        slot_key = _normalize_slot_history_key(row.get("slot")) or str(row.get("slot") or "")
+        run["active_slots"][slot_key] = dict(row)
         if row.get("game_id"):
             run["seen_game_ids"].add(str(row["game_id"]))
     for slot_key, rows in (snapshot.get("slot_histories") or {}).items():
         if isinstance(rows, list):
-            run["slot_histories"][str(slot_key)] = list(rows)[-50:]
+            normalized_slot_key = _normalize_slot_history_key(slot_key)
+            if normalized_slot_key:
+                run["slot_histories"][normalized_slot_key] = list(rows)[-50:]
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -2766,7 +2806,9 @@ def _telemetry_ingest_slot_current(payload: dict[str, Any]) -> None:
         run = _telemetry_get_run(payload)
         if run is None:
             return
-        slot_key = str(payload.get("slot") or "")
+        slot_key = _normalize_slot_history_key(payload.get("slot"))
+        if not slot_key:
+            return
         run["active_slots"][slot_key] = dict(payload)
         game_id = str(payload.get("game_id") or "")
         if game_id:
@@ -2782,7 +2824,9 @@ def _telemetry_ingest_slot_history(payload: dict[str, Any]) -> None:
         run = _telemetry_get_run(payload)
         if run is None:
             return
-        slot_key = str(payload.get("slot") or "")
+        slot_key = _normalize_slot_history_key(payload.get("slot"))
+        if not slot_key:
+            return
         history = deque(run["slot_histories"].get(slot_key) or [], maxlen=50)
         history.append(dict(payload))
         run["slot_histories"][slot_key] = list(history)

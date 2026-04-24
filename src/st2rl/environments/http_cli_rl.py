@@ -872,6 +872,9 @@ class HttpCliRlEnv(gym.Env):
         ):
             if key in details["summary"]:
                 payload[key] = details["summary"][key]
+        # Keep slot history self-contained for UI duration rendering.
+        if details["summary"].get("finished_at"):
+            payload["finished_at"] = details["summary"]["finished_at"]
         anomaly_flags = self._episode_anomaly_flags(details["summary"])
         if anomaly_flags:
             payload["anomaly_flags"] = anomaly_flags

@@ -208,10 +208,10 @@
         ...row,
         started_at_display: formatDateTime(row.started_at),
         duration_display: formatDuration(row.started_at, row.finished_at),
-        final_hp_display: row.final_hp === null || row.final_hp === undefined
+        final_hp_display: (row.final_hp ?? row.hp) === null || (row.final_hp ?? row.hp) === undefined
           ? '-'
-          : `${row.final_hp} / ${fmt(row.max_hp)}`,
-        final_gold_display: fmt(row.final_gold),
+          : `${row.final_hp ?? row.hp} / ${fmt(row.max_hp)}`,
+        final_gold_display: fmt(row.final_gold ?? row.gold),
         floor_display: floorDisplay(row, false),
         max_floor_display: floorDisplay(row, true),
       }));
