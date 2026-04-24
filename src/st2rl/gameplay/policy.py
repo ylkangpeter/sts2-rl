@@ -94,18 +94,43 @@ class SimpleFlowPolicy:
         is_hard_act1_boss = act <= 1 and is_boss_floor and (is_vantom or is_ceremonial_beast or is_kin)
         vantom_slippery = is_vantom and self._enemy_power_amount(state, "slippery", "滑溜") > 0
         high_value_combat = is_targeted_boss or is_elite_room
+        kin_priest_enemies = [
+            enemy
+            for enemy in enemies
+            if "priest" in self._text(enemy.get("id") or enemy.get("name"))
+            or "神官" in self._text(enemy.get("id") or enemy.get("name"))
+        ]
+        kin_solo_priest = is_kin and len(enemies) == 1 and bool(kin_priest_enemies)
         if is_kin and len(enemies) > 1:
+            priest_targets = [
+                enemy
+                for enemy in enemies
+                if "priest" in self._text(enemy.get("id") or enemy.get("name"))
+                or "神官" in self._text(enemy.get("id") or enemy.get("name"))
+            ]
             follower_targets = [
                 enemy
                 for enemy in enemies
                 if "follower" in self._text(enemy.get("id") or enemy.get("name"))
                 or "同族教徒" in self._text(enemy.get("id") or enemy.get("name"))
             ]
+            lethal_priest_plays: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
             lethal_follower_plays: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
             for card in playable:
                 damage = self._card_damage(card)
                 if damage <= 0:
                     continue
+                for priest in priest_targets:
+                    priest_ehp = self._enemy_effective_hp(priest)
+                    if damage < priest_ehp:
+                        continue
+                    lethal_priest_plays.append(
+                        (
+                            self._combat_card_score(state, card) + min(damage, priest_ehp) * 10.0,
+                            card,
+                            priest,
+                        )
+                    )
                 for follower in follower_targets:
                     follower_ehp = self._enemy_effective_hp(follower)
                     if damage < follower_ehp:
@@ -117,7 +142,16 @@ class SimpleFlowPolicy:
                             follower,
                         )
                     )
-            if lethal_follower_plays:
+            if lethal_priest_plays:
+                _score, lethal_card, lethal_target = max(lethal_priest_plays, key=lambda item: item[0])
+                return FlowAction(
+                    "play_card",
+                    {
+                        "card_index": lethal_card["index"],
+                        "target_index": lethal_target.get("index", enemies[0]["index"]),
+                    },
+                )
+            if lethal_follower_plays and round_no <= 2 and block_gap >= max(6, int(state.hp * 0.22)):
                 _score, lethal_card, lethal_target = max(lethal_follower_plays, key=lambda item: item[0])
                 return FlowAction(
                     "play_card",
@@ -282,6 +316,20 @@ class SimpleFlowPolicy:
             ]
             if kin_tempo_playable:
                 playable = kin_tempo_playable
+
+        if kin_solo_priest and round_no >= 7 and len(playable) > 1:
+            max_block_play = max((self._card_block(card) for card in playable), default=0)
+            cannot_stabilize = block_gap > max_block_play + max(6, int(state.hp * 0.15))
+            if cannot_stabilize:
+                race_playable = [
+                    card
+                    for card in playable
+                    if self._card_damage(card) > 0
+                    or self._card_draw(card) > 0
+                    or self._card_energy_gain(card) > 0
+                ]
+                if race_playable:
+                    playable = race_playable
 
         if is_crusher_rocket and round_no <= 2 and block_gap >= max(6, int(state.hp * 0.2)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
@@ -1192,6 +1240,13 @@ class SimpleFlowPolicy:
         early_boss_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
         early_high_value_turn = high_value_combat and (state.round in (None, 1, 2, 3))
         early_setup_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
+        kin_priest_target = None
+        if is_kin:
+            for enemy in state.living_enemies():
+                enemy_id = self._text(enemy.get("id") or enemy.get("name"))
+                if "priest" in enemy_id or "神官" in enemy_id:
+                    kin_priest_target = enemy
+                    break
 
         best_choice: tuple[float, dict[str, Any]] | None = None
         best_self_choice: tuple[float, dict[str, Any]] | None = None
@@ -1319,7 +1374,7 @@ class SimpleFlowPolicy:
                 kills_all_enemies = bool(enemies) and all(potion_damage >= self._enemy_effective_hp(enemy) for enemy in enemies)
                 if state.hp <= self_damage or not kills_all_enemies:
                     continue
-            target = self._pick_damage_target(state.living_enemies(), potion_damage)
+            target = kin_priest_target if is_kin and kin_priest_target is not None else self._pick_damage_target(state.living_enemies(), potion_damage)
             if target is None:
                 continue
             target_ehp = self._enemy_effective_hp(target)
@@ -1352,7 +1407,10 @@ class SimpleFlowPolicy:
             if debuff_hint <= 0:
                 continue
             enemies = state.living_enemies()
-            target = max(enemies, key=self._enemy_threat) if enemies else None
+            if is_kin and kin_priest_target is not None:
+                target = kin_priest_target
+            else:
+                target = max(enemies, key=self._enemy_threat) if enemies else None
             score = debuff_hint
             if high_value_combat:
                 score += 8.0
@@ -1378,6 +1436,7 @@ class SimpleFlowPolicy:
             or (is_hard_act2_elite and early_high_value_turn and best_attack_choice[0] >= 18.0)
             or (is_knowledge_demon and early_boss_turn and best_attack_choice[0] >= 18.0)
             or (is_insatiable and early_boss_turn and best_attack_choice[0] >= 18.0)
+            or (is_kin and early_boss_turn and best_attack_choice[0] >= 14.0)
             or (early_high_value_turn and self._potion_damage_amount(best_attack_choice[1]) >= 10)
         ):
             args = {"potion_index": best_attack_choice[1].get("index", 0)}
@@ -1391,6 +1450,7 @@ class SimpleFlowPolicy:
             or (is_act2_boss and block_gap >= 5 and hp_ratio < 0.85)
             or (is_boss_floor and block_gap >= 6 and hp_ratio < 0.8)
             or (is_hard_act1_boss and early_boss_turn and block_gap >= 4)
+            or (is_kin and early_boss_turn and block_gap >= 2)
             or (is_crusher_rocket and early_boss_turn and block_gap >= 4)
             or (is_hard_act2_elite and block_gap >= 6)
         ):
@@ -1507,19 +1567,24 @@ class SimpleFlowPolicy:
 
             return max(enemies, key=segment_target_score)
         if floor >= 16 and is_boss_room and self._is_kin_boss(state) and len(enemies) > 1 and damage > 0:
-            def kin_target_score(enemy: dict[str, Any]) -> tuple[int, int, int, int, int]:
+            priest_strength = self._enemy_power_amount(state, "strength", "力量")
+
+            def kin_target_score(enemy: dict[str, Any]) -> tuple[float, int, int, int, int]:
                 enemy_id = self._text(enemy.get("id") or enemy.get("name"))
                 is_priest = 1 if "priest" in enemy_id or "神官" in enemy_id else 0
                 is_follower = 1 if "follower" in enemy_id or "同族教徒" in enemy_id else 0
                 effective_hp = self._enemy_effective_hp(enemy)
                 lethal = 1 if damage >= effective_hp else 0
                 threat = self._enemy_threat(enemy)
+                early_or_scaling = 1 if round_no <= 4 or priest_strength >= 3 else 0
+                priest_bias = 60.0 if is_priest and early_or_scaling else 0.0
+                follower_lethal_bias = 48.0 if is_follower and lethal and round_no <= 3 else 0.0
                 return (
-                    lethal,
-                    is_follower,
-                    -effective_hp,
+                    lethal * 5000.0 + priest_bias + follower_lethal_bias + threat * 28.0 - effective_hp * 2.5,
+                    is_priest if early_or_scaling else is_follower,
                     threat,
-                    -is_priest,
+                    -effective_hp,
+                    -self._safe_int(enemy.get("index"), 0),
                 )
 
             return max(enemies, key=kin_target_score)
@@ -1573,6 +1638,12 @@ class SimpleFlowPolicy:
         is_targeted_boss = is_boss_floor or is_act2_boss or is_ceremonial_beast or is_kin or is_knowledge_demon
         high_value_combat = is_targeted_boss or is_elite_room
         round_no = self._safe_int(state.round, 0)
+        kin_priest_enemies = [
+            enemy
+            for enemy in enemies
+            if any(token in self._text(enemy.get("id") or enemy.get("name")) for token in ("priest", "神官"))
+        ]
+        kin_solo_priest_late = is_kin and len(enemies) == 1 and bool(kin_priest_enemies) and round_no >= 7
         sandpit_turns = self._sandpit_turns(state) if is_insatiable else 0
         lowest_enemy_ehp = min(self._enemy_effective_hp(enemy) for enemy in enemies)
         block_gap = max(0, incoming_damage - state.block)
@@ -1608,18 +1679,32 @@ class SimpleFlowPolicy:
             if is_ceremonial_beast and 1 <= round_no <= 4 and incoming_damage <= 24 and hp_ratio >= 0.35:
                 score += damage * 0.95
             if is_kin and len(enemies) > 1 and 1 <= round_no <= 4:
-                score += damage * 0.45
+                score += damage * 0.55
+                priest_strength = self._enemy_power_amount(state, "strength", "力量")
+                priest_ehps = [
+                    self._enemy_effective_hp(enemy)
+                    for enemy in enemies
+                    if any(token in self._text(enemy.get("id") or enemy.get("name")) for token in ("priest", "神官"))
+                ]
                 follower_ehps = [
                     self._enemy_effective_hp(enemy)
                     for enemy in enemies
                     if any(token in self._text(enemy.get("id") or enemy.get("name")) for token in ("follower", "同族教徒"))
                 ]
+                if priest_ehps:
+                    min_priest_ehp = min(priest_ehps)
+                    if damage >= min_priest_ehp:
+                        score += 65.0
+                    elif damage >= max(10, int(min_priest_ehp * 0.45)):
+                        score += 16.0
+                    if priest_strength >= 3:
+                        score += damage * 0.65 + 8.0
                 if follower_ehps:
                     min_follower_ehp = min(follower_ehps)
-                    if damage >= min_follower_ehp:
-                        score += 42.0
-                    elif damage >= max(8, int(min_follower_ehp * 0.5)):
-                        score += 12.0
+                    if damage >= min_follower_ehp and round_no <= 2:
+                        score += 18.0
+                    elif damage >= max(8, int(min_follower_ehp * 0.5)) and round_no <= 2:
+                        score += 6.0
             if is_vantom:
                 score += damage * 2.2
                 if vantom_slippery:
@@ -1645,6 +1730,8 @@ class SimpleFlowPolicy:
                     score += damage * 0.55
             if is_hard_act1_boss and round_no <= 4:
                 score += damage * 1.05 + 5.0
+            if kin_solo_priest_late:
+                score += damage * 1.4 + 12.0
             if damage >= lowest_enemy_ehp:
                 score += 18.0
             if "vulnerable" in description or "易伤" in description:
@@ -1656,6 +1743,8 @@ class SimpleFlowPolicy:
                 score += min(block, 12) * (1.35 if hp_ratio < 0.55 else 1.0)
             else:
                 score += block * 0.25
+            if kin_solo_priest_late and block_gap > block + 4:
+                score -= min(block, 14) * 1.1
             if is_act2_boss and block_gap > 0:
                 score += min(block, block_gap) * 1.15 + 4.0
             if is_elite_room and block_gap > 0:

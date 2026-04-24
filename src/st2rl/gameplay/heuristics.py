@@ -751,12 +751,18 @@ def estimate_card_reward_score(
             if cost >= 2 and card_id_upper in {"CARD.BLUDGEON", "CARD.PERFECTED_STRIKE", "CARD.HEAVY_BLADE"}:
                 score -= 1.8
         elif act1_boss_profile == "kin":
-            if card_id_upper in {"CARD.ANGER", "CARD.THUNDERCLAP", "CARD.UPPERCUT", "CARD.POMMEL_STRIKE"}:
-                score += 1.1
-            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT"}:
-                score += 0.65
+            if card_id_upper in {"CARD.ANGER", "CARD.THUNDERCLAP", "CARD.UPPERCUT", "CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE"}:
+                score += 1.9
+            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
+                score += 1.35
+            if draw_amount > 0 or energy_amount > 0:
+                score += 0.55
+            if card_id_upper in {"CARD.BLOODLETTING", "CARD.OFFERING"} and floor <= 13:
+                score -= 1.0
             if card_type == "attack" and cost >= 2 and draw_amount <= 0:
-                score -= 0.55
+                score -= 1.35
+            if card_id_upper in {"CARD.BLUDGEON", "CARD.PERFECTED_STRIKE", "CARD.HEAVY_BLADE", "CARD.DEMON_FORM"}:
+                score -= 1.7
         elif act1_boss_profile == "ceremonial":
             if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
                 score += 1.2
@@ -930,7 +936,7 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             if floor >= 10 and act1_boss_profile == "ceremonial":
                 value -= 1.1
             if floor >= 10 and act1_boss_profile == "kin":
-                value -= 0.8
+                value -= 1.5
             if floor >= 11 and act1_boss_profile == "vantom" and hp_ratio < 0.9:
                 value -= 0.85
         elif "rest" in room or "camp" in room or room == "r":
@@ -946,7 +952,7 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             if act1_boss_profile == "ceremonial" and floor >= 10:
                 value += 0.9
             if act1_boss_profile == "kin" and floor >= 11:
-                value += 0.7
+                value += 1.2
         elif "shop" in room or room in {"merchant", "$", "s"}:
             value = 2.65 if state.gold >= 150 else (0.35 if state.gold < 110 else 1.95)
             if purge_target is not None and state.gold >= 75:
@@ -961,6 +967,8 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
                 value += 0.9
             if act1_boss_profile in {"ceremonial", "kin"} and floor >= 10 and state.gold >= 90:
                 value += 0.6
+            if act1_boss_profile == "kin" and floor >= 10:
+                value += 0.45
             if act1_boss_profile == "vantom" and floor >= 9 and state.gold >= 80:
                 value += 0.35
         elif "treasure" in room or "chest" in room or room == "t":
@@ -1017,7 +1025,7 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
         if act1_boss_profile == "ceremonial" and has_elite_next and floor >= 10 and hp_ratio < 0.94:
             value -= 1.2
         if act1_boss_profile == "kin" and has_elite_next and floor >= 11:
-            value -= 0.95
+            value -= 1.7
         if any("elite" in next_room for next_room in next_rooms) and ("rest" in room or "shop" in room):
             value += 0.35
         if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):

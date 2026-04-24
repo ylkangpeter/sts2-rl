@@ -2959,13 +2959,49 @@ def _build_snapshot_payload() -> dict[str, Any]:
 
     training_status = str((snapshot.get("training") or {}).get("status") or "").lower()
     if training_status not in {"running", "paused", "stopping"}:
-        snapshot["training"] = dict(snapshot.get("training") or {})
-        snapshot["training"]["status"] = "idle"
-        snapshot["training"]["process_pid"] = 0
-        snapshot["training"]["process_count"] = 0
-        snapshot["training"]["thread_count"] = 0
-        snapshot["training"]["fps"] = 0.0
-        snapshot["active_slots"] = []
+        if live_training_pids or live_service_games:
+            training_payload = dict(snapshot.get("training") or {})
+            training_payload["status"] = "running"
+            training_payload["process_pid"] = live_training_pids[0] if live_training_pids else _safe_int(
+                training_payload.get("process_pid"), 0
+            )
+            training_payload["process_count"] = len(live_training_pids) if live_training_pids else max(
+                1, _safe_int(training_payload.get("process_count"), 0)
+            )
+            if _safe_int(training_payload.get("thread_count"), 0) <= 0 and live_training_pids:
+                process_stats = _process_resource_stats(live_training_pids[0])
+                if process_stats:
+                    training_payload["thread_count"] = _safe_int(process_stats.get("threads"), 0)
+                    working_set_mb = _safe_float(process_stats.get("working_set_mb"))
+                    private_mb = _safe_float(process_stats.get("private_mb"))
+                    if working_set_mb is not None:
+                        training_payload["memory_working_set_mb"] = working_set_mb
+                    if private_mb is not None:
+                        training_payload["memory_private_mb"] = private_mb
+            snapshot["training"] = training_payload
+            if not snapshot.get("active_slots") and live_service_games:
+                fallback_slots: list[dict[str, Any]] = []
+                for index, row in enumerate(live_service_games, start=1):
+                    game_id = str(row.get("game_id") or "")
+                    if not game_id:
+                        continue
+                    fallback_slots.append(
+                        {
+                            "slot": str(row.get("slot") or index),
+                            "game_id": game_id,
+                            "active": True,
+                            "source": "service_fallback",
+                        }
+                    )
+                snapshot["active_slots"] = fallback_slots
+        else:
+            snapshot["training"] = dict(snapshot.get("training") or {})
+            snapshot["training"]["status"] = "idle"
+            snapshot["training"]["process_pid"] = 0
+            snapshot["training"]["process_count"] = 0
+            snapshot["training"]["thread_count"] = 0
+            snapshot["training"]["fps"] = 0.0
+            snapshot["active_slots"] = []
     snapshot["all_time_summary"] = all_time_summary
     snapshot["historical_best"] = historical_best
     snapshot["launcher_logs"] = launcher_logs
