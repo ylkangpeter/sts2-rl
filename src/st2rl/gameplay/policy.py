@@ -170,7 +170,8 @@ class SimpleFlowPolicy:
                     },
                 )
             lethal_pressure_now = incoming_damage >= max(1, state.hp - state.block)
-            if lethal_follower_plays and round_no <= 2 and lethal_pressure_now:
+            follower_pressure_now = block_gap >= max(4, int(state.hp * 0.14)) or kin_priest_strength >= 2
+            if lethal_follower_plays and round_no <= 4 and (lethal_pressure_now or follower_pressure_now):
                 _score, lethal_card, lethal_target = max(lethal_follower_plays, key=lambda item: item[0])
                 return FlowAction(
                     "play_card",
@@ -537,6 +538,16 @@ class SimpleFlowPolicy:
         if card_needs_enemy_target(card):
             args["target_index"] = self._pick_combat_target(state, card, enemies).get("index", enemies[0]["index"])
             if is_kin and len(enemies) > 1 and incoming_damage < state.hp:
+                card_damage = self._card_damage(card)
+                can_lethal_follower = False
+                if card_damage > 0:
+                    follower_targets = [
+                        enemy
+                        for enemy in enemies
+                        if "follower" in self._text(enemy.get("id") or enemy.get("name"))
+                        or "同族教徒" in self._text(enemy.get("id") or enemy.get("name"))
+                    ]
+                    can_lethal_follower = any(card_damage >= self._enemy_effective_hp(enemy) for enemy in follower_targets)
                 priest = next(
                     (
                         enemy
@@ -546,7 +557,7 @@ class SimpleFlowPolicy:
                     ),
                     None,
                 )
-                if priest is not None and priest.get("index") is not None:
+                if not can_lethal_follower and priest is not None and priest.get("index") is not None:
                     args["target_index"] = priest.get("index")
         return FlowAction("play_card", args)
 
