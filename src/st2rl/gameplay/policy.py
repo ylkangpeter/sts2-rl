@@ -1704,7 +1704,12 @@ class SimpleFlowPolicy:
                 threat = self._enemy_threat(enemy)
                 early_or_scaling = 1 if round_no <= 4 or priest_strength >= 3 else 0
                 priest_bias = 300.0 if is_priest and kin_scaling_phase else (180.0 if is_priest else 0.0)
-                follower_lethal_bias = 10.0 if is_follower and lethal and round_no <= 2 else 0.0
+                follower_lethal_bias = 0.0
+                if is_follower and lethal:
+                    if incoming_damage >= max(8, int(state.hp * 0.22)):
+                        follower_lethal_bias += 120.0
+                    if round_no <= 2:
+                        follower_lethal_bias += 18.0
                 lethal_bias = lethal * (9000.0 if is_priest and kin_all_in_phase else (7000.0 if is_priest else (300.0 if incoming_damage >= state.hp else 0.0)))
                 non_priest_penalty = -140.0 if kin_scaling_phase and not is_priest else 0.0
                 return (
