@@ -755,14 +755,24 @@ def estimate_card_reward_score(
                 score += 1.9
             if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
                 score += 1.35
+            if card_id_upper == "CARD.FLAME_BARRIER":
+                score += 1.4
+            if card_id_upper == "CARD.SHRUG_IT_OFF":
+                score += 0.8
+            if card_id_upper in {"CARD.TAUNT", "CARD.ARMAMENTS"}:
+                score += 0.55
             if draw_amount > 0 or energy_amount > 0:
                 score += 0.55
+            if any(token in _description(card) for token in ("weak", "虚弱", "vulnerable", "易伤")):
+                score += 0.75
             if card_id_upper in {"CARD.BLOODLETTING", "CARD.OFFERING"} and floor <= 13:
                 score -= 1.0
             if card_type == "attack" and cost >= 2 and draw_amount <= 0:
                 score -= 1.35
             if card_id_upper in {"CARD.BLUDGEON", "CARD.PERFECTED_STRIKE", "CARD.HEAVY_BLADE", "CARD.DEMON_FORM"}:
                 score -= 1.7
+            if cost >= 2 and card_type == "power" and draw_amount <= 0 and energy_amount <= 0 and floor >= 10:
+                score -= 1.2
         elif act1_boss_profile == "ceremonial":
             if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
                 score += 1.2
@@ -930,15 +940,15 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             if floor >= 13 and hp_ratio < 0.9:
                 value -= 3.0
             if hard_act1_boss and floor >= 9:
-                value -= 2.2
+                value -= 4.0
             if hard_act1_boss and floor >= 12 and hp_ratio < 0.92:
-                value -= 2.0
+                value -= 2.8
             if floor >= 10 and act1_boss_profile == "ceremonial":
-                value -= 1.1
+                value -= 1.8
             if floor >= 10 and act1_boss_profile == "kin":
-                value -= 1.5
+                value -= 2.8
             if floor >= 11 and act1_boss_profile == "vantom" and hp_ratio < 0.9:
-                value -= 0.85
+                value -= 1.6
         elif "rest" in room or "camp" in room or room == "r":
             value = 4.4 if hp_ratio < 0.6 else (3.4 if hp_ratio < 0.8 else 1.15)
             if act == 2:
@@ -948,11 +958,11 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             if floor >= 14:
                 value += 1.35
             if hard_act1_boss and floor >= 10:
-                value += 1.45 if hp_ratio < 0.92 else 0.7
+                value += 2.2 if hp_ratio < 0.95 else 1.4
             if act1_boss_profile == "ceremonial" and floor >= 10:
-                value += 0.9
+                value += 1.35
             if act1_boss_profile == "kin" and floor >= 11:
-                value += 1.2
+                value += 1.75
         elif "shop" in room or room in {"merchant", "$", "s"}:
             value = 2.65 if state.gold >= 150 else (0.35 if state.gold < 110 else 1.95)
             if purge_target is not None and state.gold >= 75:
@@ -964,13 +974,13 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             if act == 2 and state.gold >= 100:
                 value += 0.85
             if hard_act1_boss and floor >= 10 and hp_ratio < 0.9:
-                value += 0.9
+                value += 1.4
             if act1_boss_profile in {"ceremonial", "kin"} and floor >= 10 and state.gold >= 90:
-                value += 0.6
+                value += 1.0
             if act1_boss_profile == "kin" and floor >= 10:
-                value += 0.45
+                value += 0.95
             if act1_boss_profile == "vantom" and floor >= 9 and state.gold >= 80:
-                value += 0.35
+                value += 0.75
         elif "treasure" in room or "chest" in room or room == "t":
             value = 1.9
         elif "event" in room or room == "?" or "question" in room:
@@ -1021,11 +1031,11 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             if hp_ratio < 0.97:
                 value -= 3.5
         if hard_act1_boss and has_elite_next and floor >= 10:
-            value -= 1.8
+            value -= 2.7
         if act1_boss_profile == "ceremonial" and has_elite_next and floor >= 10 and hp_ratio < 0.94:
-            value -= 1.2
+            value -= 1.8
         if act1_boss_profile == "kin" and has_elite_next and floor >= 11:
-            value -= 1.7
+            value -= 2.8
         if any("elite" in next_room for next_room in next_rooms) and ("rest" in room or "shop" in room):
             value += 0.35
         if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):

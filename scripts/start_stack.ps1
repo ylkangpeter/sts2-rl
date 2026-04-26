@@ -281,10 +281,10 @@ Start-ManagedProcess -Name "dashboard" -Node $config.dashboard -PythonExe $pytho
 Start-ManagedProcess -Name "watchdog" -Node $config.watchdog -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv
 Start-ManagedProcess -Name "session_supervisor" -Node $config.session_supervisor -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv
 
-if ($IncludeClient -or $config.client.enabled) {
-    Start-ManagedProcess -Name "client" -Node $config.client -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv -ForceEnabled:$IncludeClient
+if ($IncludeClient) {
+    Start-ManagedProcess -Name "client" -Node $config.client -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv -ForceEnabled:$true
 } else {
-    Write-Info "client disabled, skipping"
+    Write-Info "client auto-start disabled; use -IncludeClient to start training client"
 }
 
 if ($mutexAcquired) {

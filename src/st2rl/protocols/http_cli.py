@@ -371,6 +371,9 @@ class HttpCliProtocolConfig:
     close_retries: int = 5
     transport_retry_delay_seconds: float = 0.15
     close_retry_delay_seconds: float = 0.2
+    # One protocol instance is bound to one env worker slot; keep a single
+    # persistent HTTP connection to forbid pool overflow growth.
+    session_pool_size: int = 1
 
 
 class HttpCliProtocol(FlowProtocol):
@@ -378,16 +381,42 @@ class HttpCliProtocol(FlowProtocol):
 
     def __init__(self, config: HttpCliProtocolConfig | None = None):
         self.config = config or HttpCliProtocolConfig()
-        self._session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
+        self._pool_size = max(1, int(self.config.session_pool_size))
+        self._sessions: dict[int, requests.Session] = {}
         self._session_lock = threading.Lock()
         self._pending_event_select: dict[str, Any] | None = None
         self._start_lock = threading.Lock()
 
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=self._pool_size,
+            pool_maxsize=self._pool_size,
+            max_retries=0,
+            pool_block=True,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
     def _get_session(self) -> requests.Session:
-        return self._session
+        thread_id = threading.get_ident()
+        with self._session_lock:
+            session = self._sessions.get(thread_id)
+            if session is None:
+                session = self._build_session()
+                self._sessions[thread_id] = session
+            return session
+
+    def close(self) -> None:
+        with self._session_lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def _clear_pending_event_select(self) -> None:
         self._pending_event_select = None
@@ -437,13 +466,12 @@ class HttpCliProtocol(FlowProtocol):
             response: Optional[requests.Response] = None
             try:
                 timeout = max(1, min(int(self.config.timeout_seconds), 10))
-                with self._session_lock:
-                    if method == "GET":
-                        response = session.get(url, timeout=timeout)
-                    elif method == "POST":
-                        response = session.post(url, json=payload, timeout=timeout)
-                    else:
-                        raise ValueError(f"Unsupported method: {method}")
+                if method == "GET":
+                    response = session.get(url, timeout=timeout)
+                elif method == "POST":
+                    response = session.post(url, json=payload, timeout=timeout)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
 
                 try:
                     data = response.json()

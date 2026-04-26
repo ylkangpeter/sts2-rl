@@ -100,8 +100,26 @@ class SimpleFlowPolicy:
             if "priest" in self._text(enemy.get("id") or enemy.get("name"))
             or "神官" in self._text(enemy.get("id") or enemy.get("name"))
         ]
+        kin_multi_target = is_kin and len(enemies) > 1
+        kin_priest_strength = self._enemy_power_amount(state, "strength", "力量") if kin_multi_target else 0
+        kin_scaling_phase = kin_multi_target and bool(kin_priest_enemies) and (round_no >= 6 or kin_priest_strength >= 3)
+        kin_all_in_phase = kin_multi_target and bool(kin_priest_enemies) and (round_no >= 8 or kin_priest_strength >= 5)
         kin_solo_priest = is_kin and len(enemies) == 1 and bool(kin_priest_enemies)
-        if is_kin and len(enemies) > 1:
+        if kin_solo_priest and incoming_damage >= state.hp and len(playable) > 1:
+            block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                best_block = max(
+                    block_playable,
+                    key=lambda card: (
+                        self._card_block(card),
+                        self._combat_card_score(state, card),
+                    ),
+                )
+                args = {"card_index": best_block["index"]}
+                if card_needs_enemy_target(best_block):
+                    args["target_index"] = kin_priest_enemies[0].get("index", enemies[0]["index"])
+                return FlowAction("play_card", args)
+        if kin_multi_target:
             priest_targets = [
                 enemy
                 for enemy in enemies
@@ -151,7 +169,8 @@ class SimpleFlowPolicy:
                         "target_index": lethal_target.get("index", enemies[0]["index"]),
                     },
                 )
-            if lethal_follower_plays and round_no <= 2 and block_gap >= max(6, int(state.hp * 0.22)):
+            lethal_pressure_now = incoming_damage >= max(1, state.hp - state.block)
+            if lethal_follower_plays and round_no <= 2 and lethal_pressure_now:
                 _score, lethal_card, lethal_target = max(lethal_follower_plays, key=lambda item: item[0])
                 return FlowAction(
                     "play_card",
@@ -160,6 +179,22 @@ class SimpleFlowPolicy:
                         "target_index": lethal_target.get("index", enemies[0]["index"]),
                     },
                 )
+        if kin_scaling_phase and len(playable) > 1:
+            priest_pressure_playable = [
+                card
+                for card in playable
+                if self._card_damage(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+                or "weak" in self._text(card.get("description"))
+                or "虚弱" in self._text(card.get("description"))
+            ]
+            if priest_pressure_playable:
+                playable = priest_pressure_playable
+            if kin_all_in_phase:
+                all_in_damage = [card for card in playable if self._card_damage(card) > 0 or self._card_draw(card) > 0]
+                if all_in_damage and block_gap <= max(12, int(state.hp * 0.5)):
+                    playable = all_in_damage
 
         if vantom_slippery and len(playable) > 1:
             low_commit_playable = [
@@ -366,6 +401,9 @@ class SimpleFlowPolicy:
         if is_hard_act1_boss and block_gap >= max(5, int(state.hp * 0.18)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
             if block_playable:
+                if is_kin and kin_scaling_phase and block_gap < max(10, int(state.hp * 0.33)):
+                    block_playable = []
+            if block_playable:
                 act1_block_weight = 2.8 if is_ceremonial_beast else (2.4 if is_kin else 2.2)
                 block_scores = [
                     (
@@ -382,6 +420,10 @@ class SimpleFlowPolicy:
 
         if is_kin and len(enemies) > 1 and block_gap >= max(4, int(state.hp * 0.14)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
+            if block_playable:
+                allow_kin_forced_block = not kin_scaling_phase or block_gap >= max(14, int(state.hp * 0.5))
+                if not allow_kin_forced_block:
+                    block_playable = []
             if block_playable:
                 block_scores = [
                     (
@@ -494,6 +536,18 @@ class SimpleFlowPolicy:
         args = {"card_index": card["index"]}
         if card_needs_enemy_target(card):
             args["target_index"] = self._pick_combat_target(state, card, enemies).get("index", enemies[0]["index"])
+            if is_kin and len(enemies) > 1 and incoming_damage < state.hp:
+                priest = next(
+                    (
+                        enemy
+                        for enemy in enemies
+                        if "priest" in self._text(enemy.get("id") or enemy.get("name"))
+                        or "神官" in self._text(enemy.get("id") or enemy.get("name"))
+                    ),
+                    None,
+                )
+                if priest is not None and priest.get("index") is not None:
+                    args["target_index"] = priest.get("index")
         return FlowAction("play_card", args)
 
     @staticmethod
@@ -892,6 +946,19 @@ class SimpleFlowPolicy:
         round_no = self._safe_int(state.round, 0)
         followup_count, spendable_cost = self._playable_followup_pressure(state, card)
         unlocked_block, unlocked_damage = self._hp_loss_energy_followup_value(state, card)
+        living_enemies = state.living_enemies()
+        kin_tempo_window = (
+            self._is_kin_boss(state)
+            and len(living_enemies) > 1
+            and round_no <= 3
+            and block_gap <= max(4, int(state.hp * 0.12))
+            and hp_ratio >= 0.5
+            and state.hp > max(30, hp_loss + 18)
+            and followup_count >= 2
+            and spendable_cost > state.energy
+        )
+        if kin_tempo_window:
+            return False
         lowest_enemy_ehp = min((self._enemy_effective_hp(enemy) for enemy in state.living_enemies()), default=999)
         projected_hp = state.hp - hp_loss + state.block
         can_convert_now = (
@@ -1235,6 +1302,8 @@ class SimpleFlowPolicy:
         is_infested_prism = self._is_infested_prism_elite(state)
         is_hard_act2_elite = act >= 2 and is_elite_room and (is_decimillipede or is_entomancer or is_infested_prism)
         is_hard_act1_boss = act <= 1 and (is_vantom or is_kin or is_ceremonial_beast)
+        kin_priest_strength = self._enemy_power_amount(state, "strength", "力量") if is_kin else 0
+        kin_scaling_phase = is_kin and (self._safe_int(state.round, 0) >= 6 or kin_priest_strength >= 3)
         high_value_combat = is_boss_floor or is_elite_room
         late_act_pressure = floor >= 13
         early_boss_turn = is_boss_floor and (state.round in (None, 1, 2, 3))
@@ -1425,18 +1494,36 @@ class SimpleFlowPolicy:
             if best_debuff_choice is None or score > best_debuff_choice[0]:
                 best_debuff_choice = (score, potion, target)
 
+        if is_hard_act1_boss and early_boss_turn:
+            if best_attack_choice is not None and best_attack_choice[0] >= 6.0:
+                args = {"potion_index": best_attack_choice[1].get("index", 0)}
+                if "all" not in self._text(best_attack_choice[1].get("target_type")) and best_attack_choice[2] is not None:
+                    args["target_index"] = best_attack_choice[2].get("index")
+                return FlowAction("use_potion", args)
+            if best_debuff_choice is not None and best_debuff_choice[0] >= 6.0:
+                args = {"potion_index": best_debuff_choice[1].get("index", 0)}
+                if "all" not in self._text(best_debuff_choice[1].get("target_type")) and best_debuff_choice[2] is not None:
+                    args["target_index"] = best_debuff_choice[2].get("index")
+                return FlowAction("use_potion", args)
+            if best_setup_choice is not None and best_setup_choice[2] in {"draw", "setup"} and best_setup_choice[0] >= 12.0:
+                return FlowAction("use_potion", {"potion_index": best_setup_choice[1].get("index", 0)})
+            if best_self_choice is not None and best_self_choice[0] >= 12.0:
+                return FlowAction("use_potion", {"potion_index": best_self_choice[1].get("index", 0)})
+
         if best_attack_choice is not None and (
             incoming_damage >= state.hp
             or (not high_value_combat and hp_ratio < 0.35 and best_attack_choice[0] >= 35.0)
             or (high_value_combat and hp_ratio < 0.35)
             or (high_value_combat and best_attack_choice[0] >= 35.0)
+            or (is_hard_act1_boss and early_boss_turn and best_attack_choice[0] >= 10.0)
+            or (is_vantom and early_boss_turn and best_attack_choice[0] >= 12.0)
             or (is_hard_act1_boss and early_boss_turn and best_attack_choice[0] >= 20.0)
             or (is_act2_boss and early_boss_turn and best_attack_choice[0] >= 22.0)
             or (is_crusher_rocket and early_boss_turn and best_attack_choice[0] >= 16.0)
             or (is_hard_act2_elite and early_high_value_turn and best_attack_choice[0] >= 18.0)
             or (is_knowledge_demon and early_boss_turn and best_attack_choice[0] >= 18.0)
             or (is_insatiable and early_boss_turn and best_attack_choice[0] >= 18.0)
-            or (is_kin and early_boss_turn and best_attack_choice[0] >= 14.0)
+            or (is_kin and early_boss_turn and best_attack_choice[0] >= 8.0)
             or (early_high_value_turn and self._potion_damage_amount(best_attack_choice[1]) >= 10)
         ):
             args = {"potion_index": best_attack_choice[1].get("index", 0)}
@@ -1449,6 +1536,10 @@ class SimpleFlowPolicy:
             or (high_value_combat and block_gap >= 8)
             or (is_act2_boss and block_gap >= 5 and hp_ratio < 0.85)
             or (is_boss_floor and block_gap >= 6 and hp_ratio < 0.8)
+            or (is_hard_act1_boss and early_boss_turn and best_debuff_choice[0] >= 8.0)
+            or (is_vantom and early_boss_turn and best_debuff_choice[0] >= 10.0)
+            or (is_kin and early_boss_turn and best_debuff_choice[0] >= 4.0)
+            or (kin_scaling_phase and best_debuff_choice[0] >= 6.0)
             or (is_hard_act1_boss and early_boss_turn and block_gap >= 4)
             or (is_kin and early_boss_turn and block_gap >= 2)
             or (is_crusher_rocket and early_boss_turn and block_gap >= 4)
@@ -1465,6 +1556,12 @@ class SimpleFlowPolicy:
                 and (incoming_damage <= 0 or (block_gap <= 8 and hp_ratio >= 0.5))
             )
             or (
+                is_hard_act1_boss
+                and early_boss_turn
+                and best_setup_choice[2] in {"draw", "setup"}
+                and block_gap <= 12
+            )
+            or (
                 best_setup_choice[2] == "draw"
                 and is_boss_floor
                 and block_gap >= 10
@@ -1476,6 +1573,17 @@ class SimpleFlowPolicy:
                 and block_gap >= 8
                 and hp_ratio < 0.85
             )
+            or (
+                is_kin
+                and early_boss_turn
+                and best_setup_choice[2] in {"draw", "setup"}
+            )
+            or (
+                is_hard_act1_boss
+                and self._safe_int(state.round, 0) <= 5
+                and best_setup_choice[2] in {"draw", "setup"}
+                and hp_ratio < 0.85
+            )
         ):
             return FlowAction("use_potion", {"potion_index": best_setup_choice[1].get("index", 0)})
 
@@ -1483,6 +1591,8 @@ class SimpleFlowPolicy:
             incoming_damage >= state.hp
             or (high_value_combat and best_self_choice[0] >= 22.0)
             or (early_high_value_turn and best_self_choice[0] >= 16.0)
+            or (is_ceremonial_beast and early_boss_turn and (block_gap >= 4 or hp_ratio < 0.82) and best_self_choice[0] >= 10.0)
+            or (is_kin and early_boss_turn and best_self_choice[0] >= 8.0)
             or (is_hard_act1_boss and early_boss_turn and best_self_choice[0] >= 14.0 and block_gap <= 8)
             or (is_act2_boss and early_boss_turn and best_self_choice[0] >= 13.0 and block_gap >= 4)
             or (is_crusher_rocket and early_boss_turn and best_self_choice[0] >= 12.0)
@@ -1493,6 +1603,8 @@ class SimpleFlowPolicy:
         if best_choice is not None and (
             incoming_damage >= state.hp
             or hp_ratio < 0.22
+            or (is_hard_act1_boss and hp_ratio < 0.6 and block_gap > 0)
+            or (is_kin and hp_ratio < 0.8 and block_gap > 0)
             or (high_value_combat and hp_ratio < 0.72)
         ):
             return FlowAction("use_potion", {"potion_index": best_choice[1].get("index", 0)})
@@ -1568,6 +1680,9 @@ class SimpleFlowPolicy:
             return max(enemies, key=segment_target_score)
         if floor >= 16 and is_boss_room and self._is_kin_boss(state) and len(enemies) > 1 and damage > 0:
             priest_strength = self._enemy_power_amount(state, "strength", "力量")
+            incoming_damage = self._enemy_intended_damage(state)
+            kin_scaling_phase = round_no >= 6 or priest_strength >= 3
+            kin_all_in_phase = round_no >= 8 or priest_strength >= 5
 
             def kin_target_score(enemy: dict[str, Any]) -> tuple[float, int, int, int, int]:
                 enemy_id = self._text(enemy.get("id") or enemy.get("name"))
@@ -1577,11 +1692,13 @@ class SimpleFlowPolicy:
                 lethal = 1 if damage >= effective_hp else 0
                 threat = self._enemy_threat(enemy)
                 early_or_scaling = 1 if round_no <= 4 or priest_strength >= 3 else 0
-                priest_bias = 60.0 if is_priest and early_or_scaling else 0.0
-                follower_lethal_bias = 48.0 if is_follower and lethal and round_no <= 3 else 0.0
+                priest_bias = 300.0 if is_priest and kin_scaling_phase else (180.0 if is_priest else 0.0)
+                follower_lethal_bias = 10.0 if is_follower and lethal and round_no <= 2 else 0.0
+                lethal_bias = lethal * (9000.0 if is_priest and kin_all_in_phase else (7000.0 if is_priest else (300.0 if incoming_damage >= state.hp else 0.0)))
+                non_priest_penalty = -140.0 if kin_scaling_phase and not is_priest else 0.0
                 return (
-                    lethal * 5000.0 + priest_bias + follower_lethal_bias + threat * 28.0 - effective_hp * 2.5,
-                    is_priest if early_or_scaling else is_follower,
+                    lethal_bias + priest_bias + follower_lethal_bias + non_priest_penalty + threat * 28.0 - effective_hp * 2.5,
+                    is_priest if early_or_scaling else 0,
                     threat,
                     -effective_hp,
                     -self._safe_int(enemy.get("index"), 0),
@@ -1643,6 +1760,9 @@ class SimpleFlowPolicy:
             for enemy in enemies
             if any(token in self._text(enemy.get("id") or enemy.get("name")) for token in ("priest", "神官"))
         ]
+        kin_priest_strength = self._enemy_power_amount(state, "strength", "力量") if is_kin and len(enemies) > 1 else 0
+        kin_scaling_phase = is_kin and len(enemies) > 1 and bool(kin_priest_enemies) and (round_no >= 6 or kin_priest_strength >= 3)
+        kin_all_in_phase = is_kin and len(enemies) > 1 and bool(kin_priest_enemies) and (round_no >= 8 or kin_priest_strength >= 5)
         kin_solo_priest_late = is_kin and len(enemies) == 1 and bool(kin_priest_enemies) and round_no >= 7
         sandpit_turns = self._sandpit_turns(state) if is_insatiable else 0
         lowest_enemy_ehp = min(self._enemy_effective_hp(enemy) for enemy in enemies)
@@ -1701,10 +1821,12 @@ class SimpleFlowPolicy:
                         score += damage * 0.65 + 8.0
                 if follower_ehps:
                     min_follower_ehp = min(follower_ehps)
-                    if damage >= min_follower_ehp and round_no <= 2:
-                        score += 18.0
-                    elif damage >= max(8, int(min_follower_ehp * 0.5)) and round_no <= 2:
-                        score += 6.0
+                    if block_gap >= state.hp and damage >= min_follower_ehp and round_no <= 2:
+                        score += 8.0
+            if kin_scaling_phase:
+                score += damage * 0.95 + 6.0
+                if kin_all_in_phase:
+                    score += damage * 0.45 + 6.0
             if is_vantom:
                 score += damage * 2.2
                 if vantom_slippery:
@@ -1759,6 +1881,8 @@ class SimpleFlowPolicy:
                 score += min(block, block_gap) * 3.1 + 4.0
             if is_hard_act1_boss and round_no <= 4 and incoming_damage <= state.block + 6 and damage <= 0:
                 score -= min(block, 16) * 2.0
+            if kin_scaling_phase and damage <= 0 and block_gap <= max(12, int(state.hp * 0.45)):
+                score -= min(block, 18) * 2.0
             current_projected_hp = state.hp + state.block - incoming_damage
             projected_hp_after_block = state.hp + state.block + block - incoming_damage
             prevented = max(0, min(block, incoming_damage - state.block))
@@ -1928,6 +2052,8 @@ class SimpleFlowPolicy:
             score += 0.5
             if is_hard_act2_elite and round_no <= 2 and block_gap > 0 and damage <= 0 and block <= 0:
                 score -= 6.0
+            if kin_scaling_phase and damage <= 0 and block <= 0 and draw_amount <= 0 and energy_gain <= 0:
+                score -= 14.0
             if (
                 is_crusher_rocket
                 and round_no <= 2
@@ -1957,6 +2083,8 @@ class SimpleFlowPolicy:
                 score -= 20.0
             if is_hard_act1_boss and round_no <= 2 and incoming_damage > state.block + 6 and damage <= 0:
                 score -= 12.0
+            if kin_scaling_phase and damage <= 0 and block_gap > 0 and round_no >= 6:
+                score -= 14.0
             if is_boss_floor and not lethal_pressure:
                 if state.round in (None, 1, 2):
                     score += 11.0
@@ -2006,6 +2134,16 @@ class SimpleFlowPolicy:
         if card_id in {"CARD.BLOODLETTING", "CARD.OFFERING"} and is_targeted_boss:
             followup_count, spendable_cost = self._playable_followup_pressure(state, card)
             round_no = self._safe_int(state.round, 0)
+            kin_tempo_window = (
+                is_kin
+                and len(enemies) > 1
+                and round_no <= 3
+                and block_gap <= max(4, int(state.hp * 0.12))
+                and hp_ratio >= 0.5
+                and followup_count >= 2
+                and spendable_cost > state.energy
+                and state.hp > max(30, int(state.max_hp * 0.5))
+            )
             if is_knowledge_demon and incoming_damage <= 0 and round_no <= 2:
                 if followup_count >= 2 and spendable_cost > state.energy and hp_ratio >= 0.45:
                     score += 45.0
@@ -2038,12 +2176,16 @@ class SimpleFlowPolicy:
                     or followup_count < 3
                     or spendable_cost <= state.energy
                 )
+                if kin_tempo_window:
+                    hard_block = False
                 if hard_block:
                     return -240.0
             if block_gap > 0:
                 score -= 45.0 + min(block_gap, 20) * 1.8
                 if followup_count < 3 or spendable_cost <= state.energy:
                     score -= 22.0
+                if kin_tempo_window:
+                    score += 22.0
             if state.hp <= max(24, int(state.max_hp * 0.42)):
                 score -= 35.0
             if is_ceremonial_beast or is_kin:
@@ -2054,6 +2196,8 @@ class SimpleFlowPolicy:
                     score -= 85.0
                 if followup_count < 3 or spendable_cost <= state.energy:
                     score -= 35.0
+                if kin_tempo_window:
+                    score += 30.0
             if is_ceremonial_beast and hp_ratio < 0.75:
                 score -= 80.0
 
@@ -2136,6 +2280,7 @@ class SimpleFlowPolicy:
             or state.hp / max(1, state.max_hp) < 0.65
             or (upcoming_act1_boss in {"ceremonial", "kin"} and floor >= 10)
             or (upcoming_act1_boss == "vantom" and floor >= 12)
+            or (upcoming_act1_boss in {"ceremonial", "kin", "vantom"} and floor >= 9)
         ):
             return FlowAction("buy_potion", {"potion_index": best_potion.get("index", 0)})
 
@@ -2183,11 +2328,13 @@ class SimpleFlowPolicy:
         if hard_act1_boss:
             heal_threshold = max(heal_threshold, 0.9 if floor < 14 else 0.93)
         if upcoming_act1_boss == "ceremonial":
-            heal_threshold = max(heal_threshold, 0.92 if floor < 13 else 0.95)
+            heal_threshold = max(heal_threshold, 0.93 if floor < 13 else 0.96)
         elif upcoming_act1_boss == "kin":
-            heal_threshold = max(heal_threshold, 0.9 if floor < 13 else 0.94)
+            heal_threshold = max(heal_threshold, 0.93 if floor < 13 else 0.96)
         elif upcoming_act1_boss == "vantom":
-            heal_threshold = max(heal_threshold, 0.88 if floor < 13 else 0.92)
+            heal_threshold = max(heal_threshold, 0.9 if floor < 13 else 0.94)
+        if act == 1 and floor >= 15 and upcoming_act1_boss in {"ceremonial", "kin", "vantom"}:
+            heal_threshold = max(heal_threshold, 0.98)
         if hp_ratio < max(0.4, heal_threshold):
             heal = next(
                 (

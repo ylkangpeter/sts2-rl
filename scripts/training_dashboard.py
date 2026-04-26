@@ -78,6 +78,7 @@ TELEMETRY_STATE: dict[str, Any] = {
     "launcher_logs": {},
 }
 SESSION_DETAILS_RECENT_LIMIT = 80
+TREND_WINDOW_SIZE = 30
 
 app = Flask(__name__)
 
@@ -1180,7 +1181,14 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
         item["details_available"] = bool(item.get("details_available") or item.get("game_id") in detailed_ids)
     training = deepcopy(run.get("training") or {})
     resources = _collect_resource_summary(training)
-    trend = _build_trend_summary(training, top_sessions)
+    trend_rows: list[dict[str, Any]] = []
+    for rows in (run.get("slot_histories") or {}).values():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                trend_rows.append(dict(row))
+    trend = _build_trend_summary(training, trend_rows)
     floor_distribution_rows: list[dict[str, Any]] = [dict(row) for row in top_sessions]
     for rows in (run.get("slot_histories") or {}).values():
         if not isinstance(rows, list):
@@ -1407,7 +1415,7 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
     active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
     resources = _collect_resource_summary(training)
-    trend = _build_trend_summary(training, top_sessions)
+    trend = _build_trend_summary(training, list(history_by_job.values()))
     floor_distribution = _build_floor_distribution(list(history_by_job.values()))
     completed_session_count = max(
         sum(1 for item in history_by_job.values() if not item.get("active", False)),
@@ -2313,11 +2321,11 @@ def _trend_mean(rows: list[dict[str, Any]], key: str) -> float:
     return round(sum(clean) / len(clean), 2) if clean else 0.0
 
 
-def _build_trend_summary(training: dict[str, Any], top_sessions: list[dict[str, Any]]) -> dict[str, Any]:
-    rows = [dict(item) for item in top_sessions if isinstance(item, dict)]
+def _build_trend_summary(training: dict[str, Any], session_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [dict(item) for item in session_rows if isinstance(item, dict) and not bool(item.get("active", False))]
     rows.sort(key=lambda item: str(item.get("finished_at") or item.get("recorded_at") or ""), reverse=True)
-    recent = _trend_window(rows, 0, 12)
-    previous = _trend_window(rows, 12, 12)
+    recent = _trend_window(rows, 0, TREND_WINDOW_SIZE)
+    previous = _trend_window(rows, TREND_WINDOW_SIZE, TREND_WINDOW_SIZE)
     recent_floor = round(sum(_row_global_floor(_normalize_floor_fields(item)) for item in recent) / len(recent), 2) if recent else 0.0
     previous_floor = round(sum(_row_global_floor(_normalize_floor_fields(item)) for item in previous) / len(previous), 2) if previous else 0.0
     recent_reward = _trend_mean(recent, "episode_reward")
@@ -2680,13 +2688,12 @@ def _stop_training_process() -> dict[str, Any]:
             _force_training_status(latest_run, "stopped")
             _set_runtime_control(latest_run.name, None)
 
-    remaining = _wait_for_training_exit(timeout_seconds=8.0, poll_interval_seconds=0.5)
     forced = False
     terminated: list[int] = []
-    terminated = _terminate_training_processes(remaining)
-    remaining = _wait_for_training_exit(timeout_seconds=3.0, poll_interval_seconds=0.3)
-    if terminated:
-        forced = True
+    if existing_pids:
+        terminated = _terminate_training_processes(existing_pids)
+        forced = bool(terminated)
+    remaining = _wait_for_training_exit(timeout_seconds=2.0, poll_interval_seconds=0.2)
     if not remaining:
         _clear_pid("client")
     stack_stop = _stop_support_stack()

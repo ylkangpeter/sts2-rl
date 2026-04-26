@@ -449,44 +449,6 @@ def _start_managed_process(name: str, node: dict[str, Any] | None, runtime: dict
         return False
 
 
-def _spawn_replacement_watchdog(runtime: dict[str, Any]) -> None:
-    watchdog = runtime.get("watchdog") or {}
-    if not isinstance(watchdog, dict) or not bool(watchdog.get("enabled", False)):
-        return
-
-    default_root = _project_root(runtime, "st2rl_root", ROOT)
-    workdir = _resolve_managed_path(default_root, watchdog.get("workdir") or default_root)
-    script_path = _resolve_managed_path(default_root, watchdog.get("script"))
-    if not script_path.exists():
-        print(f"[watchdog] replacement watchdog script missing at {script_path}", flush=True)
-        return
-
-    log_dir = ROOT / "logs" / "launcher"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = log_dir / "watchdog.out.log"
-    stderr_path = log_dir / "watchdog.err.log"
-
-    env = os.environ.copy()
-    env.update(_shared_runtime_env(runtime))
-    for key, value in (watchdog.get("env") or {}).items():
-        env[str(key)] = str(value)
-    python_executable = _node_python_executable(runtime, watchdog)
-
-    try:
-        with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
-            subprocess.Popen(
-                [python_executable, str(script_path)],
-                cwd=str(workdir),
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                env=env,
-                **_subprocess_kwargs(),
-            )
-        print("[watchdog] replacement watchdog spawned", flush=True)
-    except Exception as exc:
-        print(f"[watchdog] failed to spawn replacement watchdog: {exc}", flush=True)
-
-
 def _node_health_url(node: dict[str, Any] | None) -> str | None:
     if not isinstance(node, dict):
         return None
@@ -549,51 +511,6 @@ def _stop_processes(pids: list[int]) -> None:
             continue
 
 
-def _wait_for_url(url: str, *, timeout_seconds: int = 30) -> bool:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        try:
-            _json_request(url, timeout=3.0)
-            return True
-        except Exception:
-            time.sleep(1.0)
-    return False
-
-
-def _start_stack(*, include_client: bool = True) -> None:
-    command = [
-        _powershell_executable(),
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(ROOT / "scripts" / "start_stack.ps1"),
-    ]
-    if include_client:
-        command.append("-IncludeClient")
-    subprocess.run(
-        command,
-        cwd=str(ROOT),
-        timeout=90,
-        **_subprocess_kwargs(),
-    )
-
-
-def _pid_candidates(name: str, node: dict[str, Any] | None) -> list[int]:
-    candidates: list[int] = []
-    seen: set[int] = set()
-    pid = _pid_from_file(name)
-    if pid is not None:
-        seen.add(pid)
-        candidates.append(pid)
-    process_match = str((node or {}).get("process_match") or "").strip()
-    if process_match:
-        for current_pid in _find_python_pids(process_match):
-            if current_pid not in seen:
-                seen.add(current_pid)
-                candidates.append(current_pid)
-    return candidates
-
-
 def _listening_port_pids(port: int) -> list[int]:
     try:
         output = _run_powershell(
@@ -603,72 +520,6 @@ def _listening_port_pids(port: int) -> list[int]:
     except Exception:
         return []
     return [int(line.strip()) for line in output.splitlines() if line.strip().isdigit()]
-
-
-def _terminate_runtime_stack(runtime: dict[str, Any]) -> None:
-    targets: set[int] = set()
-    for name in ("client", "service", "dashboard", "session_supervisor"):
-        node = runtime.get(name) or {}
-        targets.update(_pid_candidates(name, node))
-    targets.update(_listening_port_pids(5000))
-    targets.update(_listening_port_pids(8787))
-    if targets:
-        _stop_processes(sorted(targets))
-        time.sleep(2.0)
-    for name in ("client", "service", "dashboard", "session_supervisor"):
-        path = _pid_file(name)
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                pass
-
-
-def _powershell_literal(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def _spawn_hard_restart() -> None:
-    patterns = [
-        "http_game_service.py",
-        "training_dashboard.py",
-        "training_watchdog.py",
-        "training_session_supervisor.py",
-        "train_http_cli_rl.py",
-    ]
-    pattern_list = ",".join(_powershell_literal(item) for item in patterns)
-    start_stack_path = _powershell_literal(str(ROOT / "scripts" / "start_stack.ps1"))
-    current_pid = int(os.getpid())
-    script = f"""
-$patterns = @({pattern_list})
-$targets = @()
-$targets += Get-CimInstance Win32_Process |
-  Where-Object {{ $_.CommandLine -and ($_.Name -in @('python.exe','pythonw.exe')) }} |
-  Where-Object {{ $cmd = $_.CommandLine; ($patterns | Where-Object {{ $cmd -like "*$_*" }}).Count -gt 0 }} |
-  Select-Object -ExpandProperty ProcessId
-foreach ($port in 5000,8787) {{
-  $owner = netstat -ano -p tcp | Select-String 'LISTENING' | Where-Object {{ $_.Line -match "[:\\.]$port\\s+" }} | Select-Object -First 1
-  if ($owner) {{
-    $parts = ($owner.Line -replace '\\s+', ' ').Trim().Split(' ')
-    $targets += [int]$parts[-1]
-  }}
-}}
-$targets += {current_pid}
-$targets = $targets | Where-Object {{ $_ }} | Sort-Object -Unique
-if ($targets) {{
-  Stop-Process -Id $targets -Force -ErrorAction SilentlyContinue
-}}
-Start-Sleep -Seconds 3
-Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-ExecutionPolicy','Bypass','-File',{start_stack_path}) | Out-Null
-"""
-    subprocess.Popen(
-        [_powershell_executable(), "-NoProfile", "-Command", script],
-        cwd=str(ROOT),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        **_subprocess_kwargs(),
-    )
 
 
 def _load_state() -> dict[str, Any]:
@@ -1045,67 +896,28 @@ def _detect_history_incidents(snapshot: dict[str, Any], state: dict[str, Any]) -
             if any("deadlock" in marker or "protocol_deadlock" in marker or "stuck" in marker for marker in deadlock_markers if marker):
                 incidents.append(
                     {
-                    **common,
-                    "type": "deadlock_session",
-                    "reason": f"session ended with deadlock markers: termination_reason={termination_reason or '-'} flags={flags_display or anomaly_flags}",
-                    "restart_required": True,
-                }
-            )
+                        **common,
+                        "type": "deadlock_session",
+                        "reason": f"session ended with deadlock markers: termination_reason={termination_reason or '-'} flags={flags_display or anomaly_flags}",
+                        "restart_required": False,
+                    }
+                )
     return incidents
 
 
 def _restart_allowed(state: dict[str, Any], config: WatchdogConfig) -> bool:
-    last_restart_at = _parse_iso(state.get("last_restart_at"))
-    if last_restart_at is None:
-        return True
-    return (_now() - last_restart_at).total_seconds() >= config.restart_cooldown_seconds
-
-
-def _stop_service(runtime: dict[str, Any]) -> None:
-    service = runtime.get("service") or {}
-    process_match = str(service.get("process_match") or "http_game_service.py")
-    pids = _find_python_pids(process_match)
-    if pids:
-        _stop_processes(pids)
+    _ = state
+    _ = config
+    # Watchdog is monitor-only: restart is never allowed.
+    return False
 
 
 def _restart_runtime(runtime: dict[str, Any], config: WatchdogConfig, reason: str, state: dict[str, Any]) -> None:
-    if not config.intervention_enabled:
-        print(f"[watchdog] intervention disabled; restart suppressed: {reason}", flush=True)
-        return
-    if not _restart_allowed(state, config):
-        print(f"[watchdog] restart skipped due to cooldown: {reason}", flush=True)
-        return
-
-    state["last_restart_at"] = _now_iso()
-    state["restart_count"] = _safe_int(state.get("restart_count"), 0) + 1
-    history = list(state.get("restart_history") or [])
-    history.append({"at": state["last_restart_at"], "reason": reason})
-    state["restart_history"] = history
-    desired_num_envs = _recommended_num_envs(runtime, state)
-    state["current_num_envs"] = desired_num_envs
-    _write_json(STATE_PATH, _trim_state(state))
-    print(f"[watchdog] restarting full stack in-process: {reason}", flush=True)
-    try:
-        _terminate_runtime_stack(runtime)
-        _clear_pid = _pid_file("watchdog")
-        if _clear_pid.exists():
-            try:
-                _clear_pid.unlink()
-            except OSError:
-                pass
-        _start_stack(include_client=True)
-        dashboard_ok = _wait_for_url(f"{_dashboard_base_url()}/api/state", timeout_seconds=45)
-        service_ok = _wait_for_url(f"{_service_base_url(runtime)}/health", timeout_seconds=45)
-        print(
-            f"[watchdog] restart completed: dashboard_ok={dashboard_ok} service_ok={service_ok}",
-            flush=True,
-        )
-        _spawn_replacement_watchdog(runtime)
-    except Exception as exc:
-        print(f"[watchdog] in-process restart failed, falling back to hard restart: {exc}", flush=True)
-        _spawn_hard_restart()
-    raise SystemExit(0)
+    _ = runtime
+    _ = config
+    _ = state
+    print(f"[watchdog] monitor-only mode: intervention suppressed ({reason})", flush=True)
+    return
 
 
 def _handle_restartable_incidents(
@@ -1114,15 +926,18 @@ def _handle_restartable_incidents(
     state: dict[str, Any],
     incidents: list[dict[str, Any]],
 ) -> None:
+    _ = runtime
+    _ = config
+    _ = state
     restartable = [incident for incident in incidents if bool(incident.get("restart_required"))]
-    if not restartable:
-        return
-    first = restartable[0]
-    reason = str(first.get("reason") or first.get("type") or "incident")
-    seed = str(first.get("seed") or "")
-    if seed:
-        reason = f"{reason} | seed={seed}"
-    _restart_runtime(runtime, config, reason, state)
+    if restartable:
+        first = restartable[0]
+        reason = str(first.get("reason") or first.get("type") or "incident")
+        seed = str(first.get("seed") or "")
+        if seed:
+            reason = f"{reason} | seed={seed}"
+        print(f"[watchdog] monitor-only: flagged intervention candidate ({reason})", flush=True)
+    return
 
 
 def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], config: WatchdogConfig, state: dict[str, Any]) -> None:
@@ -1160,10 +975,10 @@ def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], 
             updated_age_seconds is not None and updated_age_seconds >= config.no_training_grace_seconds
         ):
             print(
-                f"[watchdog] training client missing while status={status or 'unknown'} active_slots={len(active_slots)} updated_age={updated_age_seconds} missing_age={missing_age_seconds}",
+                f"[watchdog] training client missing while status={status or 'unknown'} active_slots={len(active_slots)} "
+                f"updated_age={updated_age_seconds} missing_age={missing_age_seconds}",
                 flush=True,
             )
-            _restart_runtime(runtime, config, "training_client_missing", state)
         return
 
     if status == "running" or active_slots:
@@ -1183,22 +998,7 @@ def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], 
     if (_now() - since).total_seconds() < config.no_training_grace_seconds:
         return
 
-    if not config.intervention_enabled:
-        print("[watchdog] intervention disabled; training start suppressed", flush=True)
-        return
-
-    print("[watchdog] no active training detected; starting client", flush=True)
-    try:
-        desired_num_envs = _recommended_num_envs(runtime, state, snapshot)
-        state["current_num_envs"] = desired_num_envs
-        result = _post_dashboard(
-            "/api/control/start",
-            {"total_timesteps": config.total_timesteps, "num_envs": desired_num_envs},
-        )
-        print(f"[watchdog] start result: {result}", flush=True)
-    except Exception as exc:
-        print(f"[watchdog] dashboard start failed, falling back to stack restart: {exc}", flush=True)
-        _restart_runtime(_load_runtime_config(), config, "training_missing", state)
+    print("[watchdog] monitor-only: no active training detected; start suppressed", flush=True)
     state["training_missing_since"] = None
 
 
@@ -1211,17 +1011,17 @@ def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | 
 
     dashboard = runtime.get("dashboard") or {}
     if not _is_managed_process_running(dashboard):
-        _restart_runtime(runtime, config, "dashboard_process_missing", state)
+        print("[watchdog] monitor-only: dashboard_process_missing", flush=True)
         return
 
     try:
         health = _service_health(runtime)
     except Exception as exc:
-        _restart_runtime(runtime, config, f"service_unavailable: {exc}", state)
+        print(f"[watchdog] monitor-only: service_unavailable: {exc}", flush=True)
         return
 
     if str(health.get("status") or "").lower() != "healthy":
-        _restart_runtime(runtime, config, f"service_unhealthy: {health}", state)
+        print(f"[watchdog] monitor-only: service_unhealthy: {health}", flush=True)
         return
 
     training = (snapshot or {}).get("training") or {}
@@ -1234,21 +1034,18 @@ def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | 
     if busy_workers > active_games + 1:
         if startup_grace_active and active_games == 0:
             return
-        _restart_runtime(
-            runtime,
-            config,
-            f"worker_leak_detected: active_games={active_games} busy_workers={busy_workers}",
-            state,
+        print(
+            f"[watchdog] monitor-only: worker_leak_detected active_games={active_games} busy_workers={busy_workers}",
+            flush=True,
         )
         return
     if expected_envs > 1 and active_games < max(1, expected_envs - 1) and len(active_slots) < max(1, expected_envs - 1):
         if startup_grace_active:
             return
-        _restart_runtime(
-            runtime,
-            config,
-            f"parallelism_collapsed: expected_envs={expected_envs} active_games={active_games} active_slots={len(active_slots)}",
-            state,
+        print(
+            f"[watchdog] monitor-only: parallelism_collapsed expected_envs={expected_envs} "
+            f"active_games={active_games} active_slots={len(active_slots)}",
+            flush=True,
         )
         return
 
@@ -1278,11 +1075,7 @@ def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | 
 
     session_supervisor = runtime.get("session_supervisor") or {}
     if not _is_managed_process_running(session_supervisor):
-        if not config.intervention_enabled:
-            print("[watchdog] intervention disabled; session_supervisor start suppressed", flush=True)
-        else:
-            print("[watchdog] session_supervisor missing; starting session_supervisor only", flush=True)
-            _start_managed_process("session_supervisor", session_supervisor, runtime)
+        print("[watchdog] monitor-only: session_supervisor missing", flush=True)
 
 
 def _write_status(snapshot: dict[str, Any] | None, incidents: list[dict[str, Any]], state: dict[str, Any]) -> None:
@@ -1349,10 +1142,10 @@ def main() -> None:
                 "game_id": None,
                 "seed": None,
                 "reason": str(exc),
-                "restart_required": True,
+                "restart_required": False,
             }
             _record_incident(state, incident)
-            _restart_runtime(runtime, config, f"dashboard_unavailable: {exc}", state)
+            print(f"[watchdog] monitor-only: dashboard_unavailable: {exc}", flush=True)
             incidents = [incident]
         except Exception as exc:
             print(f"[watchdog] unexpected error: {exc}", flush=True)

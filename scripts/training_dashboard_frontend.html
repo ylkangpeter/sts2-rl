@@ -117,6 +117,18 @@
       .memory-lines { grid-template-columns:1fr; }
     }
     svg polyline { stroke-linecap:round; stroke-linejoin:round; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .toggle-btn {
+      border:1px solid #5f6f82;
+      background:#1a232f;
+      color:#cfd8e3;
+      border-radius:8px;
+      font-size:12px;
+      padding:6px 10px;
+      cursor:pointer;
+    }
+    .toggle-btn:hover { border-color:#8fa2b8; color:#e5edf6; }
+    .collapsed { display:none; }
   </style>
 </head>
 <body>
@@ -129,8 +141,13 @@
     <div class="grid" id="cards"></div>
     <h2>Active Slots</h2>
     <table id="activeTable"></table>
-    <h2>Slot History</h2>
-    <div id="slotCharts"></div>
+    <div class="section-head">
+      <h2>Slot History</h2>
+      <button id="slotHistoryToggle" class="toggle-btn" type="button">Expand</button>
+    </div>
+    <div id="slotHistoryBody" class="collapsed">
+      <div id="slotCharts"></div>
+    </div>
     <h2>Checkpoints</h2>
     <table id="checkpointTable"></table>
     <h2>Current Run Top 50</h2>
@@ -223,6 +240,32 @@
     let currentSessionGameId = null;
     let currentAct = null;
     let currentNodeId = null;
+    const SLOT_HISTORY_COLLAPSE_KEY = 'sts2.dashboard.slot_history.collapsed';
+    let slotHistoryCollapsed = true;
+
+    function applySlotHistoryCollapsed() {
+      const body = document.getElementById('slotHistoryBody');
+      const toggle = document.getElementById('slotHistoryToggle');
+      if (!body || !toggle) return;
+      body.classList.toggle('collapsed', slotHistoryCollapsed);
+      toggle.textContent = slotHistoryCollapsed ? 'Expand' : 'Collapse';
+    }
+
+    function initSlotHistoryCollapsed() {
+      const raw = localStorage.getItem(SLOT_HISTORY_COLLAPSE_KEY);
+      if (raw === '0') slotHistoryCollapsed = false;
+      else if (raw === '1') slotHistoryCollapsed = true;
+      else slotHistoryCollapsed = true;
+      const toggle = document.getElementById('slotHistoryToggle');
+      if (toggle) {
+        toggle.addEventListener('click', () => {
+          slotHistoryCollapsed = !slotHistoryCollapsed;
+          localStorage.setItem(SLOT_HISTORY_COLLAPSE_KEY, slotHistoryCollapsed ? '1' : '0');
+          applySlotHistoryCollapsed();
+        });
+      }
+      applySlotHistoryCollapsed();
+    }
     let currentNodeStageIndex = 0;
     let currentRunDir = null;
     let activeAlerts = [];
@@ -551,7 +594,7 @@
         { label: 'Trend', value: kpi(trend.recent_floor_mean ?? '-', trend.degrading ? 'metric-warn' : 'metric-good'), sub: `Prev floor ${kpi(trend.previous_floor_mean ?? '-')} | Delta ${kpi(trend.floor_delta ?? '-', trend.degrading ? 'metric-warn' : 'metric-good')}` },
         { label: 'Resume', value: kpi(resumeStatus, t.resume_load_status === 'fallback_fresh' ? 'metric-warn' : 'metric-good'), sub: `${resumePath}${resumeFailure}` },
         { label: 'Health', value: kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), sub: `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}` },
-        { label: 'Floor Distribution', value: kpi((monitoring.floor_distribution || {}).total ?? 0, 'metric-good'), sub: renderFloorDistribution(monitoring.floor_distribution || {}), className: 'wide' },
+        { label: 'Floor Distribution', value: kpi(data.completed_sessions ?? (monitoring.floor_distribution || {}).total ?? 0, 'metric-good'), sub: renderFloorDistribution(monitoring.floor_distribution || {}, { completedSessions: data.completed_sessions, bestFloor: allTime.best_floor }), className: 'wide' },
         { label: 'Memory (All Processes)', value: kpi(fmtMb(resources.total_working_set_mb)), sub: memoryCardSub, className: 'wide' },
       ];
       return cards.map((card) => `<div class="card ${card.className || ''}"><div class="label">${card.label}</div><div class="value">${card.value}</div><div class="sub">${card.sub}</div></div>`).join('');
@@ -573,7 +616,7 @@
       }).join(' ');
       return `<svg width="220" height="54" viewBox="0 0 220 54"><polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" /></svg>`;
     }
-    function renderFloorDistribution(distribution) {
+    function renderFloorDistribution(distribution, summary = {}) {
       const points = Array.isArray(distribution?.points) ? distribution.points : [];
       if (!points.length) return '<div class="dist-empty">No completed episodes yet.</div>';
       const width = 1160;
@@ -585,6 +628,7 @@
       const plotWidth = width - padLeft - padRight;
       const plotHeight = height - padTop - padBottom;
       const maxFloor = Math.max(1, Number(distribution?.max_floor || points.length));
+      const maxFloorSeen = Math.max(maxFloor, Number(summary?.bestFloor || 0));
       const maxCount = Math.max(1, ...points.map((item) => Number(item?.count || 0)));
       const xOf = (floor) => {
         if (maxFloor <= 1) return padLeft;
@@ -635,9 +679,9 @@
           <text x="${(x + 4).toFixed(2)}" y="${(padTop + 14 + idx * 14).toFixed(2)}" fill="${color.stroke}" font-size="11">A${idx + 1} End (${marker})</text>
         </g>`;
       }).join('');
-      const total = Number(distribution?.total || 0);
+      const total = Number(summary?.completedSessions ?? distribution?.total ?? 0);
       return `
-        <div class="sub">Completed episodes: ${total} | Max floor seen: ${maxFloor} | <span class="pill" style="background:rgba(108,192,139,0.18);color:#6cc08b">Act1</span> <span class="pill" style="background:rgba(225,177,90,0.18);color:#e1b15a">Act2</span> <span class="pill" style="background:rgba(127,185,255,0.18);color:#7fb9ff">Act3</span> <span class="pill" style="background:rgba(222,115,115,0.18);color:#de7373">Act4+</span></div>
+        <div class="sub">Completed episodes: ${total} | Max floor seen: ${maxFloorSeen} | <span class="pill" style="background:rgba(108,192,139,0.18);color:#6cc08b">Act1</span> <span class="pill" style="background:rgba(225,177,90,0.18);color:#e1b15a">Act2</span> <span class="pill" style="background:rgba(127,185,255,0.18);color:#7fb9ff">Act3</span> <span class="pill" style="background:rgba(222,115,115,0.18);color:#de7373">Act4+</span></div>
         <div class="dist-wrap">
           <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
             ${yGuides}
@@ -1271,6 +1315,7 @@
           }
       });
     }
+    initSlotHistoryCollapsed();
     refresh();
     setInterval(refresh, 3000);
   </script>
