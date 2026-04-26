@@ -28,6 +28,7 @@ class SimpleFlowPolicy:
 
     def __init__(self, config: FlowPolicyConfig | None = None):
         self.config = config or FlowPolicyConfig()
+        self._last_policy_debug: dict[str, str] = {}
 
     def choose_action(self, state: GameStateView, rng: random.Random) -> FlowAction:
         if state.decision == "combat_play":
@@ -1692,8 +1693,69 @@ class SimpleFlowPolicy:
         if floor >= 16 and is_boss_room and self._is_kin_boss(state) and len(enemies) > 1 and damage > 0:
             priest_strength = self._enemy_power_amount(state, "strength", "力量")
             incoming_damage = self._enemy_intended_damage(state)
+            block_gap = max(0, incoming_damage - state.block)
             kin_scaling_phase = round_no >= 6 or priest_strength >= 3
             kin_all_in_phase = round_no >= 8 or priest_strength >= 5
+            priest_targets = [
+                enemy
+                for enemy in enemies
+                if any(token in self._text(enemy.get("id") or enemy.get("name")) for token in ("priest", "神官"))
+            ]
+            follower_targets = [
+                enemy
+                for enemy in enemies
+                if any(token in self._text(enemy.get("id") or enemy.get("name")) for token in ("follower", "同族教徒"))
+            ]
+
+            if round_no <= 3 and follower_targets:
+                lethal_followers = [enemy for enemy in follower_targets if damage >= self._enemy_effective_hp(enemy)]
+                if lethal_followers:
+                    def _follower_early_score(enemy: dict[str, Any]) -> tuple[float, int, int]:
+                        threat_drop = self._enemy_threat(enemy)
+                        effective_hp = self._enemy_effective_hp(enemy)
+                        score = threat_drop * 3.0 - effective_hp * 0.25
+                        return (score, threat_drop, -self._safe_int(enemy.get("index"), 0))
+
+                    candidate = max(lethal_followers, key=_follower_early_score)
+                    candidate_drop = self._enemy_threat(candidate)
+                    significant_drop = candidate_drop >= max(8, int(incoming_damage * 0.35))
+                    avoid_lethal = block_gap >= state.hp and max(0, incoming_damage - candidate_drop - state.block) < state.hp
+                    if significant_drop or avoid_lethal:
+                        self._last_policy_debug["kin_target"] = (
+                            f"early_follower_lethal:r{round_no}:drop={candidate_drop}:incoming={incoming_damage}"
+                        )
+                        return candidate
+
+            if round_no >= 6 and priest_targets:
+                best_priest = max(
+                    priest_targets,
+                    key=lambda enemy: (
+                        1 if damage >= self._enemy_effective_hp(enemy) else 0,
+                        self._enemy_threat(enemy),
+                        -self._enemy_effective_hp(enemy),
+                        -self._safe_int(enemy.get("index"), 0),
+                    ),
+                )
+                if follower_targets:
+                    lethal_followers = [enemy for enemy in follower_targets if damage >= self._enemy_effective_hp(enemy)]
+                    if lethal_followers and block_gap >= state.hp:
+                        best_follower = max(
+                            lethal_followers,
+                            key=lambda enemy: (
+                                self._enemy_threat(enemy),
+                                -self._enemy_effective_hp(enemy),
+                                -self._safe_int(enemy.get("index"), 0),
+                            ),
+                        )
+                        threat_drop = self._enemy_threat(best_follower)
+                        projected_gap = max(0, incoming_damage - threat_drop - state.block)
+                        if projected_gap < state.hp:
+                            self._last_policy_debug["kin_target"] = (
+                                f"late_follower_survival:r{round_no}:drop={threat_drop}:incoming={incoming_damage}"
+                            )
+                            return best_follower
+                self._last_policy_debug["kin_target"] = f"late_priest_focus:r{round_no}:incoming={incoming_damage}"
+                return best_priest
 
             def kin_target_score(enemy: dict[str, Any]) -> tuple[float, int, int, int, int]:
                 enemy_id = self._text(enemy.get("id") or enemy.get("name"))
@@ -1720,7 +1782,13 @@ class SimpleFlowPolicy:
                     -self._safe_int(enemy.get("index"), 0),
                 )
 
-            return max(enemies, key=kin_target_score)
+            picked = max(enemies, key=kin_target_score)
+            picked_id = self._text(picked.get("id") or picked.get("name"))
+            picked_is_priest = "priest" in picked_id or "神官" in picked_id
+            self._last_policy_debug["kin_target"] = (
+                f"score_pick:r{round_no}:target={'priest' if picked_is_priest else 'follower'}:incoming={incoming_damage}"
+            )
+            return picked
         if floor >= 16 and is_boss_room and len(enemies) > 1 and damage > 0:
             def boss_target_score(enemy: dict[str, Any]) -> tuple[float, int, int]:
                 effective_hp = self._enemy_effective_hp(enemy)
