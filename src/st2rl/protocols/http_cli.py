@@ -384,7 +384,7 @@ class HttpCliProtocol(FlowProtocol):
         self._pool_size = max(1, int(self.config.session_pool_size))
         self._sessions: dict[int, requests.Session] = {}
         self._session_lock = threading.Lock()
-        self._pending_event_select: dict[str, Any] | None = None
+        self._thread_local = threading.local()
         self._start_lock = threading.Lock()
 
     def _build_session(self) -> requests.Session:
@@ -419,7 +419,7 @@ class HttpCliProtocol(FlowProtocol):
                 pass
 
     def _clear_pending_event_select(self) -> None:
-        self._pending_event_select = None
+        self._thread_local.pending_event_select = None
 
     def _remember_pending_event_select(self, state: GameStateView, action: FlowAction) -> None:
         if action.name != "choose_option":
@@ -436,13 +436,13 @@ class HttpCliProtocol(FlowProtocol):
             str(selected.get(key) or "")
             for key in ("option_id", "name", "label", "title", "description", "text_key")
         ).lower()
-        self._pending_event_select = {
+        self._thread_local.pending_event_select = {
             "floor": _safe_int((state.raw.get("context") or {}).get("floor"), 0),
             "text": text,
         }
 
     def _pending_event_select_text(self, state: GameStateView) -> str:
-        pending = self._pending_event_select
+        pending = getattr(self._thread_local, "pending_event_select", None)
         if not isinstance(pending, dict):
             return ""
         current_floor = _safe_int((state.raw.get("context") or {}).get("floor"), 0)
