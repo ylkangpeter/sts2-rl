@@ -744,29 +744,66 @@ def estimate_card_reward_score(
             score -= 0.75
     if act == 1 and floor >= 9 and act1_boss_profile:
         if act1_boss_profile == "vantom":
-            if card_id_upper in {"CARD.ANGER", "CARD.POMMEL_STRIKE", "CARD.THUNDERCLAP", "CARD.BATTLE_TRANCE"}:
-                score += 1.35
+            if card_id_upper in {
+                "CARD.ANGER",
+                "CARD.POMMEL_STRIKE",
+                "CARD.THUNDERCLAP",
+                "CARD.BATTLE_TRANCE",
+                "CARD.UPPERCUT",
+                "CARD.HEADBUTT",
+            }:
+                score += 1.8
+            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER"}:
+                score += 0.85
             if draw_amount > 0 or energy_amount > 0:
-                score += 0.55
+                score += 0.7
+            if any(token in _description(card) for token in ("weak", "虚弱", "vulnerable", "易伤")):
+                score += 0.6
+            if floor <= 12 and card_type == "attack" and cost <= 1:
+                score += 0.4
+            if floor >= 13 and card_id_upper in {"CARD.BATTLE_TRANCE", "CARD.POMMEL_STRIKE", "CARD.HEADBUTT"}:
+                score += 0.45
+            if card_id_upper in {"CARD.BLOODLETTING", "CARD.OFFERING"} and floor <= 12:
+                score -= 0.7
+            if card_type == "skill" and draw_amount <= 0 and energy_amount <= 0 and any(
+                token in _description(card) for token in ("block", "格挡")
+            ):
+                score -= 0.55
             if cost >= 2 and card_id_upper in {"CARD.BLUDGEON", "CARD.PERFECTED_STRIKE", "CARD.HEAVY_BLADE"}:
                 score -= 1.8
+            if card_id_upper in {"CARD.DEMON_FORM"} and floor >= 10:
+                score -= 1.15
         elif act1_boss_profile == "kin":
-            if card_id_upper in {"CARD.ANGER", "CARD.THUNDERCLAP", "CARD.UPPERCUT", "CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE"}:
-                score += 1.9
-            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
-                score += 1.35
-            if card_id_upper == "CARD.FLAME_BARRIER":
-                score += 1.4
-            if card_id_upper == "CARD.SHRUG_IT_OFF":
-                score += 0.8
-            if card_id_upper in {"CARD.TAUNT", "CARD.ARMAMENTS"}:
-                score += 0.55
+            if card_id_upper in {
+                "CARD.ANGER",
+                "CARD.THUNDERCLAP",
+                "CARD.UPPERCUT",
+                "CARD.POMMEL_STRIKE",
+                "CARD.BATTLE_TRANCE",
+                "CARD.HEADBUTT",
+                "CARD.IRON_WAVE",
+            }:
+                score += 2.1
+            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER"}:
+                score += 1.1
             if draw_amount > 0 or energy_amount > 0:
-                score += 0.55
+                score += 0.85
             if any(token in _description(card) for token in ("weak", "虚弱", "vulnerable", "易伤")):
-                score += 0.75
+                score += 0.95
+            if floor <= 12 and card_type == "attack" and cost <= 1:
+                score += 0.45
+            if 9 <= floor <= 12 and card_id_upper in {"CARD.ANGER", "CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE"}:
+                score += 0.65
+            if floor >= 13 and card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.HEADBUTT"}:
+                score += 0.55
             if card_id_upper in {"CARD.BLOODLETTING", "CARD.OFFERING"} and floor <= 13:
                 score -= 1.0
+            if card_id_upper in {"CARD.TAUNT", "CARD.ARMAMENTS", "CARD.TRUE_GRIT"}:
+                score -= 0.8
+            if card_type == "skill" and draw_amount <= 0 and energy_amount <= 0 and any(
+                token in _description(card) for token in ("block", "格挡")
+            ):
+                score -= 0.75
             if card_type == "attack" and cost >= 2 and draw_amount <= 0:
                 score -= 1.35
             if card_id_upper in {"CARD.BLUDGEON", "CARD.PERFECTED_STRIKE", "CARD.HEAVY_BLADE", "CARD.DEMON_FORM"}:
@@ -774,12 +811,28 @@ def estimate_card_reward_score(
             if cost >= 2 and card_type == "power" and draw_amount <= 0 and energy_amount <= 0 and floor >= 10:
                 score -= 1.2
         elif act1_boss_profile == "ceremonial":
-            if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.ARMAMENTS"}:
-                score += 1.2
-            if card_id_upper in {"CARD.UPPERCUT", "CARD.BATTLE_TRANCE", "CARD.POMMEL_STRIKE"}:
+            if card_id_upper in {
+                "CARD.SHRUG_IT_OFF",
+                "CARD.FLAME_BARRIER",
+                "CARD.TAUNT",
+                "CARD.ARMAMENTS",
+                "CARD.IRON_WAVE",
+            }:
+                score += 1.45
+            if card_id_upper in {"CARD.UPPERCUT", "CARD.BATTLE_TRANCE", "CARD.POMMEL_STRIKE", "CARD.THUNDERCLAP"}:
+                score += 0.9
+            if draw_amount > 0:
+                score += 0.55
+            if any(token in _description(card) for token in ("weak", "虚弱")):
                 score += 0.65
+            if floor <= 12 and card_type == "skill" and any(token in _description(card) for token in ("block", "格挡")):
+                score += 0.45
+            if floor >= 13 and card_id_upper in {"CARD.FLAME_BARRIER", "CARD.SHRUG_IT_OFF", "CARD.ARMAMENTS"}:
+                score += 0.4
             if card_id_upper in {"CARD.BLOODLETTING", "CARD.OFFERING", "CARD.HEMOKINESIS"}:
-                score -= 0.9
+                score -= 1.05
+            if card_type == "attack" and cost >= 2 and draw_amount <= 0:
+                score -= 0.65
 
     if act >= 2:
         if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL", "CARD.ARMAMENTS"}:
@@ -1325,6 +1378,14 @@ def choose_event_option(options: list[dict[str, Any]], state: GameStateView) -> 
     if not unlocked:
         return None
 
+    context = state.raw.get("context") or {}
+    if not isinstance(context, dict):
+        context = {}
+    act = _safe_int(context.get("act") or state.raw.get("act"), 1) or 1
+    floor = _safe_int(context.get("floor") or state.raw.get("floor"), 0)
+    boss_key = _boss_key_from_context(context)
+    act1_boss_profile = _act1_boss_profile_key(boss_key) if act == 1 else ""
+    hard_act1_boss = bool(act1_boss_profile)
     hp_ratio = state.hp / max(1, state.max_hp)
 
     def option_score(option: dict[str, Any]) -> tuple[float, int]:
@@ -1345,17 +1406,43 @@ def choose_event_option(options: list[dict[str, Any]], state: GameStateView) -> 
                 score += 4.0
             if any(str(key).lower() == "potion" for key in vars_payload):
                 score += 2.2
-            gold_amount = max(_safe_int(vars_payload.get("Gold"), 0), _safe_int(vars_payload.get("gold"), 0))
+            normalized_vars = {str(key).replace("_", "").lower(): value for key, value in vars_payload.items()}
+            gold_amount = max(
+                [_safe_int(value, 0) for key, value in normalized_vars.items() if "gold" in key] or [0]
+            )
             if gold_amount > 0:
                 score += min(gold_amount / 80.0, 2.5)
-            hp_loss = max(_safe_int(vars_payload.get("HpLoss"), 0), _safe_int(vars_payload.get("hp_loss"), 0))
+            hp_loss = max(
+                [
+                    _safe_int(value, 0)
+                    for key, value in normalized_vars.items()
+                    if "hp" in key
+                    and "maxhp" not in key
+                    and any(token in key for token in ("loss", "lose", "cost", "damage", "solo"))
+                ]
+                or [0]
+            )
             if hp_loss > 0:
-                score -= min(hp_loss / 3.0, 4.0)
+                score -= min(hp_loss / 2.2, 8.0)
                 if hp_ratio < 0.6:
                     score -= 1.5
                 if hp_ratio < 0.45:
                     score -= 1.5
+                if act == 1 and floor < 16:
+                    score -= min(hp_loss / 6.0, 3.0)
+                if hard_act1_boss and floor >= 3:
+                    score -= min(hp_loss / 5.0, 4.0)
+                if hp_loss >= max(10, int(state.hp * 0.22)):
+                    score -= 4.0
             max_hp_delta = max(_safe_int(vars_payload.get("MaxHp"), 0), _safe_int(vars_payload.get("max_hp"), 0))
+            max_hp_loss = max(
+                [
+                    _safe_int(value, 0)
+                    for key, value in normalized_vars.items()
+                    if "maxhp" in key and any(token in key for token in ("loss", "lose", "cost", "decipher"))
+                ]
+                or [0]
+            )
             if max_hp_delta > 0:
                 loses_max_hp = (
                     "lose max hp" in text
@@ -1375,8 +1462,28 @@ def choose_event_option(options: list[dict[str, Any]], state: GameStateView) -> 
                     score -= min(max_hp_delta / 2.5, 5.0)
                 elif gains_max_hp:
                     score += min(max_hp_delta / 4.0, 3.0)
+            if max_hp_loss > 0:
+                score -= min(max_hp_loss * 1.8, 14.0)
+                if act == 1 and floor < 16:
+                    score -= min(max_hp_loss * 0.9, 6.0)
+                if hard_act1_boss:
+                    score -= min(max_hp_loss * 1.1, 8.0)
+                if max_hp_loss >= 6:
+                    score -= 5.0
+                if max_hp_loss >= 12:
+                    score -= 12.0
             if any(token in text for token in ("transform", "变化", "变形")):
                 score += 1.8
+        if any(token in text for token in ("heal", "smash", "\u6062\u590d", "\u7838\u788e")):
+            score += 2.0
+            if hp_ratio < 0.8:
+                score += 2.0
+            if act == 1 and floor < 16:
+                score += 1.2
+        if any(token in text for token in ("join forces", "\u7ed3\u4f34\u540c\u884c")):
+            score += 1.5
+            if act == 1 and floor < 16:
+                score += 1.5
         if "skip" in text or "\u8df3\u8fc7" in text:
             score -= 0.25
         if any(token in text for token in ("amalgamator", "combine", "combine strikes", "junglemaze", "jungle maze", "safety in numbers")):

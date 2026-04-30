@@ -151,6 +151,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of concurrent backtest games to run against reusable game-server workers.",
     )
     parser.add_argument(
+        "--worker-slot-base",
+        type=int,
+        default=0,
+        help="Base slot index for worker assignment when --workers > 1 (uses base..base+workers-1).",
+    )
+    parser.add_argument(
         "--allow-runtime-errors",
         action="store_true",
         help="Write results but do not fail the process when any seed reports an error.",
@@ -797,6 +803,7 @@ def _run_dataset(
     max_steps: int,
     worker_slot: int | None = None,
     workers: int = 1,
+    worker_slot_base: int = 0,
     cache: BacktestRolloutCache | None = None,
 ) -> dict[str, Any]:
     name = str(dataset.get("name") or "dataset")
@@ -835,6 +842,7 @@ def _run_dataset(
     else:
         completed_lock = threading.Lock()
         completed_count = 0
+        slot_base = max(0, int(worker_slot_base))
         slot_batches: list[list[tuple[int, str]]] = [[] for _ in range(worker_count)]
         for index, seed in enumerate(seeds, start=1):
             slot_batches[(index - 1) % worker_count].append((index, seed))
@@ -860,7 +868,7 @@ def _run_dataset(
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [
-                executor.submit(run_slot_batch, slot, batch)
+                executor.submit(run_slot_batch, slot_base + slot, batch)
                 for slot, batch in enumerate(slot_batches)
                 if batch
             ]
@@ -905,6 +913,7 @@ def main() -> None:
             max_steps=max(100, args.max_steps),
             worker_slot=args.worker_slot,
             workers=args.workers,
+            worker_slot_base=args.worker_slot_base,
             cache=cache,
         )
         dataset_payloads.append(payload)

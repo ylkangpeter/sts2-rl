@@ -114,6 +114,22 @@ Training is considered healthy only when all of the following hold:
 - For combat-policy changes, include focused deterministic seed evidence that is relevant to the targeted elite/boss encounters, not only merged aggregate metrics.
 - Backtest review output should include targeted boss/elite slices so operators can verify whether encounter-specific handling is actually improving outcomes.
 
+## Enemy Intent Script Prediction/Validation (Required)
+
+- For targeted combat strategy (especially boss/elite), maintain a versioned in-repo enemy intent script database with:
+  1. per-enemy (or per-enemy-family) future move timeline,
+  2. expected intent categories and pressure values,
+  3. branch conditions for special transitions (e.g., stun on armor break, stun/phase change on HP threshold).
+- Policy and debug/backtest flows must use this database for short-horizon intent prediction (at least next 1-2 turns) to support decision making.
+- Runtime must include prediction-vs-observation validation:
+  1. compare observed enemy intent/move category against expected script at current round/state,
+  2. when mismatch occurs, emit explicit alert records (seed/game_id/act/floor/round/enemy/expected/observed),
+  3. do not silently ignore persistent mismatches.
+- Backtest/analysis workflow should periodically review mismatch alerts and either:
+  1. fix database entries,
+  2. encode missing branch conditions, or
+  3. document and suppress proven-benign edge cases with narrow rules.
+
 ## Repository-Specific Notes
 
 - Python source files should start with `# -*- coding: utf-8 -*-`.

@@ -596,8 +596,9 @@ class HttpCliProtocol(FlowProtocol):
                 message = str(data.get("message") or "")
                 if worker_slot is None or attempt >= attempts - 1 or "busy" not in message.lower():
                     break
-                if not self._close_worker_slot_game(int(worker_slot)):
-                    self._reset_worker_slot(int(worker_slot))
+                # Never force-close/reset a busy slot here: another concurrent
+                # training/backtest worker may legitimately own that game.
+                # Cross-worker eviction causes cascading "Game not found" errors.
                 time.sleep(self.config.close_retry_delay_seconds)
 
         raise RuntimeError(f"Start game failed: {last_error}")
