@@ -1,0 +1,125 @@
+{
+  "config": {
+    "dataset_mode": "single",
+    "character": "Ironclad",
+    "max_steps": 1200,
+    "timeout_seconds": 10,
+    "history_root": "models\\http_cli_rl",
+    "history_floor_threshold": 17,
+    "history_limit": 0,
+    "focused_high_floor_threshold": 17,
+    "focused_anomaly_floor_threshold": 10,
+    "focused_high_floor_limit": 240,
+    "focused_anomaly_limit": 120,
+    "curated_seeds_file": "tmp_one_determinism_seed.txt",
+    "random_count": 16,
+    "random_run_tag": "",
+    "workers": 1,
+    "cache_enabled": false,
+    "cache_namespace": ""
+  },
+  "datasets": [
+    {
+      "name": "determinism_probe_slot8",
+      "source": "tmp_one_determinism_seed.txt",
+      "seed_count": 1,
+      "seeds": [
+        "rl_1775774100363_00_0076_8357"
+      ],
+      "summary": {
+        "total": 1,
+        "success": 0,
+        "errors": 1,
+        "victory": 0,
+        "avg_floor": 0.0,
+        "avg_global_floor": 0.0,
+        "ge5": 0,
+        "ge10": 0,
+        "ge15": 0,
+        "ge17": 0,
+        "ge18": 0,
+        "gt17": 0,
+        "ge_global_17": 0,
+        "ge_global_34": 0,
+        "ge_global_51": 0,
+        "ge_global_52": 0,
+        "boss_attempt": 0,
+        "boss_clear": 0,
+        "act1_boss_attempt": 0,
+        "act1_boss_clear": 0,
+        "act2_boss_attempt": 0,
+        "act2_boss_clear": 0,
+        "act3_boss_attempt": 0,
+        "act3_boss_clear": 0,
+        "cache_hits": 0
+      },
+      "rows": [
+        {
+          "seed": "rl_1775774100363_00_0076_8357",
+          "success": false,
+          "victory": false,
+          "steps": 0,
+          "max_floor": 0,
+          "final_act": 1,
+          "final_floor": 0,
+          "final_global_floor": 0,
+          "max_act": 1,
+          "max_act_floor": 0,
+          "max_global_floor": 0,
+          "final_hp": 0,
+          "error": "Start game failed: {'message': 'Worker slot_08 is busy', 'status': 'error'}",
+          "cache_hit": false,
+          "boss_attempt": false,
+          "boss_clear": false,
+          "act1_boss_attempt": false,
+          "act1_boss_clear": false,
+          "act2_boss_attempt": false,
+          "act2_boss_clear": false,
+          "act3_boss_attempt": false,
+          "act3_boss_clear": false,
+          "recovery_count": 0,
+          "resync_count": 0,
+          "dataset": "determinism_probe_slot8"
+        }
+      ]
+    }
+  ],
+  "merged_summary": {
+    "total": 1,
+    "success": 0,
+    "errors": 1,
+    "victory": 0,
+    "avg_floor": 0.0,
+    "avg_global_floor": 0.0,
+    "ge5": 0,
+    "ge10": 0,
+    "ge15": 0,
+    "ge17": 0,
+    "ge18": 0,
+    "gt17": 0,
+    "ge_global_17": 0,
+    "ge_global_34": 0,
+    "ge_global_51": 0,
+    "ge_global_52": 0,
+    "boss_attempt": 0,
+    "boss_clear": 0,
+    "act1_boss_attempt": 0,
+    "act1_boss_clear": 0,
+    "act2_boss_attempt": 0,
+    "act2_boss_clear": 0,
+    "act3_boss_attempt": 0,
+    "act3_boss_clear": 0,
+    "cache_hits": 0
+  },
+  "runtime_error_examples": [
+    {
+      "dataset": "determinism_probe_slot8",
+      "seed": "rl_1775774100363_00_0076_8357",
+      "success": false,
+      "error": "Start game failed: {'message': 'Worker slot_08 is busy', 'status': 'error'}"
+    }
+  ],
+  "cache": {
+    "enabled": false
+  }
+}
