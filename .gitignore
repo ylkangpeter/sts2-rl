@@ -60,3 +60,5 @@ temp_ai_*.py
 temp_ai_*.txt
 temp_ai_*.json
 .tmp_jsdom/
+tmp/
+temp/
