@@ -41,11 +41,6 @@ htmlcov/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Model files
-models/
-*.pkl
-*.zip
-
 # Logs
 logs/
 *.log

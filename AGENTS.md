@@ -76,6 +76,8 @@ Training is considered healthy only when all of the following hold:
 - Use concrete seeds / game IDs when investigating.
 - Prefer fixing root causes over masking problems with endless restarts.
 - Surface suspicious sessions explicitly in telemetry/dashboard output so operators do not need to infer them from raw logs.
+- `watchdog` is monitor-and-log only. It must not perform any start/stop/restart/cleanup control actions on service, client, dashboard, or sessions.
+- For improvement/backtest workflows, use `20` concurrent workers by default unless explicitly overridden by the operator.
 
 ## Script And Runtime Output Discipline
 

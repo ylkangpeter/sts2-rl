@@ -58,7 +58,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def _iter_history_rows(run_dir: Path):
-    dashboard_slots = run_dir / "dashboard" / "slots"
+    dashboard_slots = (
+        Path("logs")
+        / "dashboard_runs"
+        / run_dir.parent.name
+        / run_dir.name
+        / "dashboard"
+        / "slots"
+    )
+    if not dashboard_slots.exists():
+        dashboard_slots = run_dir / "dashboard" / "slots"
     if not dashboard_slots.exists():
         return
     for history_path in dashboard_slots.glob("slot_*.history.jsonl"):

@@ -147,7 +147,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=20,
         help="Number of concurrent backtest games to run against reusable game-server workers.",
     )
     parser.add_argument(
@@ -180,7 +180,16 @@ def _load_seeds(path: Path) -> list[str]:
 def _iter_history_rows(root: Path):
     if not root.exists():
         return
-    for history_path in sorted(root.glob("**/dashboard/slots/slot_*.history.jsonl")):
+    history_paths: list[Path] = sorted(root.glob("**/dashboard/slots/slot_*.history.jsonl"))
+    external_root = Path("logs") / "dashboard_runs"
+    if external_root.exists():
+        history_paths.extend(sorted(external_root.glob("**/dashboard/slots/slot_*.history.jsonl")))
+    seen: set[str] = set()
+    for history_path in history_paths:
+        resolved = str(history_path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         try:
             for raw_line in history_path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = raw_line.strip()
@@ -802,7 +811,7 @@ def _run_dataset(
     character: str,
     max_steps: int,
     worker_slot: int | None = None,
-    workers: int = 1,
+    workers: int = 20,
     worker_slot_base: int = 0,
     cache: BacktestRolloutCache | None = None,
 ) -> dict[str, Any]:

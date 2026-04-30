@@ -54,7 +54,7 @@ training:
   total_timesteps: 1000000
   save_freq: 2048
   verbose: 1
-  num_envs: 12
+  num_envs: 20
   vec_env: threaded
 
 paths:

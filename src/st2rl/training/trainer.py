@@ -46,6 +46,8 @@ class UnifiedTrainer:
         self.run_id = paths_config.get('run_id') or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.save_dir = os.path.join(self.base_save_dir, self.experiment_name, self.run_id)
         os.makedirs(self.save_dir, exist_ok=True)
+        self.dashboard_dir = os.path.join("logs", "dashboard_runs", self.experiment_name, self.run_id, "dashboard")
+        os.makedirs(self.dashboard_dir, exist_ok=True)
         self.resume_model_path: str | None = None
         self.resume_load_status = "fresh"
         self.resume_failure_reason: str | None = None
@@ -80,7 +82,8 @@ class UnifiedTrainer:
         training_config = self.config.get('training', {})
         num_envs = max(1, int(training_config.get('num_envs', 1)))
         vec_env = str(training_config.get('vec_env', 'threaded')).lower()
-        env_config.setdefault("telemetry_dir", os.path.join(self.save_dir, "dashboard"))
+        env_config.setdefault("telemetry_dir", self.dashboard_dir)
+        env_config.setdefault("telemetry_model_run_dir", self.save_dir)
 
         print(f"Creating {mode} environment...")
         if num_envs == 1:
@@ -189,7 +192,7 @@ class UnifiedTrainer:
             callback_list.append(training_callback)
 
         status_writer = TrainingStatusWriter(
-            os.path.join(self.save_dir, "dashboard"),
+            self.dashboard_dir,
             {
                 "experiment_name": self.experiment_name,
                 "run_id": self.run_id,
@@ -201,6 +204,7 @@ class UnifiedTrainer:
                 "resume_load_status": self.resume_load_status,
                 "resume_failure_reason": self.resume_failure_reason,
             },
+            model_run_dir=self.save_dir,
         )
         callback_list.append(
             TrainingStatusCallback(

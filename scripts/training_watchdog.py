@@ -31,6 +31,7 @@ INCIDENTS_DIR = WATCHDOG_ROOT / "incidents"
 STATE_PATH = WATCHDOG_ROOT / "watchdog_state.json"
 STATUS_PATH = WATCHDOG_ROOT / "current_status.json"
 SESSION_SUPERVISOR_STATUS_PATH = ROOT / "logs" / "session_supervisor" / "current_status.json"
+DASHBOARD_RUNS_ROOT = ROOT / "logs" / "dashboard_runs"
 
 
 @dataclass(slots=True)
@@ -175,37 +176,6 @@ def _recommended_num_envs(runtime: dict[str, Any], state: dict[str, Any], snapsh
             current = len(snapshot.get("active_slots") or [])
     if current <= 0:
         current = configured
-    history = state.get("restart_history") or []
-    recent_cutoff = _now().timestamp() - 3600
-    recent_count = 0
-    performance_markers = (
-        "worker_leak_detected",
-        "slow_active_game",
-        "performance",
-        "throughput",
-        "overload",
-        "capacity",
-    )
-    if isinstance(history, list):
-        for value in history:
-            dt = None
-            reason = ""
-            if isinstance(value, dict):
-                dt = _parse_iso(value.get("at"))
-                reason = str(value.get("reason") or "").lower()
-            else:
-                dt = _parse_iso(value)
-            if dt is None or dt.timestamp() < recent_cutoff:
-                continue
-            if not reason:
-                continue
-            if any(marker in reason for marker in performance_markers):
-                recent_count += 1
-    if configured >= 10:
-        if recent_count >= 6:
-            return min(configured, 6)
-        if recent_count >= 3:
-            return min(configured, 8)
     return min(configured, current if current > 0 else configured)
 
 
@@ -411,44 +381,6 @@ def _node_python_executable(runtime: dict[str, Any], node: dict[str, Any] | None
     return str(runtime.get("python_executable") or sys.executable or "python")
 
 
-def _start_managed_process(name: str, node: dict[str, Any] | None, runtime: dict[str, Any]) -> bool:
-    if not isinstance(node, dict) or not bool(node.get("enabled", False)):
-        return False
-    default_root = _project_root(runtime, "sts2_cli_root" if name == "service" else "st2rl_root", ROOT)
-    workdir = _resolve_managed_path(default_root, node.get("workdir") or default_root)
-    script_path = _resolve_managed_path(default_root, node.get("script"))
-    if not script_path.exists():
-        print(f"[watchdog] cannot start {name}: script missing at {script_path}", flush=True)
-        return False
-
-    log_dir = ROOT / "logs" / "launcher"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = log_dir / f"{name}.out.log"
-    stderr_path = log_dir / f"{name}.err.log"
-
-    env = os.environ.copy()
-    env.update(_shared_runtime_env(runtime))
-    for key, value in (node.get("env") or {}).items():
-        env[str(key)] = str(value)
-    python_executable = _node_python_executable(runtime, node)
-
-    try:
-        with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
-            subprocess.Popen(
-                [python_executable, str(script_path), *[str(item) for item in (node.get("args") or [])]],
-                cwd=str(workdir),
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                env=env,
-                **_subprocess_kwargs(),
-            )
-        print(f"[watchdog] started managed process: {name}", flush=True)
-        return True
-    except Exception as exc:
-        print(f"[watchdog] failed to start managed process {name}: {exc}", flush=True)
-        return False
-
-
 def _node_health_url(node: dict[str, Any] | None) -> str | None:
     if not isinstance(node, dict):
         return None
@@ -496,21 +428,6 @@ def _is_managed_process_running(node: dict[str, Any] | None) -> bool:
     return bool(_find_python_pids(process_match))
 
 
-def _stop_processes(pids: list[int]) -> None:
-    for pid in pids:
-        try:
-            subprocess.run(
-                [_powershell_executable(), "-NoProfile", "-Command", f"Stop-Process -Id {int(pid)} -Force"],
-                cwd=str(ROOT),
-                capture_output=True,
-                text=True,
-                timeout=10,
-                **_subprocess_kwargs(),
-            )
-        except Exception:
-            continue
-
-
 def _listening_port_pids(port: int) -> list[int]:
     try:
         output = _run_powershell(
@@ -529,10 +446,7 @@ def _load_state() -> dict[str, Any]:
             "watch_started_at": _now_iso(),
             "processed_history_games": [],
             "processed_incidents": [],
-            "last_restart_at": None,
             "training_missing_since": None,
-            "restart_count": 0,
-            "restart_history": [],
             "current_num_envs": 0,
             "current_run_id": None,
             "current_run_dir": None,
@@ -545,10 +459,7 @@ def _load_state() -> dict[str, Any]:
     state.setdefault("watch_started_at", _now_iso())
     state.setdefault("processed_history_games", [])
     state.setdefault("processed_incidents", [])
-    state.setdefault("last_restart_at", None)
     state.setdefault("training_missing_since", None)
-    state.setdefault("restart_count", 0)
-    state.setdefault("restart_history", [])
     state.setdefault("current_num_envs", 0)
     state.setdefault("current_run_id", None)
     state.setdefault("current_run_dir", None)
@@ -560,19 +471,6 @@ def _load_state() -> dict[str, Any]:
 def _trim_state(state: dict[str, Any]) -> dict[str, Any]:
     state["processed_history_games"] = list(dict.fromkeys(state.get("processed_history_games") or []))[-2000:]
     state["processed_incidents"] = list(dict.fromkeys(state.get("processed_incidents") or []))[-2000:]
-    raw_history = state.get("restart_history") or []
-    history: list[Any] = []
-    for item in raw_history:
-        if isinstance(item, dict):
-            history.append(
-                {
-                    "at": str(item.get("at") or ""),
-                    "reason": str(item.get("reason") or ""),
-                }
-            )
-        else:
-            history.append(str(item))
-    state["restart_history"] = history[-50:]
     state["current_num_envs"] = max(1, _safe_int(state.get("current_num_envs"), _configured_num_envs(_load_runtime_config())))
     active_floor_progress = state.get("active_floor_progress") or {}
     if isinstance(active_floor_progress, dict):
@@ -660,12 +558,22 @@ def _floor_age_seconds(slot: dict[str, Any], state: dict[str, Any]) -> float | N
     return _seconds_since(floor_since)
 
 
+def _dashboard_dir_for_run(run_dir: Path) -> Path:
+    experiment_name = run_dir.parent.name if run_dir.parent else ""
+    run_id = run_dir.name
+    if experiment_name and run_id:
+        candidate = DASHBOARD_RUNS_ROOT / experiment_name / run_id / "dashboard"
+        if candidate.exists():
+            return candidate
+    return run_dir / "dashboard"
+
+
 def _session_details_path(run_dir: Path, game_id: str) -> Path:
-    return run_dir / "dashboard" / "sessions" / f"{game_id}.json"
+    return _dashboard_dir_for_run(run_dir) / "sessions" / f"{game_id}.json"
 
 
 def _slot_history_paths(run_dir: Path) -> list[Path]:
-    slots_dir = run_dir / "dashboard" / "slots"
+    slots_dir = _dashboard_dir_for_run(run_dir) / "slots"
     if not slots_dir.exists():
         return []
     return sorted(slots_dir.glob("slot_*.history.jsonl"))
@@ -905,41 +813,6 @@ def _detect_history_incidents(snapshot: dict[str, Any], state: dict[str, Any]) -
     return incidents
 
 
-def _restart_allowed(state: dict[str, Any], config: WatchdogConfig) -> bool:
-    _ = state
-    _ = config
-    # Watchdog is monitor-only: restart is never allowed.
-    return False
-
-
-def _restart_runtime(runtime: dict[str, Any], config: WatchdogConfig, reason: str, state: dict[str, Any]) -> None:
-    _ = runtime
-    _ = config
-    _ = state
-    print(f"[watchdog] monitor-only mode: intervention suppressed ({reason})", flush=True)
-    return
-
-
-def _handle_restartable_incidents(
-    runtime: dict[str, Any],
-    config: WatchdogConfig,
-    state: dict[str, Any],
-    incidents: list[dict[str, Any]],
-) -> None:
-    _ = runtime
-    _ = config
-    _ = state
-    restartable = [incident for incident in incidents if bool(incident.get("restart_required"))]
-    if restartable:
-        first = restartable[0]
-        reason = str(first.get("reason") or first.get("type") or "incident")
-        seed = str(first.get("seed") or "")
-        if seed:
-            reason = f"{reason} | seed={seed}"
-        print(f"[watchdog] monitor-only: flagged intervention candidate ({reason})", flush=True)
-    return
-
-
 def _ensure_training_running(runtime: dict[str, Any], snapshot: dict[str, Any], config: WatchdogConfig, state: dict[str, Any]) -> None:
     training = snapshot.get("training") or {}
     status = str(training.get("status") or "").lower()
@@ -1049,30 +922,6 @@ def _ensure_runtime_healthy(runtime: dict[str, Any], snapshot: dict[str, Any] | 
         )
         return
 
-    if not startup_grace_active:
-        active_game_ids = {
-            str(slot.get("game_id") or "")
-            for slot in active_slots
-            if isinstance(slot, dict) and str(slot.get("game_id") or "")
-        }
-        try:
-            live_games_payload = _service_request(runtime, "/games", timeout=5.0)
-        except Exception as exc:
-            print(f"[watchdog] failed to inspect live games for orphan cleanup: {exc}", flush=True)
-        else:
-            live_games = [row for row in (live_games_payload.get("games") or []) if isinstance(row, dict)]
-            for row in live_games:
-                game_id = str(row.get("game_id") or "")
-                uptime_seconds = float(row.get("uptime_seconds") or 0.0)
-                if not game_id or game_id in active_game_ids or uptime_seconds < 180:
-                    continue
-                try:
-                    result = _service_request(runtime, f"/close/{game_id}", method="POST", payload={}, timeout=10.0)
-                except Exception as exc:
-                    print(f"[watchdog] orphan close failed: game_id={game_id} error={exc}", flush=True)
-                    continue
-                print(f"[watchdog] orphan cleanup requested: game_id={game_id} result={result}", flush=True)
-
     session_supervisor = runtime.get("session_supervisor") or {}
     if not _is_managed_process_running(session_supervisor):
         print("[watchdog] monitor-only: session_supervisor missing", flush=True)
@@ -1085,8 +934,6 @@ def _write_status(snapshot: dict[str, Any] | None, incidents: list[dict[str, Any
         "run_id": ((snapshot or {}).get("training") or {}).get("run_id") if snapshot else None,
         "active_slots": len((snapshot or {}).get("active_slots") or []),
         "incidents_detected": len(incidents),
-        "last_restart_at": state.get("last_restart_at"),
-        "restart_count": state.get("restart_count"),
         "target_num_envs": state.get("current_num_envs"),
         "intervention_enabled": bool(config.intervention_enabled),
     }
@@ -1132,7 +979,6 @@ def main() -> None:
                 for incident in incidents:
                     _record_incident(state, incident)
 
-                _handle_restartable_incidents(runtime, config, state, incidents)
                 _ensure_runtime_healthy(runtime, snapshot, config, state)
                 _ensure_training_running(runtime, snapshot, config, state)
         except (URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError) as exc:

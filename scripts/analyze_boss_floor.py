@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--boss-act", type=int, default=1, help="Boss act to trace; use 2 for Act2/global floor 34.")
     parser.add_argument("--max-seeds", type=int, default=120)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=20)
     parser.add_argument("--character", type=str, default="Ironclad")
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--max-steps", type=int, default=1200)

@@ -18,11 +18,11 @@ def _dashboard_base_url() -> str:
     return str(os.environ.get("ST2RL_DASHBOARD_URL") or "http://127.0.0.1:8787").rstrip("/")
 
 
-def _run_metadata(root: Path | None) -> dict[str, str]:
+def _run_metadata(root: Path | None, model_run_dir: Path | None = None) -> dict[str, str]:
     if root is None:
         return {}
     dashboard_dir = root
-    run_dir = dashboard_dir.parent
+    run_dir = model_run_dir if model_run_dir is not None else dashboard_dir.parent
     experiment_dir = run_dir.parent
     return {
         "dashboard_dir": str(dashboard_dir),
@@ -50,12 +50,12 @@ def _post_dashboard(path: str, payload: dict[str, Any]) -> None:
 class SlotTelemetry:
     """Per-slot telemetry persisted as small JSON/JSONL files."""
 
-    def __init__(self, root_dir: str | None, slot_id: int):
+    def __init__(self, root_dir: str | None, slot_id: int, *, model_run_dir: str | None = None):
         self.root = Path(root_dir) if root_dir else None
         self.slot_id = slot_id
         self.current_path = None
         self.history_path = None
-        self.run_meta = _run_metadata(self.root)
+        self.run_meta = _run_metadata(self.root, Path(model_run_dir) if model_run_dir else None)
         self._last_current_write_ts = 0.0
         self._min_current_update_interval_seconds = 1.0
         if self.root:
@@ -91,7 +91,7 @@ class SlotTelemetry:
 class SessionLeaderboardStore:
     """Persist detailed leaderboard sessions for dashboard drill-down."""
 
-    def __init__(self, root_dir: str | None, *, limit: int = 50):
+    def __init__(self, root_dir: str | None, *, limit: int = 50, model_run_dir: str | None = None):
         self.root = Path(root_dir) if root_dir else None
         self.limit = limit
         self.sessions_dir = None
@@ -102,7 +102,7 @@ class SessionLeaderboardStore:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
             self.index_path = self.root / "session_leaderboard.json"
             self.best_path = self.root / "best_session.json"
-        self.run_meta = _run_metadata(self.root)
+        self.run_meta = _run_metadata(self.root, Path(model_run_dir) if model_run_dir else None)
 
     def _read_index(self) -> list[dict[str, Any]]:
         if not self.index_path or not self.index_path.exists():
@@ -326,12 +326,12 @@ class DashboardControlClient:
 class TrainingStatusWriter:
     """Writes compact training progress snapshots for dashboard use."""
 
-    def __init__(self, root_dir: str, payload: dict[str, Any]):
+    def __init__(self, root_dir: str, payload: dict[str, Any], *, model_run_dir: str | None = None):
         self.root = Path(root_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "training_status.json"
         self.payload = dict(payload)
-        self.payload.update(_run_metadata(self.root))
+        self.payload.update(_run_metadata(self.root, Path(model_run_dir) if model_run_dir else None))
         self._last_write_ts = 0.0
         self._last_status = None
         self._min_update_interval_seconds = 1.0

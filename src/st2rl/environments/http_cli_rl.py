@@ -53,6 +53,7 @@ class HttpCliEnvConfig:
     observation_max_enemies: int = 5
     seed_offset: int = 0
     telemetry_dir: str | None = None
+    telemetry_model_run_dir: str | None = None
     knowledge_mismatch_log_path: str = str(DEFAULT_MISMATCH_LOG_PATH)
     overlong_seed_log_path: str | None = None
 
@@ -109,8 +110,15 @@ class HttpCliRlEnv(gym.Env):
         self.flow_policy = SimpleFlowPolicy(FlowPolicyConfig())
         self._flow_policy_rng = random.Random(self.config.seed_offset)
         self.logger = get_run_logger()
-        self.telemetry = SlotTelemetry(self.config.telemetry_dir, self.config.seed_offset)
-        self.session_store = SessionLeaderboardStore(self.config.telemetry_dir)
+        self.telemetry = SlotTelemetry(
+            self.config.telemetry_dir,
+            self.config.seed_offset,
+            model_run_dir=self.config.telemetry_model_run_dir,
+        )
+        self.session_store = SessionLeaderboardStore(
+            self.config.telemetry_dir,
+            model_run_dir=self.config.telemetry_model_run_dir,
+        )
         self.knowledge_matcher = KnowledgeMatcher(Path(self.config.knowledge_mismatch_log_path))
         default_overlong_log = Path(self.config.telemetry_dir or "logs") / "overlong_episode_seeds.jsonl"
         self._overlong_seed_log_path = Path(self.config.overlong_seed_log_path or default_overlong_log)

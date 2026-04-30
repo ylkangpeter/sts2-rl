@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS_ROOT = ROOT / "models" / "http_cli_rl"
+DASHBOARD_RUNS_ROOT = ROOT / "logs" / "dashboard_runs"
 ALL_TIME_SUMMARY_PATH = MODELS_ROOT / "all_time_summary.json"
 ALL_TIME_SUMMARY_TTL_SECONDS = 300
 LIVE_SESSION_CACHE_LIMIT = 100
@@ -312,8 +313,26 @@ def _collect_checkpoints(run_dir: Path | None) -> list[dict[str, Any]]:
     return checkpoints
 
 
+def _dashboard_dir_for_run(run_dir: Path, training: dict[str, Any] | None = None) -> Path:
+    if isinstance(training, dict):
+        explicit = str(training.get("dashboard_dir") or "").strip()
+        if explicit:
+            explicit_path = Path(explicit)
+            if not explicit_path.is_absolute():
+                explicit_path = (ROOT / explicit_path).resolve()
+            return explicit_path
+    experiment_name = run_dir.parent.name if run_dir.parent else ""
+    run_id = run_dir.name
+    if experiment_name and run_id:
+        return DASHBOARD_RUNS_ROOT / experiment_name / run_id / "dashboard"
+    return run_dir / "dashboard"
+
+
 def _training_payload(run_dir: Path) -> dict[str, Any]:
-    data = _read_json(run_dir / "dashboard" / "training_status.json")
+    dashboard_dir = _dashboard_dir_for_run(run_dir)
+    if not dashboard_dir.exists():
+        dashboard_dir = run_dir / "dashboard"
+    data = _read_json(dashboard_dir / "training_status.json")
     return data if isinstance(data, dict) else {}
 
 
@@ -335,10 +354,10 @@ def _seconds_since(value: Any) -> float | None:
 
 
 def _run_activity_snapshot(run_dir: Path) -> dict[str, Any]:
-    dashboard_dir = run_dir / "dashboard"
+    training = _training_payload(run_dir)
+    dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
     slots_dir = dashboard_dir / "slots"
     training_path = dashboard_dir / "training_status.json"
-    training = _training_payload(run_dir)
     status = str(training.get("status") or "").lower()
     training_updated_ts = _iso_to_timestamp(training.get("updated_at"))
     active_slot_count = 0
@@ -425,12 +444,16 @@ def _latest_run_dir() -> Path | None:
 
 
 def _read_session_details(run_dir: Path, game_id: str) -> dict[str, Any]:
-    data = _read_json(run_dir / "dashboard" / "sessions" / f"{game_id}.json")
+    training = _training_payload(run_dir)
+    dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
+    data = _read_json(dashboard_dir / "sessions" / f"{game_id}.json")
     return data if isinstance(data, dict) else {}
 
 
 def _find_slot_row(run_dir: Path, game_id: str) -> dict[str, Any]:
-    slots_dir = run_dir / "dashboard" / "slots"
+    training = _training_payload(run_dir)
+    dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
+    slots_dir = dashboard_dir / "slots"
     if not slots_dir.exists():
         return {}
     for current_file in sorted(slots_dir.glob("slot_*.json")):
@@ -1286,8 +1309,8 @@ def _sanitize_incident_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
-    dashboard_dir = run_dir / "dashboard"
     training = _training_payload(run_dir)
+    dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
     persisted_leaderboard = _read_json(dashboard_dir / "session_leaderboard.json")
     persisted_leaderboard = persisted_leaderboard if isinstance(persisted_leaderboard, list) else []
     slots_dir = dashboard_dir / "slots"
@@ -1465,7 +1488,9 @@ def _collect_historical_best() -> list[dict[str, Any]]:
 
     merged: dict[str, dict[str, Any]] = {}
     for run_dir in _all_run_dirs():
-        leaderboard = _read_json(run_dir / "dashboard" / "session_leaderboard.json")
+        training = _training_payload(run_dir)
+        dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
+        leaderboard = _read_json(dashboard_dir / "session_leaderboard.json")
         if not isinstance(leaderboard, list):
             continue
         for row in leaderboard:
@@ -1499,7 +1524,8 @@ def _compute_all_time_summary() -> dict[str, Any]:
 
     for run_dir in _all_run_dirs():
         run_count += 1
-        dashboard_dir = run_dir / "dashboard"
+        training = _training_payload(run_dir)
+        dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
         slots_dir = dashboard_dir / "slots"
 
         if slots_dir.exists():
@@ -1608,7 +1634,9 @@ def _get_runtime_control(run_id: str | None = None) -> dict[str, Any]:
 
 
 def _force_training_status(run_dir: Path, status: str) -> None:
-    training_path = run_dir / "dashboard" / "training_status.json"
+    training = _training_payload(run_dir)
+    dashboard_dir = _dashboard_dir_for_run(run_dir, training=training)
+    training_path = dashboard_dir / "training_status.json"
     payload = _training_payload(run_dir)
     payload["status"] = status
     payload["updated_at"] = _now_iso()

@@ -1,5 +1,0 @@
-{
-  "algorithm": "PPO",
-  "model_params": {},
-  "total_timesteps": 410700
-}
