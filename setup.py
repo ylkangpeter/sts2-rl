@@ -17,6 +17,7 @@ setup(
         "numpy>=1.24.0",
         "requests>=2.31.0",
         "flask>=3.0.0",
+        "waitress>=3.0.0",
         "pygame>=2.5.0",
         "pillow>=10.0.0",
         "pyyaml>=6.0",

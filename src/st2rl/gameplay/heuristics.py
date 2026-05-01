@@ -833,6 +833,23 @@ def estimate_card_reward_score(
                 score -= 1.05
             if card_type == "attack" and cost >= 2 and draw_amount <= 0:
                 score -= 0.65
+    if act == 1 and 9 <= floor <= 16:
+        if block_deficit and card_id_upper in _BLOCK_CARD_IDS:
+            score += 1.35
+        if card_id_upper in {"CARD.POMMEL_STRIKE", "CARD.BATTLE_TRANCE", "CARD.BURNING_PACT", "CARD.HEADBUTT"}:
+            score += 0.9
+        if any(token in _description(card) for token in ("weak", "\u865a\u5f31", "vulnerable", "\u6613\u4f24")):
+            score += 0.95
+        if draw_amount > 0:
+            score += 0.65
+        if energy_amount > 0:
+            score += 0.55
+        if card_type == "power" and cost >= 2 and draw_amount <= 0 and energy_amount <= 0:
+            score -= 0.85
+        if card_type == "attack" and cost >= 2 and draw_amount <= 0 and card_id_upper not in {"CARD.BLUDGEON"}:
+            score -= 0.75
+        if card_id_upper in {"CARD.TRUE_GRIT", "CARD.GRAPPLE", "CARD.RAMPAGE", "CARD.FORGOTTEN_RITUAL"}:
+            score -= 0.7
 
     if act >= 2:
         if card_id_upper in {"CARD.SHRUG_IT_OFF", "CARD.FLAME_BARRIER", "CARD.TAUNT", "CARD.BLOOD_WALL", "CARD.ARMAMENTS"}:
@@ -1093,6 +1110,21 @@ def choose_map_node_choice(choices: list[dict[str, Any]], state: GameStateView) 
             value += 0.35
         if floor <= 8 and "unknown" in room and any("elite" in next_room for next_room in next_rooms):
             value -= 0.65
+        if act == 1:
+            if floor <= 12 and "monster" in room:
+                value += 0.4
+            if floor >= 10 and "event" in room:
+                value += 0.45
+            if floor >= 11 and ("rest" in room or "shop" in room):
+                value += 0.75
+            if floor >= 13 and "monster" in room and hp_ratio < 0.82:
+                value -= 0.55
+            if floor >= 13 and "event" in room and hp_ratio < 0.88:
+                value += 0.7
+            if floor >= 13 and "shop" in room and state.gold >= 80:
+                value += 0.6
+            if floor >= 14 and "rest" in room:
+                value += 1.1
         return (
             value,
             -_safe_int(choice.get("row"), 0),

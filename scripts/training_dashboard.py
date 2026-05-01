@@ -996,6 +996,155 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _act1_boss_bucket(name: Any) -> str:
+    text = str(name or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "vantom" in text or "澧ㄥ奖" in text:
+        return "Vantom"
+    if "kin" in text or "鍚屾棌" in text:
+        return "Kin"
+    if "ceremonial" in text or "浠紡" in text:
+        return "Ceremonial Beast"
+    return str(name or "unknown")
+
+
+def _act1_boss_entry_metrics(details: dict[str, Any]) -> dict[str, Any]:
+    nodes = details.get("nodes") or []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        act = _safe_int(node.get("act"), 0)
+        floor = _safe_int(node.get("floor"), 0)
+        room_type = str(node.get("room_type") or "").lower()
+        if act != 1 or (floor < 17 and "boss" not in room_type):
+            continue
+        entry = node.get("entry_state") or {}
+        return {
+            "hp": _safe_int(entry.get("hp"), 0),
+            "max_hp": _safe_int(entry.get("max_hp"), 0),
+            "deck_size": len(entry.get("deck") or []),
+            "potions": len(entry.get("potions") or []),
+        }
+    return {}
+
+
+def _build_act1_metrics(
+    rows: list[dict[str, Any]],
+    *,
+    session_details: dict[str, dict[str, Any]] | None = None,
+    window: int = 500,
+) -> dict[str, Any]:
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        game_id = str(row.get("game_id") or "")
+        if not game_id:
+            continue
+        normalized.append(_normalize_floor_fields(dict(row)))
+    normalized.sort(
+        key=lambda item: (
+            _iso_to_timestamp(item.get("finished_at")) or 0.0,
+            _iso_to_timestamp(item.get("started_at")) or 0.0,
+            _safe_int(item.get("episode_index"), 0),
+        ),
+        reverse=True,
+    )
+    deduped: list[dict[str, Any]] = []
+    seen_game_ids: set[str] = set()
+    for row in normalized:
+        game_id = str(row.get("game_id") or "")
+        if game_id in seen_game_ids:
+            continue
+        seen_game_ids.add(game_id)
+        deduped.append(row)
+        if len(deduped) >= max(1, window):
+            break
+
+    attempted = [row for row in deduped if bool(row.get("act1_boss_attempt"))]
+    cleared = [row for row in attempted if bool(row.get("act1_boss_clear"))]
+    boss_breakdown: dict[str, dict[str, Any]] = {}
+    failure_reasons = {
+        "route_failure": 0,
+        "pre_elite_collapse": 0,
+        "boss_entry_low_hp": 0,
+        "boss_tactical_failure": 0,
+        "protocol_or_deadlock": 0,
+    }
+
+    for row in deduped:
+        flags = [str(item).lower() for item in (row.get("anomaly_flags") or row.get("health_flags") or [])]
+        if any("deadlock" in flag or "protocol" in flag for flag in flags):
+            failure_reasons["protocol_or_deadlock"] += 1
+            continue
+        max_floor = max(_safe_int(row.get("max_floor"), 0), _safe_int(row.get("final_floor"), 0))
+        final_hp = _safe_int(row.get("final_hp"), 0)
+        max_hp = max(1, _safe_int(row.get("max_hp"), 1))
+        if bool(row.get("act1_boss_attempt")) and not bool(row.get("act1_boss_clear")):
+            if final_hp <= max(12, int(max_hp * 0.25)):
+                failure_reasons["boss_entry_low_hp"] += 1
+            else:
+                failure_reasons["boss_tactical_failure"] += 1
+        elif max_floor < 8:
+            failure_reasons["route_failure"] += 1
+        elif max_floor < 17:
+            failure_reasons["pre_elite_collapse"] += 1
+
+    details_by_game = session_details or {}
+    for row in attempted:
+        boss_name = row.get("boss_display") or row.get("boss_name") or row.get("boss_id")
+        boss_key = _act1_boss_bucket(boss_name)
+        bucket = dict(boss_breakdown.get(boss_key) or {})
+        bucket.setdefault("attempts", 0)
+        bucket.setdefault("clears", 0)
+        bucket.setdefault("entry_hp_sum", 0.0)
+        bucket.setdefault("entry_hp_ratio_sum", 0.0)
+        bucket.setdefault("entry_deck_size_sum", 0.0)
+        bucket.setdefault("entry_potions_sum", 0.0)
+        bucket.setdefault("entry_samples", 0)
+        bucket["attempts"] += 1
+        if bool(row.get("act1_boss_clear")):
+            bucket["clears"] += 1
+        details = details_by_game.get(str(row.get("game_id") or "")) or {}
+        metrics = _act1_boss_entry_metrics(details)
+        if metrics:
+            entry_hp = _safe_int(metrics.get("hp"), 0)
+            entry_max_hp = max(1, _safe_int(metrics.get("max_hp"), 1))
+            bucket["entry_hp_sum"] += entry_hp
+            bucket["entry_hp_ratio_sum"] += entry_hp / entry_max_hp
+            bucket["entry_deck_size_sum"] += _safe_int(metrics.get("deck_size"), 0)
+            bucket["entry_potions_sum"] += _safe_int(metrics.get("potions"), 0)
+            bucket["entry_samples"] += 1
+        boss_breakdown[boss_key] = bucket
+
+    for boss_key, bucket in boss_breakdown.items():
+        attempts_count = max(1, _safe_int(bucket.get("attempts"), 0))
+        sample_count = max(1, _safe_int(bucket.get("entry_samples"), 0))
+        bucket["clear_rate"] = round(100.0 * _safe_int(bucket.get("clears"), 0) / attempts_count, 2)
+        bucket["avg_entry_hp"] = round((_safe_float(bucket.get("entry_hp_sum")) or 0.0) / sample_count, 2) if bucket.get("entry_samples") else None
+        bucket["avg_entry_hp_ratio"] = round(100.0 * (_safe_float(bucket.get("entry_hp_ratio_sum")) or 0.0) / sample_count, 2) if bucket.get("entry_samples") else None
+        bucket["avg_entry_deck_size"] = round((_safe_float(bucket.get("entry_deck_size_sum")) or 0.0) / sample_count, 2) if bucket.get("entry_samples") else None
+        bucket["avg_entry_potions"] = round((_safe_float(bucket.get("entry_potions_sum")) or 0.0) / sample_count, 2) if bucket.get("entry_samples") else None
+        bucket["boss"] = boss_key
+        boss_breakdown[boss_key] = bucket
+
+    sample_count = len(deduped)
+    attempt_count = len(attempted)
+    clear_count = len(cleared)
+    return {
+        "window": sample_count,
+        "target_window": window,
+        "act1_boss_reach_rate_500": round(100.0 * attempt_count / max(1, sample_count), 2),
+        "act1_boss_clear_given_reach_rate_500": round(100.0 * clear_count / max(1, attempt_count), 2),
+        "act1_boss_clear_rate_500": round(100.0 * clear_count / max(1, sample_count), 2),
+        "attempts": attempt_count,
+        "clears": clear_count,
+        "bosses": [boss_breakdown[key] for key in sorted(boss_breakdown.keys())],
+        "failure_reasons": failure_reasons,
+    }
+
+
 def _row_health_flags(row: dict[str, Any]) -> list[str]:
     flags = [str(item) for item in (row.get("anomaly_flags") or []) if item]
     active = bool(row.get("active", False))
@@ -1195,6 +1344,11 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
     suspicious_completed = [row for row in top_sessions if row.get("suspicious")]
     overlong_active = [row for row in active_slots if "overlong_active" in (row.get("health_flags") or [])]
     recent_incidents = _filter_incidents_for_run(TELEMETRY_STATE.get("recent_incidents") or [], run)
+    intent_mismatch_incidents = [
+        dict(item)
+        for item in recent_incidents
+        if str(item.get("type") or "") == "enemy_intent_mismatch"
+    ]
     active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
     detailed_ids = set((run.get("session_details") or {}).keys())
@@ -1220,6 +1374,10 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
             if isinstance(row, dict):
                 floor_distribution_rows.append(dict(row))
     floor_distribution = _build_floor_distribution(floor_distribution_rows)
+    act1_metrics = _build_act1_metrics(
+        floor_distribution_rows,
+        session_details=deepcopy(run.get("session_details") or {}),
+    )
     run_dir_path = _resolve_run_dir_path(run.get("run_dir"))
     return {
         "updated_at": training.get("updated_at"),
@@ -1242,10 +1400,13 @@ def _telemetry_snapshot_from_memory(run: dict[str, Any]) -> dict[str, Any]:
             "suspicious_completed": suspicious_completed[:10],
             "recent_incidents_count": len(recent_incidents),
             "recent_incidents": recent_incidents,
+            "intent_mismatch_count": len(intent_mismatch_incidents),
+            "intent_mismatch_incidents": intent_mismatch_incidents[:10],
             "problem_list": problem_list,
             "resources": resources,
             "trend": trend,
             "floor_distribution": floor_distribution,
+            "act1_metrics": act1_metrics,
             "watchdog_status": deepcopy(TELEMETRY_STATE.get("watchdog_status") or {}),
             "session_supervisor_status": deepcopy(TELEMETRY_STATE.get("session_supervisor_status") or {}),
         },
@@ -1435,11 +1596,26 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
         _collect_recent_runtime_incidents(),
         {"run_id": run_dir.name, "run_dir": str(run_dir), "training": training},
     )
+    intent_mismatch_incidents = [
+        dict(item)
+        for item in recent_incidents
+        if str(item.get("type") or "") == "enemy_intent_mismatch"
+    ]
     active_game_ids = {str(item.get("game_id") or "") for item in active_slots if str(item.get("game_id") or "")}
     problem_list = _build_problem_list(recent_incidents, suspicious_completed, active_game_ids=active_game_ids, runtime_healthy=True)
     resources = _collect_resource_summary(training)
     trend = _build_trend_summary(training, list(history_by_job.values()))
     floor_distribution = _build_floor_distribution(list(history_by_job.values()))
+    session_details_payload: dict[str, dict[str, Any]] = {}
+    if sessions_dir.exists():
+        for row in top_sessions[:100]:
+            game_id = str(row.get("game_id") or "")
+            if not game_id:
+                continue
+            details = _read_session_details(run_dir, game_id)
+            if details:
+                session_details_payload[game_id] = details
+    act1_metrics = _build_act1_metrics(list(history_by_job.values()), session_details=session_details_payload)
     completed_session_count = max(
         sum(1 for item in history_by_job.values() if not item.get("active", False)),
         _safe_int(training.get("episodes_finished"), 0),
@@ -1467,10 +1643,13 @@ def _collect_run_snapshot(run_dir: Path) -> dict[str, Any]:
             "suspicious_completed": suspicious_completed[:10],
             "recent_incidents_count": len(recent_incidents),
             "recent_incidents": recent_incidents,
+            "intent_mismatch_count": len(intent_mismatch_incidents),
+            "intent_mismatch_incidents": intent_mismatch_incidents[:10],
             "problem_list": problem_list,
             "resources": resources,
             "trend": trend,
             "floor_distribution": floor_distribution,
+            "act1_metrics": act1_metrics,
             "watchdog_status": _read_json(WATCHDOG_STATUS_PATH),
             "session_supervisor_status": _read_json(SESSION_SUPERVISOR_STATUS_PATH),
         },
@@ -2986,6 +3165,8 @@ def _build_snapshot_payload() -> dict[str, Any]:
                 "suspicious_completed": [],
                 "recent_incidents_count": len(recent_incidents),
                 "recent_incidents": recent_incidents,
+                "intent_mismatch_count": 0,
+                "intent_mismatch_incidents": [],
                 "problem_list": problem_list,
                 "resources": {},
                 "trend": {},

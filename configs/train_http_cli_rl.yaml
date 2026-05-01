@@ -35,6 +35,19 @@ environment:
     progress_floor_reward: 1.0
     act_progress_reward: 50.0
     boss_combat_victory_reward: 30.0
+    act1_floor6_reward: 3.0
+    act1_floor10_reward: 4.0
+    act1_floor13_reward: 6.0
+    act1_floor16_reward: 8.0
+    act1_boss_reach_reward: 12.0
+    act1_boss_clear_reward: 45.0
+    act1_boss_prep_hp_reward: 10.0
+    act1_boss_prep_block_density_reward: 6.0
+    act1_boss_prep_potion_reward: 3.0
+    act1_early_damage_penalty: -1.5
+    act1_late_preboss_low_hp_penalty: -10.0
+    act1_elite_risk_penalty: -5.0
+    act1_deadly_greed_penalty: -7.0
 
 model:
   learning_rate: 3.0e-4

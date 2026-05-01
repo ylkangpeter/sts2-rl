@@ -282,6 +282,29 @@
     function kpi(value, cls='metric-strong') {
       return `<span class="${cls}">${fmt(value)}</span>`;
     }
+    function renderAct1BossMetrics(act1Metrics) {
+      const metrics = act1Metrics || {};
+      const bosses = Array.isArray(metrics.bosses) ? metrics.bosses : [];
+      const failures = metrics.failure_reasons || {};
+      const bossLines = bosses.length
+        ? bosses.map((boss) => {
+            const samples = boss.entry_samples
+              ? ` | Entry HP ${fmt(boss.avg_entry_hp)} (${fmt(boss.avg_entry_hp_ratio)}%) | Deck ${fmt(boss.avg_entry_deck_size)} | Potions ${fmt(boss.avg_entry_potions)}`
+              : '';
+            return `<div class="memory-line"><div class="k">${escapeHtml(boss.boss)}</div><div class="v">Reach ${fmt(boss.attempts)} | Clear ${fmt(boss.clears)} | Rate ${fmt(boss.clear_rate)}%${samples}</div></div>`;
+          }).join('')
+        : '<div class="memory-line"><div class="k">Bosses</div><div class="v">No Act1 boss samples yet</div></div>';
+      return `
+        <div class="memory-lines">
+          <div class="memory-line"><div class="k">Reach</div><div class="v">${fmt(metrics.act1_boss_reach_rate_500)}%</div></div>
+          <div class="memory-line"><div class="k">Clear | Reach</div><div class="v">${fmt(metrics.act1_boss_clear_given_reach_rate_500)}%</div></div>
+          <div class="memory-line"><div class="k">Clear</div><div class="v">${fmt(metrics.act1_boss_clear_rate_500)}%</div></div>
+          <div class="memory-line"><div class="k">Window</div><div class="v">${fmt(metrics.window)} / ${fmt(metrics.target_window)}</div></div>
+          <div class="memory-line"><div class="k">Failures</div><div class="v">Route ${fmt(failures.route_failure)} | Elite ${fmt(failures.pre_elite_collapse)} | Low HP ${fmt(failures.boss_entry_low_hp)} | Boss ${fmt(failures.boss_tactical_failure)} | Protocol ${fmt(failures.protocol_or_deadlock)}</div></div>
+          ${bossLines}
+        </div>
+      `;
+    }
     function pushAlert(title, body, level='danger', details='', source='request') {
       const key = JSON.stringify([title || '', body || '', level || '', details || '', source || '']);
       if (activeAlerts.some((item) => JSON.stringify([item.title || '', item.body || '', item.level || '', item.details || '', item.source || '']) === key)) {
@@ -496,6 +519,16 @@
           'state',
         );
       }
+      const intentMismatches = monitoring?.intent_mismatch_incidents || [];
+      if (intentMismatches.length) {
+        pushAlert(
+          'Enemy intent mismatches',
+          intentMismatches.slice(0, 8).map((item) => `seed=${fmt(item.seed)} floor=A${fmt(item.act)}F${fmt(item.floor)} round=${fmt(item.round)} enemy=${fmt(item.enemy)} expected=${fmt((item.expected_categories || []).join('|'))} observed=${fmt(item.observed_category)} intent=${fmt(item.observed_intent)}`).join('\\n'),
+          'danger',
+          '',
+          'state',
+        );
+      }
       const recentIncidents = monitoring?.recent_incidents || [];
       if (recentIncidents.length) {
         pushAlert(
@@ -563,6 +596,7 @@
       const monitoring = data.monitoring || {};
       const resources = monitoring.resources || {};
       const trend = monitoring.trend || {};
+      const act1Metrics = monitoring.act1_metrics || {};
       const resumeStateMap = {
         resumed: 'Resume',
         fresh: 'Fresh',
@@ -593,7 +627,8 @@
         { label: 'Reward', value: kpi(t.mean_reward_100, 'metric-warn'), sub: `Mean length 100 ${kpi(t.mean_length_100)}` },
         { label: 'Trend', value: kpi(trend.recent_floor_mean ?? '-', trend.degrading ? 'metric-warn' : 'metric-good'), sub: `Prev floor ${kpi(trend.previous_floor_mean ?? '-')} | Delta ${kpi(trend.floor_delta ?? '-', trend.degrading ? 'metric-warn' : 'metric-good')}` },
         { label: 'Resume', value: kpi(resumeStatus, t.resume_load_status === 'fallback_fresh' ? 'metric-warn' : 'metric-good'), sub: `${resumePath}${resumeFailure}` },
-        { label: 'Health', value: kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), sub: `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}` },
+        { label: 'Health', value: kpi(monitoring.suspicious_completed_count || 0, (monitoring.suspicious_completed_count || 0) ? 'metric-warn' : 'metric-good'), sub: `Overlong ${kpi(monitoring.overlong_active_count || 0, (monitoring.overlong_active_count || 0) ? 'metric-warn' : 'metric-good')} | Intent mismatch ${kpi(monitoring.intent_mismatch_count || 0, (monitoring.intent_mismatch_count || 0) ? 'metric-warn' : 'metric-good')} | Incidents ${kpi(monitoring.recent_incidents_count || 0, (monitoring.recent_incidents_count || 0) ? 'metric-warn' : 'metric-good')}` },
+        { label: 'Act1 Boss Gate', value: kpi(`${fmt(act1Metrics.act1_boss_reach_rate_500)}% / ${fmt(act1Metrics.act1_boss_clear_given_reach_rate_500)}%`, ((act1Metrics.act1_boss_reach_rate_500 || 0) >= 70 && (act1Metrics.act1_boss_clear_given_reach_rate_500 || 0) >= 70) ? 'metric-good' : 'metric-warn'), sub: renderAct1BossMetrics(act1Metrics), className: 'wide' },
         { label: 'Floor Distribution', value: kpi(data.completed_sessions ?? (monitoring.floor_distribution || {}).total ?? 0, 'metric-good'), sub: renderFloorDistribution(monitoring.floor_distribution || {}, { completedSessions: data.completed_sessions, bestFloor: allTime.best_floor }), className: 'wide' },
         { label: 'Memory (All Processes)', value: kpi(fmtMb(resources.total_working_set_mb)), sub: memoryCardSub, className: 'wide' },
       ];
@@ -793,9 +828,10 @@
     }
     function renderSummary(session) {
       const s = session.summary || {};
+      const bossDisplay = formatBossChain(s.boss_chain, s.boss_display || s.boss_name);
       const items = [
         ['Character', s.character],
-        ['Boss', s.boss_name],
+        ['Boss', bossDisplay],
         ['Seed', s.seed],
         ['Act', s.act],
         ['Max Floor', floorDisplay(s, true)],
@@ -824,7 +860,8 @@
       if (!currentAct || !maps.find(m => m.act === currentAct)) currentAct = maps[0].act;
       const activeMap = maps.find(m => m.act === currentAct) || maps[0];
       const activeBoss = activeMap.boss_info || activeMap.boss || {};
-      const activeBossName = activeBoss.name || activeBoss.boss_name || activeBoss.display_name || activeBoss.id || session.summary?.boss_name || '-';
+      const activeBossName = activeBoss.name || activeBoss.boss_name || activeBoss.display_name || activeMap.boss_name || activeMap.boss_id || '-';
+      const bossChainDisplay = formatBossChain(session.summary?.boss_chain, session.summary?.boss_display || session.summary?.boss_name);
       const visitedIds = new Set(activeMap.visited_node_ids || []);
       const visitedEdges = buildVisitedEdgeSet(activeMap);
       const baseNodes = (activeMap.nodes || []).map(node => ({ ...node, room_type: normalizeRoomType(node.room_type) }));
@@ -931,7 +968,8 @@
       return `<div class="card map-card">
         <div class="label">Act Map</div>
         <div class="map-toolbar">${maps.map(map => `<button class="map-tab ${map.act === activeMap.act ? 'active' : ''}" data-act="${map.act}">Act ${map.act}</button>`).join('')}</div>
-        <div class="sub">Boss: <span class="metric-warn">${escapeHtml(activeBossName)}</span></div>
+        <div class="sub">Boss Chain: <span class="metric-warn">${escapeHtml(bossChainDisplay)}</span></div>
+        <div class="sub">Act ${escapeHtml(activeMap.act)} Boss: <span class="metric-warn">${escapeHtml(activeBossName)}</span></div>
         <div class="map-toolbar">${legendItems}</div>
         <div class="tree-wrap">
           <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" data-darkreader-ignore="true">
@@ -947,6 +985,33 @@
         if (typeof item === 'string') return item;
         return item?.name || item?.id || '?';
       }).filter(Boolean);
+    }
+    function cardDisplayName(card) {
+      if (typeof card === 'string') return card;
+      const baseName = card?.name || card?.id || '?';
+      return card?.upgraded ? `${baseName}+` : baseName;
+    }
+    function compactCardList(cards) {
+      const counts = new Map();
+      (cards || []).forEach((card) => {
+        const name = cardDisplayName(card);
+        counts.set(name, (counts.get(name) || 0) + 1);
+      });
+      return Array.from(counts.entries()).map(([name, count]) => count > 1 ? `${name} x${count}` : name);
+    }
+    function formatBossChain(bossChain, fallback = '-') {
+      const names = (bossChain || [])
+        .map((boss) => boss?.boss_name || boss?.name || boss?.id)
+        .filter(Boolean);
+      if (names.length) return names.join(' | ');
+      return fallback || '-';
+    }
+    function renderCardSnapshot(title, cards) {
+      const summary = compactCardList(cards);
+      return `<div class="node-block">
+        <div class="label">${escapeHtml(title)}</div>
+        <div>${summary.length ? summary.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join(' ') : '<span class="muted">None recorded</span>'}</div>
+      </div>`;
     }
     function inventoryDiff(beforeItems, afterItems) {
       const before = new Map();
@@ -1106,6 +1171,8 @@
       const entryShopPotions = node.entry_state?.shop_potions || [];
       const entryPurgeCost = node.entry_state?.purge_cost;
       const purgeCandidates = node.entry_state?.deck || [];
+      const entryHand = node.entry_state?.hand || [];
+      const deckOverview = node.deck_overview || [];
       const shopItemName = (item) => typeof item === 'string' ? item : (item?.name || item?.id || '?');
       const shopDetails = normalizeRoomType(node.room_type) === 'Shop'
         ? `<div class="node-block"><div class="label">Shop Stock</div><div>
@@ -1130,6 +1197,8 @@
           <div class="node-block"><div class="label">Monsters</div><div>${(node.monsters || []).length ? (node.monsters || []).map(escapeHtml).join(', ') : 'None recorded'}</div></div>
           <div class="node-block"><div class="label">Entry</div><div>HP ${escapeHtml(node.entry_state?.hp)} / ${escapeHtml(node.entry_state?.max_hp)} | Gold ${escapeHtml(node.entry_state?.gold)} | Decision ${escapeHtml(node.entry_state?.decision)}</div></div>
           <div class="node-block"><div class="label">Exit</div><div>HP ${escapeHtml(node.exit_state?.hp)} / ${escapeHtml(node.exit_state?.max_hp)} | Gold ${escapeHtml(node.exit_state?.gold)} | Decision ${escapeHtml(node.exit_state?.decision)}</div></div>
+          ${renderCardSnapshot('Entry Hand', entryHand)}
+          ${renderCardSnapshot('Deck Snapshot', deckOverview)}
           ${renderInventoryTimeline(session)}
           ${shopDetails}
           <div class="node-block"><div class="label">Rewards</div><div>${rewards || '<span class="muted">No explicit rewards captured.</span>'}</div></div>

@@ -57,3 +57,8 @@ temp_ai_*.json
 .tmp_jsdom/
 tmp/
 temp/
+
+# Runtime model artifacts
+models/http_cli_rl/**
+!models/.gitkeep
+!models/http_cli_rl/.gitkeep

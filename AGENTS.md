@@ -76,6 +76,17 @@ Training is considered healthy only when all of the following hold:
 - Use concrete seeds / game IDs when investigating.
 - Prefer fixing root causes over masking problems with endless restarts.
 - Surface suspicious sessions explicitly in telemetry/dashboard output so operators do not need to infer them from raw logs.
+- When deadlock, protocol mismatch, or overlong sessions are detected, do **not** treat early truncation/restart as the final fix.
+- Required workflow for abnormal sessions:
+  1. capture reproducible evidence (seed, game_id, slot, last actions/state),
+  2. identify and fix the root cause in protocol/decision/state handling,
+  3. verify with rerun on the same or equivalent scenario,
+  4. only keep defensive guards as temporary safety nets, never as substitute fixes.
+- In any situation, do not introduce or keep workarounds that bypass, hide, reinterpret, or locally absorb protocol/runtime bugs.
+- The `server` and `client` must both follow the intended protocol and state-transition flow directly.
+- If observed behavior does not match the expected flow, treat it as a real bug in the server, client, or protocol contract and fix that layer directly.
+- Do not ship or keep fallback heuristics such as blacklists, forced skips, synthetic progress markers, semantic-changing silent retries, or protective early exits as substitutes for a real fix.
+- A task is not complete until any temporary debugging-only guard/workaround added during investigation has been removed again.
 - `watchdog` is monitor-and-log only. It must not perform any start/stop/restart/cleanup control actions on service, client, dashboard, or sessions.
 - For improvement/backtest workflows, use `20` concurrent workers by default unless explicitly overridden by the operator.
 

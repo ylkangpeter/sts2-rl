@@ -1,52 +1,138 @@
 {
-  "version": "v1",
+  "version": "v3_act1_boss_tuning",
   "entries": [
     {
-      "name": "kin_priest",
-      "match_any": ["priest", "神官"],
+      "name": "vantom_boss",
+      "match_any": ["vantom", "墨影幻灵"],
       "timeline": {
-        "1": {"intent_categories": ["buff", "debuff"], "damage_max": 0},
-        "2": {"intent_categories": ["attack", "buff"], "damage_max": 12},
-        "3": {"intent_categories": ["attack", "debuff"], "damage_max": 14},
-        "4": {"intent_categories": ["attack", "buff"], "damage_max": 16},
-        "5": {"intent_categories": ["attack", "buff"], "damage_max": 18},
-        "6": {"intent_categories": ["attack", "buff"], "damage_max": 20},
-        "7": {"intent_categories": ["attack", "buff"], "damage_max": 22},
-        "8": {"intent_categories": ["attack", "buff"], "damage_max": 24}
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 10, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["attack", "buff"], "damage_max": 16, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 20, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 24, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "burst"},
+        "5": {"round": 5, "intent_categories": ["attack", "buff"], "damage_max": 26, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "burst"},
+        "6": {"round": 6, "intent_categories": ["attack", "debuff"], "damage_max": 28, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": true, "special_phase_tag": "execute"}
+      }
+    },
+    {
+      "name": "ceremonial_beast_boss",
+      "match_any": ["ceremonial_beast", "ceremonial beast", "仪式兽"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack", "debuff"], "damage_max": 10, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "2": {"round": 2, "intent_categories": ["attack", "buff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 18, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 20, "hit_count": 2, "targets_all": true, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "aoe_burst"},
+        "5": {"round": 5, "intent_categories": ["attack", "buff"], "damage_max": 22, "hit_count": 2, "targets_all": true, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "aoe_burst"},
+        "6": {"round": 6, "intent_categories": ["attack", "debuff"], "damage_max": 24, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": true, "special_phase_tag": "execute"}
+      }
+    },
+    {
+      "name": "kin_priest",
+      "match_any": ["kin_priest", "kin priest", "同族神官"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["buff", "debuff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": true, "spawn_or_scale": true, "special_phase_tag": "setup"},
+        "2": {"round": 2, "intent_categories": ["attack", "buff"], "damage_max": 12, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 16, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
+        "5": {"round": 5, "intent_categories": ["attack", "buff"], "damage_max": 18, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
+        "6": {"round": 6, "intent_categories": ["attack", "buff"], "damage_max": 20, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
+        "7": {"round": 7, "intent_categories": ["attack", "buff"], "damage_max": 22, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "all_in"},
+        "8": {"round": 8, "intent_categories": ["attack", "buff"], "damage_max": 24, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "all_in"}
       }
     },
     {
       "name": "kin_follower",
-      "match_any": ["follower", "同族教徒"],
+      "match_any": ["kin_follower", "kin follower", "同族信徒"],
       "timeline": {
-        "1": {"intent_categories": ["attack", "buff"], "damage_max": 8},
-        "2": {"intent_categories": ["attack", "debuff"], "damage_max": 10},
-        "3": {"intent_categories": ["attack", "buff"], "damage_max": 11},
-        "4": {"intent_categories": ["attack", "debuff"], "damage_max": 12},
-        "5": {"intent_categories": ["attack", "buff"], "damage_max": 13},
-        "6": {"intent_categories": ["attack", "buff"], "damage_max": 14}
+        "1": {"round": 1, "intent_categories": ["attack", "buff"], "damage_max": 8, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["attack", "debuff"], "damage_max": 10, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "3": {"round": 3, "intent_categories": ["buff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
+        "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 12, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "5": {"round": 5, "intent_categories": ["attack", "debuff"], "damage_max": 13, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "6": {"round": 6, "intent_categories": ["attack", "buff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "all_in"}
       }
     },
     {
-      "name": "vantom_boss",
-      "match_any": ["vantom"],
+      "name": "bygone_effigy_elite",
+      "match_any": ["bygone_effigy", "bygone effigy", "旧日雕像"],
       "timeline": {
-        "1": {"intent_categories": ["buff", "debuff"], "damage_max": 0},
-        "2": {"intent_categories": ["attack", "buff"], "damage_max": 16},
-        "3": {"intent_categories": ["attack", "debuff"], "damage_max": 20},
-        "4": {"intent_categories": ["attack", "buff"], "damage_max": 24},
-        "5": {"intent_categories": ["attack", "buff"], "damage_max": 26}
+        "1": {"round": 1, "intent_categories": ["buff", "block"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": true, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "setup"},
+        "2": {"round": 2, "intent_categories": ["attack"], "damage_max": 12, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "4": {"round": 4, "intent_categories": ["buff", "block"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": true, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"}
       }
     },
     {
-      "name": "ceremonial_beast",
-      "match_any": ["ceremonial", "beast", "祭典兽"],
+      "name": "byrdonis_elite",
+      "match_any": ["byrdonis", "多尼斯异鸟"],
       "timeline": {
-        "1": {"intent_categories": ["buff", "debuff"], "damage_max": 0},
-        "2": {"intent_categories": ["attack", "buff"], "damage_max": 14},
-        "3": {"intent_categories": ["attack", "debuff"], "damage_max": 18},
-        "4": {"intent_categories": ["attack", "buff"], "damage_max": 20},
-        "5": {"intent_categories": ["attack", "buff"], "damage_max": 22}
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 10, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["buff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
+        "3": {"round": 3, "intent_categories": ["attack"], "damage_max": 16, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "burst"},
+        "4": {"round": 4, "intent_categories": ["attack", "debuff"], "damage_max": 18, "hit_count": 2, "targets_all": true, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "aoe_burst"}
+      }
+    },
+    {
+      "name": "phrog_parasite_elite",
+      "match_any": ["phrog_parasite", "phrog parasite", "异蛙寄生虫"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 11, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["buff", "summon"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "summon"},
+        "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 15, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "4": {"round": 4, "intent_categories": ["attack"], "damage_max": 18, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "burst"}
+      }
+    },
+    {
+      "name": "wriggler_support",
+      "match_any": ["wriggler", "蠕虫"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 6, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["debuff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "3": {"round": 3, "intent_categories": ["attack"], "damage_max": 8, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"}
+      }
+    },
+    {
+      "name": "fogmog_pair",
+      "match_any": ["fogmog", "雾菇"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["buff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "setup"},
+        "2": {"round": 2, "intent_categories": ["attack"], "damage_max": 10, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 12, "hit_count": 1, "targets_all": true, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "aoe_pressure"}
+      }
+    },
+    {
+      "name": "eye_with_teeth_support",
+      "match_any": ["eye_with_teeth", "eye with teeth", "眼牙"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 8, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["debuff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "3": {"round": 3, "intent_categories": ["attack"], "damage_max": 10, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"}
+      }
+    },
+    {
+      "name": "inklet_swarm",
+      "match_any": ["inklet", "墨宝"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 7, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["attack"], "damage_max": 9, "hit_count": 2, "targets_all": true, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "aoe_pressure"},
+        "3": {"round": 3, "intent_categories": ["buff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"}
+      }
+    },
+    {
+      "name": "mawler_brute",
+      "match_any": ["mawler", "裂口兽"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 11, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["attack", "debuff"], "damage_max": 13, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "3": {"round": 3, "intent_categories": ["attack"], "damage_max": 16, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "burst"}
+      }
+    },
+    {
+      "name": "nibbit_pair",
+      "match_any": ["nibbit", "小啃兽"],
+      "timeline": {
+        "1": {"round": 1, "intent_categories": ["attack"], "damage_max": 7, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "2": {"round": 2, "intent_categories": ["attack", "buff"], "damage_max": 9, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
+        "3": {"round": 3, "intent_categories": ["attack"], "damage_max": 11, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "pressure"}
       }
     }
   ]

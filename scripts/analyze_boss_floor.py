@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Analyze deterministic floor-17 boss attempts for flow-policy tuning."""
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import sys
 from typing import Any
 
 from st2rl.gameplay.config import FlowPolicyConfig
+from st2rl.gameplay.enemy_intent_script import describe_enemy_intent
 from st2rl.gameplay.policy import SimpleFlowPolicy
 from st2rl.gameplay.types import FlowAction, GameStateView
 from st2rl.protocols.http_cli import HttpCliProtocol, HttpCliProtocolConfig
@@ -137,12 +139,57 @@ def _card_hp_loss(policy: SimpleFlowPolicy, card: dict[str, Any]) -> int:
     return policy._card_hp_loss(card)
 
 
+def _compact_powers(powers: Any) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for power in powers or []:
+        if not isinstance(power, dict):
+            continue
+        compact.append(
+            {
+                "id": power.get("id") or power.get("power_id") or power.get("name"),
+                "name": power.get("name") or power.get("display_name") or power.get("id"),
+                "amount": power.get("amount"),
+            }
+        )
+    return compact
+
+
+def _combat_boss_label(state: GameStateView) -> str:
+    context = state.raw.get("context") or {}
+    boss = context.get("boss")
+    if isinstance(boss, dict):
+        for key in ("name", "display_name", "boss_name", "id", "boss_id"):
+            value = str(boss.get(key) or "").strip()
+            if value:
+                return value
+    for key in ("boss_name", "boss_id"):
+        value = str(context.get(key) or "").strip()
+        if value:
+            return value
+    living = state.living_enemies()
+    if living:
+        return " + ".join(str(enemy.get("name") or enemy.get("id") or "?") for enemy in living)
+    return "UNKNOWN_BOSS"
+
+
+def _combat_target_name(action: FlowAction, living: list[dict[str, Any]]) -> str:
+    target_index = action.args.get("target_index")
+    for enemy in living:
+        if enemy.get("index") == target_index:
+            return str(enemy.get("name") or enemy.get("id") or "")
+    return ""
+
+
 def _combat_snapshot(state: GameStateView, policy: SimpleFlowPolicy, action: FlowAction, step: int) -> dict[str, Any]:
     playable = state.playable_cards()
     played_card = next((card for card in playable if card.get("index") == action.args.get("card_index")), None)
     living = state.living_enemies()
+    intent_snapshot = describe_enemy_intent(state, horizon=3)
+    intent_rows = list(intent_snapshot.get("rows") or [])
+    mismatch_rows = [row for row in intent_rows if row.get("mismatch")]
     return {
         "step": step,
+        "boss_name": _combat_boss_label(state),
         "floor": _state_floor(state),
         "round": state.round,
         "decision": state.decision,
@@ -153,19 +200,51 @@ def _combat_snapshot(state: GameStateView, policy: SimpleFlowPolicy, action: Flo
         "incoming": _enemy_intended_damage(state),
         "action": action.name,
         "action_args": dict(action.args),
+        "target_name": _combat_target_name(action, living),
         "played_card": _card_id(played_card or {}) if played_card else "",
         "played_damage": _card_damage(policy, played_card or {}) if played_card else 0,
         "played_block": _card_block(policy, played_card or {}) if played_card else 0,
         "played_hp_loss": _card_hp_loss(policy, played_card or {}) if played_card else 0,
         "playable_count": len(playable),
         "playable_cards": [_card_id(card) for card in playable],
+        "player_powers": _compact_powers(state.player.get("powers") or state.raw.get("player_powers") or []),
+        "policy_debug": dict(policy._last_policy_debug),
+        "intent_mismatch_count": len(mismatch_rows),
+        "intent_mismatches": [
+            {
+                "enemy": row.get("enemy"),
+                "script": row.get("script"),
+                "observed_category": row.get("observed_category"),
+                "observed_intent": row.get("observed_intent"),
+                "expected_categories": row.get("expected_categories"),
+                "expected_phase": (row.get("expected_step") or {}).get("special_phase_tag"),
+            }
+            for row in mismatch_rows
+        ],
+        "enemy_intent": [
+            {
+                "enemy": row.get("enemy"),
+                "script": row.get("script"),
+                "observed_category": row.get("observed_category"),
+                "observed_intent": row.get("observed_intent"),
+                "observed_intended_damage": row.get("observed_intended_damage"),
+                "expected_categories": row.get("expected_categories"),
+                "expected_phase": (row.get("expected_step") or {}).get("special_phase_tag"),
+                "next_turn_forecast": row.get("next_turn_forecast"),
+                "short_horizon_forecast": row.get("short_horizon_forecast"),
+                "predicted_two_turn_damage": row.get("predicted_two_turn_damage"),
+                "scaling_risk": row.get("scaling_risk"),
+                "mismatch": bool(row.get("mismatch")),
+            }
+            for row in intent_rows
+        ],
         "enemies": [
             {
                 "id": enemy.get("id"),
                 "name": enemy.get("name"),
                 "hp": enemy.get("hp"),
                 "block": enemy.get("block"),
-                "powers": enemy.get("powers") or [],
+                "powers": _compact_powers(enemy.get("powers") or []),
             }
             for enemy in living
         ],
@@ -282,8 +361,10 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
         "block_cards": sum(1 for row in combat_actions if row.get("played_block", 0) > 0),
         "damage_cards": sum(1 for row in combat_actions if row.get("played_damage", 0) > 0),
         "potions_used": sum(1 for row in boss_rows if row.get("action") == "use_potion"),
+        "intent_mismatch_count": sum(_safe_int(row.get("intent_mismatch_count"), 0) for row in boss_rows),
         "deck": dict(deck),
         "played_cards": Counter(played_cards),
+        "trace": boss_rows,
         "trace_tail": boss_rows[-12:],
     }
 
@@ -322,6 +403,11 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
         for bucket, rows in _group_by(attempted, lambda row: _bucket_hp(row.get("entry_hp"))).items()
     }
 
+    mismatch_by_boss = {
+        boss: _summarize_mismatch_group(rows)
+        for boss, rows in _group_by(attempted, "boss").items()
+    }
+
     return {
         "run_quality": {
             "total": len(results),
@@ -335,7 +421,9 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "summary": _summarize_group(attempted, clears, fails),
         "by_boss": by_boss,
+        "by_boss_mismatch": mismatch_by_boss,
         "by_entry_hp": by_entry_hp,
+        "mismatch_hotspots": _mismatch_hotspots(attempted),
         "common_fail_deck": dict(_common_counter(fails, "deck").most_common(30)),
         "common_clear_deck": dict(_common_counter(clears, "deck").most_common(30)),
         "common_fail_played": dict(_common_counter(fails, "played_cards").most_common(30)),
@@ -343,6 +431,7 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
         "deck_delta_clear_minus_fail": _counter_rate_delta(clears, fails, "deck"),
         "played_delta_clear_minus_fail": _counter_rate_delta(clears, fails, "played_cards"),
         "representative_fails": sorted(fails, key=lambda row: (_safe_int(row.get("entry_hp"), 0), row.get("boss")))[:12],
+        "representative_clears": sorted(clears, key=lambda row: (_safe_int(row.get("entry_hp"), 0), row.get("boss")))[:12],
     }
 
 
@@ -403,7 +492,62 @@ def _summarize_group(rows: list[dict[str, Any]], clears: list[dict[str, Any]], f
         "avg_playable": round(mean([float(row.get("avg_playable") or 0.0) for row in rows]), 2) if rows else 0.0,
         "avg_hp_loss_cards": avg("hp_loss_cards", rows),
         "avg_potions_used": avg("potions_used", rows),
+        "avg_intent_mismatches": avg("intent_mismatch_count", rows),
     }
+
+
+def _summarize_mismatch_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    attempts = len(rows)
+    mismatch_attempts = sum(1 for row in rows if _safe_int(row.get("intent_mismatch_count"), 0) > 0)
+    total_mismatches = sum(_safe_int(row.get("intent_mismatch_count"), 0) for row in rows)
+    round_counter: Counter[str] = Counter()
+    phase_counter: Counter[str] = Counter()
+    enemy_counter: Counter[str] = Counter()
+    for row in rows:
+        for trace in list(row.get("trace") or []):
+            for mismatch in list(trace.get("intent_mismatches") or []):
+                round_counter.update([str(trace.get("round") or "?")])
+                phase = str(mismatch.get("expected_phase") or "unknown")
+                phase_counter.update([phase])
+                enemy_counter.update([str(mismatch.get("enemy") or "unknown")])
+    return {
+        "attempts": attempts,
+        "mismatch_attempts": mismatch_attempts,
+        "mismatch_attempt_rate": round(mismatch_attempts / attempts, 4) if attempts else 0.0,
+        "total_mismatches": total_mismatches,
+        "top_rounds": [{"round": key, "count": value} for key, value in round_counter.most_common(8)],
+        "top_phases": [{"phase": key, "count": value} for key, value in phase_counter.most_common(8)],
+        "top_enemies": [{"enemy": key, "count": value} for key, value in enemy_counter.most_common(8)],
+    }
+
+
+def _mismatch_hotspots(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    hotspot_counter: Counter[tuple[str, str, str, str]] = Counter()
+    for row in rows:
+        boss = str(row.get("boss") or "UNKNOWN_BOSS")
+        for trace in list(row.get("trace") or []):
+            trace_round = str(trace.get("round") or "?")
+            for mismatch in list(trace.get("intent_mismatches") or []):
+                hotspot_counter.update(
+                    [
+                        (
+                            boss,
+                            str(mismatch.get("enemy") or "unknown"),
+                            trace_round,
+                            str(mismatch.get("expected_phase") or "unknown"),
+                        )
+                    ]
+                )
+    return [
+        {
+            "boss": boss,
+            "enemy": enemy,
+            "round": round_no,
+            "phase": phase,
+            "count": count,
+        }
+        for (boss, enemy, round_no, phase), count in hotspot_counter.most_common(16)
+    ]
 
 
 def main() -> None:

@@ -15,6 +15,7 @@ from gymnasium import spaces
 
 from st2rl.gameplay.combat_stagnation import CombatStagnationProfile, build_combat_stagnation_profile
 from st2rl.gameplay.config import FlowPolicyConfig
+from st2rl.gameplay.enemy_intent_script import forecast_enemy_intent
 from st2rl.gameplay.knowledge_matcher import DEFAULT_MISMATCH_LOG_PATH, KnowledgeMatcher
 from st2rl.gameplay.policy import SimpleFlowPolicy
 from st2rl.gameplay.types import FlowAction, GameStateView
@@ -124,7 +125,7 @@ class HttpCliRlEnv(gym.Env):
         self._overlong_seed_log_path = Path(self.config.overlong_seed_log_path or default_overlong_log)
         self._anomaly_log_path = Path(self.config.telemetry_dir or "logs") / "session_anomalies.jsonl"
         self.action_space = create_action_space()
-        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(129,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(167,), dtype=np.float32)
 
         self._episode_index = 0
         self._step_count = 0
@@ -307,6 +308,50 @@ class HttpCliRlEnv(gym.Env):
             "boss_id": boss.get("id"),
             "boss_name": boss.get("name") or boss.get("display_name") or boss.get("id"),
         }
+
+    def _card_reward_choice_action(self, action_name: Any) -> bool:
+        return str(action_name or "").strip() in {"choose_card_reward", "select_card_reward"}
+
+    def _boss_entry(self, boss: Any, act: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(boss, dict):
+            return None
+        boss_id = str(boss.get("id") or "").strip()
+        boss_name = str(boss.get("name") or boss.get("display_name") or boss.get("id") or "").strip()
+        if not boss_id and not boss_name:
+            return None
+        return {
+            "act": self._safe_number(act, 0),
+            "boss_id": boss_id or None,
+            "boss_name": boss_name or None,
+        }
+
+    def _collect_boss_chain(self, final_state: Optional[GameStateView]) -> list[dict[str, Any]]:
+        bosses_by_act: dict[int, dict[str, Any]] = {}
+
+        def remember(state_like: Any) -> None:
+            if not isinstance(state_like, dict):
+                return
+            context = state_like.get("context") or {}
+            act = self._safe_number(context.get("act") or state_like.get("act"), 0)
+            candidate = self._boss_entry(context.get("boss"), act)
+            if candidate is None:
+                full_map = state_like.get("full_map") or {}
+                candidate = self._boss_entry(full_map.get("boss"), act)
+            if candidate is not None and candidate.get("act", 0) > 0:
+                bosses_by_act[candidate["act"]] = candidate
+
+        for item in self._episode_trace:
+            remember(item.get("before"))
+            remember(item.get("after"))
+            map_snapshot = item.get("map_snapshot") or {}
+            candidate = self._boss_entry(map_snapshot.get("boss"), map_snapshot.get("act"))
+            if candidate is not None and candidate.get("act", 0) > 0:
+                bosses_by_act[candidate["act"]] = candidate
+
+        if final_state is not None:
+            remember(self._state_snapshot(final_state))
+
+        return [bosses_by_act[act] for act in sorted(bosses_by_act.keys(), reverse=True)]
 
     def _compact_card(self, card: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -494,8 +539,31 @@ class HttpCliRlEnv(gym.Env):
         after_card_names = {card.get("name") for card in after.get("cards", []) if card.get("name")}
         for card_name in sorted(after_card_names - before_card_names):
             rewards.append({"type": "card_seen", "name": card_name})
-        if action.name == "choose_card_reward":
-            chosen = next((card.get("name") for card in before.get("cards", []) if card.get("index") == action.args.get("card_index")), None)
+        if self._card_reward_choice_action(action.name):
+            chosen = None
+            card_index = action.args.get("card_index")
+            before_cards = [card for card in (before.get("cards") or []) if isinstance(card, dict)]
+            if card_index is not None:
+                chosen_card = next((card for card in before_cards if card.get("index") == card_index), None)
+                if chosen_card:
+                    chosen = chosen_card.get("name")
+            if not chosen:
+                # Fallback: infer the picked card from deck delta when reward-choice index is unavailable/misaligned.
+                before_deck = [card for card in ((before.get("player") or {}).get("deck") or []) if isinstance(card, dict)]
+                after_deck = [card for card in ((after.get("player") or {}).get("deck") or []) if isinstance(card, dict)]
+                before_names = sorted(card.get("name") for card in before_deck if card.get("name"))
+                after_names = sorted(card.get("name") for card in after_deck if card.get("name"))
+                if len(after_names) > len(before_names):
+                    before_count: dict[str, int] = {}
+                    for name in before_names:
+                        before_count[name] = before_count.get(name, 0) + 1
+                    for name in after_names:
+                        count = before_count.get(name, 0)
+                        if count > 0:
+                            before_count[name] = count - 1
+                        else:
+                            chosen = name
+                            break
             if chosen:
                 rewards.append({"type": "card_chosen", "name": chosen})
         return rewards
@@ -554,7 +622,7 @@ class HttpCliRlEnv(gym.Env):
             option_name = self._display_name(option, fallback=f"option[{args.get('option_index')}]")
             return f"choose {option_name}"
 
-        if action.name == "choose_card_reward":
+        if self._card_reward_choice_action(action.name):
             card = self._lookup_by_index(before.cards, args.get("card_index"))
             fallback = f"card[{args.get('card_index')}]"
             return f"take {self._display_name(card, fallback=fallback)}"
@@ -658,6 +726,81 @@ class HttpCliRlEnv(gym.Env):
             return f"a{act}_c{map_target.get('col')}_r{map_target.get('row')}"
         return f"a{act}_f{floor}"
 
+    def _format_floor_label(self, act: Any, floor: Any) -> str:
+        act_value = self._safe_number(act, 0)
+        floor_value = self._safe_number(floor, 0)
+        if act_value <= 0 and floor_value <= 0:
+            return "A0F0"
+        return f"A{max(act_value, 0)}F{max(floor_value, 0)}"
+
+    def _format_global_floor_label(self, act: Any, floor: Any) -> str:
+        global_floor = self._global_floor(act=self._safe_number(act, 1), floor=self._safe_number(floor, 0))
+        return f"F{max(global_floor, 0)}"
+
+    def _card_key(self, card: dict[str, Any]) -> str:
+        name = str(card.get("name") or card.get("id") or "Unknown").strip()
+        upgraded = bool(card.get("upgraded"))
+        suffix = "+" if upgraded else ""
+        return f"{name}{suffix}"
+
+    def _deck_overview(self, deck: list[dict[str, Any]]) -> list[str]:
+        counts: dict[str, int] = {}
+        ordered: list[str] = []
+        for card in deck or []:
+            if not isinstance(card, dict):
+                continue
+            key = self._card_key(card)
+            if key not in counts:
+                ordered.append(key)
+                counts[key] = 0
+            counts[key] += 1
+        overview: list[str] = []
+        for key in ordered:
+            count = counts[key]
+            overview.append(f"{key}x{count}" if count > 1 else key)
+        return overview
+
+    def _inventory_names(self, snapshot: dict[str, Any], field: str) -> set[str]:
+        values = snapshot.get(field) or []
+        output: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                output.add(text)
+        return output
+
+    def _append_item_event(
+        self,
+        container: dict[str, dict[str, Any]],
+        *,
+        kind: str,
+        name: str,
+        event_type: str,
+        act: int,
+        floor: int,
+    ) -> None:
+        item_name = str(name or "").strip()
+        if not item_name:
+            return
+        key = f"{kind}:{item_name}"
+        entry = container.setdefault(
+            key,
+            {
+                "kind": kind,
+                "name": item_name,
+                "obtained": [],
+                "used": [],
+            },
+        )
+        payload = {
+            "act_floor": self._format_floor_label(act, floor),
+            "global_floor": self._format_global_floor_label(act, floor),
+        }
+        if event_type == "obtained":
+            entry["obtained"].append(payload)
+        if event_type == "used":
+            entry["used"].append(payload)
+
     def _build_session_details(self, *, terminated: bool, truncated: bool) -> dict[str, Any]:
         initial = dict(self._episode_initial_snapshot)
         final = self._state_snapshot(self._state)
@@ -665,6 +808,7 @@ class HttpCliRlEnv(gym.Env):
         nodes_by_id: dict[str, dict[str, Any]] = {}
         ordered_nodes: list[str] = []
         active_room_target: Optional[dict[str, Any]] = None
+        item_events: dict[str, dict[str, Any]] = {}
 
         for item in self._episode_trace:
             map_snapshot = item.get("map_snapshot") or {}
@@ -714,15 +858,19 @@ class HttpCliRlEnv(gym.Env):
             room_type = (room_target or {}).get("room_type") or context.get("room_type")
             node = nodes_by_id.get(node_id)
             if node is None:
+                entry_state = item.get("before") or after
                 node = {
                     "node_id": node_id,
                     "act": act,
                     "floor": floor,
+                    "floor_label": self._format_floor_label(act, floor),
+                    "global_floor_label": self._format_global_floor_label(act, floor),
                     "col": (room_target or {}).get("col"),
                     "row": (room_target or {}).get("row"),
                     "room_type": self._normalize_room_type(room_type),
-                    "entry_state": item.get("before") or after,
+                    "entry_state": entry_state,
                     "exit_state": after,
+                    "deck_overview": self._deck_overview(((entry_state.get("player") or {}).get("deck") or [])),
                     "monsters": [],
                     "rewards": [],
                     "actions": [],
@@ -750,6 +898,101 @@ class HttpCliRlEnv(gym.Env):
             for reward_item in item.get("rewards_found", []):
                 if reward_item not in node["rewards"]:
                     node["rewards"].append(reward_item)
+                reward_type = str(reward_item.get("type") or "").strip().lower()
+                reward_name = str(reward_item.get("name") or "").strip()
+                if reward_type in {"card_seen", "card_chosen"} and reward_name:
+                    self._append_item_event(
+                        item_events,
+                        kind="card",
+                        name=reward_name,
+                        event_type="obtained",
+                        act=act,
+                        floor=floor,
+                    )
+                if reward_type == "potion" and reward_name:
+                    self._append_item_event(
+                        item_events,
+                        kind="potion",
+                        name=reward_name,
+                        event_type="obtained",
+                        act=act,
+                        floor=floor,
+                    )
+                if reward_type == "relic" and reward_name:
+                    self._append_item_event(
+                        item_events,
+                        kind="relic",
+                        name=reward_name,
+                        event_type="obtained",
+                        act=act,
+                        floor=floor,
+                    )
+
+            action_name = str(item.get("action") or "").strip()
+            action_args = dict(item.get("action_args") or {})
+            if action_name == "use_potion":
+                before_player = (before.get("player") or {})
+                potions = before_player.get("potions") or []
+                potion = self._lookup_by_index(potions, action_args.get("potion_index"))
+                potion_name = self._display_name(potion, fallback=f"potion[{action_args.get('potion_index')}]")
+                self._append_item_event(
+                    item_events,
+                    kind="potion",
+                    name=potion_name,
+                    event_type="used",
+                    act=act,
+                    floor=floor,
+                )
+            if action_name == "play_card":
+                hand = before.get("hand") or []
+                card = self._lookup_by_index(hand, action_args.get("card_index"))
+                card_name = self._display_name(card, fallback=f"card[{action_args.get('card_index')}]")
+                upgraded = bool((card or {}).get("upgraded"))
+                card_name = f"{card_name}+" if upgraded else card_name
+                self._append_item_event(
+                    item_events,
+                    kind="card",
+                    name=card_name,
+                    event_type="used",
+                    act=act,
+                    floor=floor,
+                )
+
+            before_relics = self._inventory_names(before, "relics")
+            after_relics = self._inventory_names(after, "relics")
+            for relic_name in sorted(after_relics - before_relics):
+                self._append_item_event(
+                    item_events,
+                    kind="relic",
+                    name=relic_name,
+                    event_type="obtained",
+                    act=act,
+                    floor=floor,
+                )
+            before_potions = self._inventory_names(before, "potions")
+            after_potions = self._inventory_names(after, "potions")
+            for potion_name in sorted(after_potions - before_potions):
+                self._append_item_event(
+                    item_events,
+                    kind="potion",
+                    name=potion_name,
+                    event_type="obtained",
+                    act=act,
+                    floor=floor,
+                )
+            before_deck = self._deck_overview(((before.get("player") or {}).get("deck") or []))
+            after_deck = self._deck_overview(((after.get("player") or {}).get("deck") or []))
+            before_deck_set = set(before_deck)
+            after_deck_set = set(after_deck)
+            for card_name in sorted(after_deck_set - before_deck_set):
+                self._append_item_event(
+                    item_events,
+                    kind="card",
+                    name=card_name,
+                    event_type="obtained",
+                    act=act,
+                    floor=floor,
+                )
 
             act_map = maps_by_act.setdefault(act, {"act": act, "nodes": {}, "visited_node_ids": []})
             act_map["visited_node_ids"].append(node_id)
@@ -809,6 +1052,12 @@ class HttpCliRlEnv(gym.Env):
         )
         act1_boss_clear = bool(final_act >= 2 or max_act >= 2)
         boss_info = self._extract_boss_info(self._state)
+        boss_chain = self._collect_boss_chain(self._state)
+        boss_display = " | ".join(
+            boss.get("boss_name") or boss.get("boss_id") or ""
+            for boss in boss_chain
+            if isinstance(boss, dict) and (boss.get("boss_name") or boss.get("boss_id"))
+        )
         summary = {
             "game_id": self._game_id,
             "seed": self._seed,
@@ -840,13 +1089,39 @@ class HttpCliRlEnv(gym.Env):
             "elapsed_seconds": self._episode_elapsed_seconds(),
             "boss_id": boss_info.get("boss_id"),
             "boss_name": boss_info.get("boss_name"),
+            "boss_chain": boss_chain,
+            "boss_display": boss_display or boss_info.get("boss_name"),
         }
+        for act_map in maps:
+            map_boss = next((boss for boss in boss_chain if self._safe_number(boss.get("act"), 0) == self._safe_number(act_map.get("act"), 0)), None)
+            if map_boss:
+                act_map["boss_id"] = map_boss.get("boss_id")
+                act_map["boss_name"] = map_boss.get("boss_name")
+        if boss_chain:
+            final["boss_chain"] = boss_chain
+            final["boss_display"] = boss_display or boss_info.get("boss_name")
+        items_summary: dict[str, list[dict[str, Any]]] = {"cards": [], "potions": [], "relics": []}
+        for _, entry in sorted(item_events.items(), key=lambda pair: (pair[1].get("kind"), pair[1].get("name"))):
+            kind = str(entry.get("kind") or "")
+            bucket = "cards" if kind == "card" else "potions" if kind == "potion" else "relics"
+            obtained = list(entry.get("obtained") or [])
+            used = list(entry.get("used") or [])
+            items_summary[bucket].append(
+                {
+                    "name": entry.get("name"),
+                    "obtained": obtained,
+                    "used": used,
+                    "obtained_display": " | ".join(item.get("global_floor", "") for item in obtained) if obtained else "-",
+                    "used_display": " | ".join(item.get("global_floor", "") for item in used) if used else "-",
+                }
+            )
         return {
             "summary": summary,
             "initial_state": initial,
             "final_state": final,
             "maps": maps,
             "nodes": [nodes_by_id[node_id] for node_id in ordered_nodes],
+            "items": items_summary,
             "trace": self._episode_trace,
         }
 
@@ -939,6 +1214,26 @@ class HttpCliRlEnv(gym.Env):
     def _record_episode_anomaly(self, summary: dict[str, Any]) -> None:
         self._anomaly_log_path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(summary)
+        payload["termination_reason"] = self._termination_reason
+        if self._state is not None:
+            payload["final_decision"] = self._state.decision
+            payload["final_context"] = dict((self._state.raw or {}).get("context") or {})
+            payload["final_summary"] = self._state.summary()
+        if self._episode_trace:
+            tail = self._episode_trace[-8:]
+            payload["trace_tail"] = [
+                {
+                    "step": item.get("step"),
+                    "status": item.get("status"),
+                    "action": item.get("action"),
+                    "action_args": item.get("action_args"),
+                    "action_detail": item.get("action_detail"),
+                    "decision_before": (item.get("before") or {}).get("decision"),
+                    "decision_after": (item.get("after") or {}).get("decision"),
+                    "reward": item.get("reward"),
+                }
+                for item in tail
+            ]
         payload["recorded_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         with self._anomaly_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -972,6 +1267,38 @@ class HttpCliRlEnv(gym.Env):
             )
             for card in state.hand
         )
+        cards = tuple(
+            (
+                card.get("index"),
+                card.get("name") or card.get("id"),
+                self._safe_number(card.get("cost"), 99),
+                bool(card.get("upgraded")),
+            )
+            for card in state.cards
+        )
+        relics = tuple(
+            (
+                relic.get("index"),
+                relic.get("name") or relic.get("id"),
+            )
+            for relic in state.relics
+        )
+        potions = tuple(
+            (
+                potion.get("index"),
+                potion.get("name") or potion.get("id"),
+                bool(potion.get("requires_target")),
+            )
+            for potion in state.potions
+        )
+        bundles = tuple(
+            (
+                bundle.get("index"),
+                bundle.get("name") or bundle.get("id"),
+                bundle.get("type"),
+            )
+            for bundle in state.bundles
+        )
         choices = tuple(
             (
                 choice.get("index"),
@@ -982,6 +1309,31 @@ class HttpCliRlEnv(gym.Env):
                 bool(choice.get("is_enabled", True)),
             )
             for choice in (state.options or state.choices)
+        )
+        player_relics = tuple(
+            (
+                relic.get("name") or relic.get("id"),
+                tuple(sorted((relic.get("vars") or {}).items())),
+            )
+            for relic in (state.player.get("relics") or [])
+            if isinstance(relic, dict)
+        )
+        player_potions = tuple(
+            (
+                potion.get("index"),
+                potion.get("name") or potion.get("id"),
+                tuple(sorted((potion.get("vars") or {}).items())),
+            )
+            for potion in (state.player.get("potions") or [])
+            if isinstance(potion, dict)
+        )
+        player_powers = tuple(
+            (
+                power.get("name"),
+                self._safe_number(power.get("amount")),
+            )
+            for power in (state.raw.get("player_powers") or [])
+            if isinstance(power, dict)
         )
         return str(
             (
@@ -998,12 +1350,22 @@ class HttpCliRlEnv(gym.Env):
                 state.energy,
                 state.max_energy,
                 state.deck_size,
-                len(state.player.get("relics") or []),
-                len(state.player.get("potions") or []),
-                len(state.raw.get("player_powers") or []),
+                self._safe_number(state.raw.get("draw_pile_count")),
+                self._safe_number(state.raw.get("discard_pile_count")),
+                self._safe_number(state.raw.get("exhaust_pile_count")),
+                player_relics,
+                player_potions,
+                player_powers,
                 enemies,
                 hand,
                 choices,
+                cards,
+                relics,
+                potions,
+                bundles,
+                self._safe_number(state.raw.get("card_removal_cost")),
+                bool(state.raw.get("can_skip")),
+                state.raw.get("event_name"),
                 bool(state.game_over),
                 bool(state.victory),
             )
@@ -1117,8 +1479,85 @@ class HttpCliRlEnv(gym.Env):
             1.0 if normalized == "boss" else 0.0,
         ]
 
+    def _intent_category_index(self, category: Any) -> float:
+        normalized = str(category or "").strip().lower()
+        mapping = {
+            "unknown": 0,
+            "attack": 1,
+            "buff": 2,
+            "debuff": 3,
+            "block": 4,
+            "summon": 5,
+        }
+        return float(mapping.get(normalized, 0)) / 5.0
+
+    def _enemy_forecast_features(
+        self,
+        state: GameStateView,
+        forecast: dict[str, Any],
+        *,
+        max_count: int,
+    ) -> tuple[list[float], list[float]]:
+        rows = {
+            self._safe_number(row.get("enemy_index"), -1): row
+            for row in (forecast.get("rows") or [])
+            if isinstance(row, dict)
+        }
+        per_enemy: list[float] = []
+        forecast_damage_t1 = float(forecast.get("expected_damage_turn_plus_one") or 0)
+        forecast_damage_t2 = float(forecast.get("expected_damage_turn_plus_two") or 0)
+        forecast_two_turn = float(forecast.get("predicted_two_turn_pressure") or 0)
+        scaling_risk = float(forecast.get("enemy_scaling_risk") or 0)
+        future_pressure = max(float(self._enemy_intended_damage(state)), forecast_damage_t1)
+        requires_block_now = 1.0 if max(0.0, future_pressure - float(state.block)) >= max(6.0, state.hp * 0.18) else 0.0
+        requires_frontload_damage = 1.0 if forecast_two_turn >= max(18.0, state.hp * 0.45) else 0.0
+        requires_kill_priority = 1.0 if scaling_risk > 0 or len(state.living_enemies()) >= 2 else 0.0
+        for enemy in state.enemies[:max_count]:
+            row = rows.get(self._safe_number(enemy.get("index"), -1), {})
+            next_turn = row.get("next_turn_forecast") or {}
+            two_turn_damage = float(row.get("predicted_two_turn_damage") or 0)
+            special_window = 1.0 if (
+                next_turn.get("adds_buff")
+                or next_turn.get("adds_debuff")
+                or next_turn.get("spawn_or_scale")
+                or str(next_turn.get("special_phase_tag") or "").strip()
+            ) else 0.0
+            current_category = "unknown"
+            if enemy.get("intends_attack"):
+                current_category = "attack"
+            elif enemy.get("intents"):
+                current_category = str((enemy.get("intents") or [{}])[0].get("type") or "unknown")
+            elif enemy.get("intent"):
+                current_category = str(enemy.get("intent") or "unknown")
+            next_categories = next_turn.get("intent_categories") or []
+            next_category = next_categories[0] if next_categories else "unknown"
+            per_enemy.extend(
+                [
+                    self._intent_category_index(current_category),
+                    self._intent_category_index(next_category),
+                    float(next_turn.get("damage_max") or 0) / 40.0,
+                    two_turn_damage / 80.0,
+                    1.0 if next_turn.get("targets_all") else 0.0,
+                    special_window,
+                ]
+            )
+        while len(per_enemy) < max_count * 6:
+            per_enemy.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        global_features = [
+            forecast_damage_t1 / 80.0,
+            forecast_damage_t2 / 80.0,
+            forecast_two_turn / 120.0,
+            float(forecast.get("matched_enemies") or 0) / max(1.0, float(len(state.living_enemies()) or 1)),
+            requires_block_now,
+            requires_frontload_damage,
+            requires_kill_priority,
+            min(1.0, scaling_risk / 3.0),
+        ]
+        return per_enemy, global_features
+
     def _get_observation(self, state: GameStateView) -> np.ndarray:
         knowledge_summary = self.knowledge_matcher.summarize_state(state)
+        intent_forecast = forecast_enemy_intent(state, horizon=3)
         context = self._state_context(state)
         playable_cards = state.playable_cards()
         playable_types = [str(card.get("type") or "").lower() for card in playable_cards]
@@ -1137,6 +1576,11 @@ class HttpCliRlEnv(gym.Env):
         player_relic_count = len(state.player.get("relics") or [])
         player_potion_count = len(state.player.get("potions") or [])
         player_power_count = len(state.raw.get("player_powers") or [])
+        forecast_enemy_vector, forecast_global_vector = self._enemy_forecast_features(
+            state,
+            intent_forecast,
+            max_count=self.config.observation_max_enemies,
+        )
         extra_vector = [
             float(context.get("act") or 0) / 3.0,
             float(context.get("floor") or 0) / 20.0,
@@ -1187,8 +1631,10 @@ class HttpCliRlEnv(gym.Env):
         ]
         vector.extend(self._encode_cards(state.hand, self.config.observation_max_hand))
         vector.extend(self._encode_enemies(state.enemies, self.config.observation_max_enemies))
+        vector.extend(forecast_enemy_vector)
         vector.extend(float(value) for value in knowledge_summary["features"])
         vector.extend(extra_vector)
+        vector.extend(forecast_global_vector)
         return np.array(vector, dtype=np.float32)
 
     def _apply_transition_tracking(self, state: GameStateView) -> None:
@@ -1629,7 +2075,6 @@ class HttpCliRlEnv(gym.Env):
             if stagnation_abort_reason:
                 abort_episode = True
                 termination_reason = termination_reason or stagnation_abort_reason
-
             terminated = bool(self._state.game_over)
             truncated = truncated or abort_episode or bool(self.config.max_steps is not None and self._step_count >= self.config.max_steps)
             if truncated and not terminated:

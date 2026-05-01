@@ -136,6 +136,53 @@ class SimpleFlowPolicy:
         is_hard_act1_boss = act <= 1 and is_boss_floor and (is_vantom or is_ceremonial_beast or is_kin)
         vantom_slippery = is_vantom and self._enemy_power_amount(state, "slippery", "滑溜") > 0
         high_value_combat = is_targeted_boss or is_elite_room
+        forecast_rows = list(intent_forecast.get("rows") or [])
+        def _forecast_row_contains(*tokens: str) -> dict[str, Any]:
+            lowered = tuple(self._text(token) for token in tokens if token)
+            for row in forecast_rows:
+                enemy_name = self._text(row.get("enemy"))
+                if any(token and token in enemy_name for token in lowered):
+                    return dict(row)
+            return {}
+
+        def _forecast_phase(row: dict[str, Any], idx: int = 0) -> str:
+            steps = list(row.get("short_horizon_forecast") or [])
+            if idx < 0 or idx >= len(steps):
+                return ""
+            return self._text((steps[idx] or {}).get("special_phase_tag"))
+
+        predicted_turn_one_damage = max(incoming_damage, self._safe_int(intent_forecast.get("expected_damage_turn_plus_one"), 0))
+        predicted_turn_two_damage = self._safe_int(intent_forecast.get("expected_damage_turn_plus_two"), 0)
+        predicted_two_turn_pressure = max(
+            predicted_turn_one_damage + predicted_turn_two_damage,
+            self._safe_int(intent_forecast.get("predicted_two_turn_pressure"), 0),
+        )
+        predicted_block_gap = max(0, predicted_turn_one_damage - state.block)
+        hp_ratio = state.hp / max(1, state.max_hp)
+        requires_block_now = (
+            predicted_turn_one_damage >= state.hp
+            or predicted_block_gap >= max(6, int(state.hp * 0.18))
+            or (act == 1 and high_value_combat and predicted_block_gap >= max(4, int(state.hp * 0.12)))
+        )
+        requires_frontload_damage = (
+            act == 1
+            and (
+                self._safe_int(intent_forecast.get("enemy_scaling_risk"), 0) > 0
+                or predicted_two_turn_pressure >= max(14, int(state.hp * 0.42))
+                or (is_elite_room and floor >= 10)
+                or is_hard_act1_boss
+            )
+        )
+        low_pressure_window = (
+            predicted_turn_one_damage <= max(4, int(state.hp * 0.08))
+            and predicted_two_turn_pressure <= max(10, int(state.hp * 0.2))
+        )
+        vantom_forecast_row = _forecast_row_contains("vantom", "墨影")
+        ceremonial_forecast_row = _forecast_row_contains("ceremonial_beast", "ceremonial beast", "仪式兽")
+        vantom_next_phase = _forecast_phase(vantom_forecast_row, 0)
+        vantom_follow_phase = _forecast_phase(vantom_forecast_row, 1)
+        ceremonial_next_phase = _forecast_phase(ceremonial_forecast_row, 0)
+        ceremonial_follow_phase = _forecast_phase(ceremonial_forecast_row, 1)
         kin_priest_enemies = [
             enemy
             for enemy in enemies
@@ -241,6 +288,47 @@ class SimpleFlowPolicy:
                 if all_in_damage and block_gap <= max(12, int(state.hp * 0.5)) and safe_next_turn:
                     playable = all_in_damage
 
+        if act == 1 and high_value_combat and len(playable) > 1:
+            if requires_block_now:
+                survival_playable = [
+                    card
+                    for card in playable
+                    if self._card_block(card) > 0
+                    or "weak" in self._text(card.get("description"))
+                    or "铏氬急" in self._text(card.get("description"))
+                    or self._card_draw(card) > 0
+                    or self._card_energy_gain(card) > 0
+                    or (
+                        self._card_damage(card) > 0
+                        and self._pick_combat_target(state, card, enemies).get("hp", 0) <= self._card_damage(card)
+                    )
+                ]
+                if survival_playable:
+                    playable = survival_playable
+            elif requires_frontload_damage:
+                tempo_playable = [
+                    card
+                    for card in playable
+                    if self._card_damage(card) > 0
+                    or self._card_draw(card) > 0
+                    or self._card_energy_gain(card) > 0
+                    or "weak" in self._text(card.get("description"))
+                    or "铏氬急" in self._text(card.get("description"))
+                ]
+                if tempo_playable:
+                    playable = tempo_playable
+            elif low_pressure_window:
+                low_pressure_playable = [
+                    card
+                    for card in playable
+                    if self._card_damage(card) > 0
+                    or self._text(card.get("type")) == "power"
+                    or self._card_draw(card) > 0
+                    or self._card_energy_gain(card) > 0
+                ]
+                if low_pressure_playable:
+                    playable = low_pressure_playable
+
         if vantom_slippery and len(playable) > 1:
             low_commit_playable = [
                 card
@@ -252,6 +340,42 @@ class SimpleFlowPolicy:
             ]
             if low_commit_playable:
                 playable = low_commit_playable
+        if is_vantom and len(playable) > 1 and (vantom_next_phase in {"burst", "execute"} or vantom_follow_phase in {"burst", "execute"}):
+            vantom_safe_playable = [
+                card
+                for card in playable
+                if self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+                or self._card_damage(card) > 0
+            ]
+            if vantom_safe_playable and block_gap >= max(4, int(state.hp * 0.1)):
+                playable = vantom_safe_playable
+        if is_ceremonial_beast and len(playable) > 1 and ceremonial_next_phase in {"aoe_burst", "execute"}:
+            ceremonial_safe_playable = [
+                card
+                for card in playable
+                if self._card_block(card) > 0
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+                or (
+                    self._card_damage(card) > 0
+                    and self._pick_combat_target(state, card, enemies).get("hp", 0) <= self._card_damage(card)
+                )
+            ]
+            if ceremonial_safe_playable and block_gap >= max(4, int(state.hp * 0.12)):
+                playable = ceremonial_safe_playable
+        if is_ceremonial_beast and len(playable) > 1 and ceremonial_next_phase in {"setup", "tempo"} and ceremonial_follow_phase in {"pressure", "aoe_burst"} and incoming_damage <= 0:
+            ceremonial_tempo_playable = [
+                card
+                for card in playable
+                if self._card_damage(card) > 0
+                or self._text(card.get("type")) == "power"
+                or self._card_draw(card) > 0
+                or self._card_energy_gain(card) > 0
+            ]
+            if ceremonial_tempo_playable:
+                playable = ceremonial_tempo_playable
         if is_targeted_boss and len(playable) > 1:
             safer_playable = [card for card in playable if not self._should_avoid_hp_loss_energy_card(state, card, block_gap)]
             if safer_playable:
@@ -1748,7 +1872,7 @@ class SimpleFlowPolicy:
         enemies: list[dict[str, Any]],
     ) -> dict[str, Any]:
         damage = self._card_damage(card)
-        _, floor, room_type, is_boss_room = self._combat_context(state)
+        act, floor, room_type, is_boss_room = self._combat_context(state)
         round_no = self._safe_int(state.round, 0)
         strength_down, apply_weak = self._card_enemy_attack_debuff_profile(card)
         if strength_down > 0 or apply_weak:
@@ -1811,19 +1935,28 @@ class SimpleFlowPolicy:
                         return row
                 return {}
 
-            def _forecast_intent_categories(enemy: dict[str, Any], idx: int) -> set[str]:
+            def _forecast_steps(enemy: dict[str, Any]) -> list[dict[str, Any]]:
                 row = _forecast_row(enemy)
-                forecast = list(row.get("forecast") or [])
+                steps = list(row.get("short_horizon_forecast") or row.get("forecast") or [])
+                return [dict(step) for step in steps if isinstance(step, dict)]
+
+            def _forecast_intent_categories(enemy: dict[str, Any], idx: int) -> set[str]:
+                forecast = _forecast_steps(enemy)
                 if idx < 0 or idx >= len(forecast):
                     return set()
                 return {self._text(item) for item in (forecast[idx].get("intent_categories") or [])}
 
             def _forecast_damage_max(enemy: dict[str, Any], idx: int) -> int:
-                row = _forecast_row(enemy)
-                forecast = list(row.get("forecast") or [])
+                forecast = _forecast_steps(enemy)
                 if idx < 0 or idx >= len(forecast):
                     return 0
                 return max(0, self._safe_int(forecast[idx].get("damage_max"), 0))
+
+            def _forecast_phase(enemy: dict[str, Any], idx: int) -> str:
+                forecast = _forecast_steps(enemy)
+                if idx < 0 or idx >= len(forecast):
+                    return ""
+                return self._text(forecast[idx].get("special_phase_tag"))
 
             priest_strength = self._enemy_power_amount(state, "strength", "力量")
             incoming_damage = self._enemy_intended_damage(state)
@@ -1855,18 +1988,75 @@ class SimpleFlowPolicy:
                     candidate_forecast_next = _forecast_damage_max(candidate, 0)
                     priest_forecast_now = _forecast_intent_categories(priest_targets[0], 0) if priest_targets else set()
                     priest_forecast_next = _forecast_intent_categories(priest_targets[0], 1) if priest_targets else set()
+                    priest_phase_now = _forecast_phase(priest_targets[0], 0) if priest_targets else ""
+                    priest_phase_next = _forecast_phase(priest_targets[0], 1) if priest_targets else ""
                     significant_drop = candidate_drop >= max(10, int(incoming_damage * 0.45))
                     forecast_drop = candidate_forecast_next >= max(8, int(incoming_damage * 0.35))
                     projected_after_kill = max(0, incoming_damage - candidate_drop - state.block)
                     avoid_lethal = block_gap >= state.hp and projected_after_kill < state.hp
                     low_hp_emergency = state.hp <= max(18, int(state.max_hp * 0.3))
                     emergency_relief = low_hp_emergency and projected_after_kill <= max(0, state.hp - 6)
-                    priest_scaling_soon = ("buff" in priest_forecast_now or "buff" in priest_forecast_next)
+                    priest_scaling_soon = (
+                        priest_phase_now in {"scale", "all_in"}
+                        or priest_phase_next in {"scale", "all_in"}
+                        or (
+                            round_no >= 3
+                            and ("buff" in priest_forecast_now or "buff" in priest_forecast_next)
+                        )
+                    )
                     if avoid_lethal or (emergency_relief and not priest_scaling_soon) or ((significant_drop or forecast_drop) and not priest_scaling_soon and round_no <= 2):
                         self._last_policy_debug["kin_target"] = (
                             f"early_follower_lethal:r{round_no}:drop={candidate_drop}:next={candidate_forecast_next}:incoming={incoming_damage}"
                         )
                         return candidate
+                if priest_targets:
+                    best_follower = max(
+                        follower_targets,
+                        key=lambda enemy: (
+                            self._enemy_threat(enemy) + _forecast_damage_max(enemy, 0),
+                            -self._enemy_effective_hp(enemy),
+                            -self._safe_int(enemy.get("index"), 0),
+                        ),
+                    )
+                    best_priest = max(
+                        priest_targets,
+                        key=lambda enemy: (
+                            self._enemy_threat(enemy) + _forecast_damage_max(enemy, 0),
+                            -self._enemy_effective_hp(enemy),
+                            -self._safe_int(enemy.get("index"), 0),
+                        ),
+                    )
+                    priest_gap = max(0, self._enemy_effective_hp(best_priest) - damage)
+                    priest_scaling_soon = (
+                        _forecast_phase(best_priest, 0) in {"scale", "all_in"}
+                        or _forecast_phase(best_priest, 1) in {"scale", "all_in"}
+                        or (
+                            round_no >= 3
+                            and (
+                                "buff" in _forecast_intent_categories(best_priest, 0)
+                                or "buff" in _forecast_intent_categories(best_priest, 1)
+                            )
+                        )
+                    )
+                    follower_pressure = self._enemy_threat(best_follower) + _forecast_damage_max(best_follower, 0)
+                    if (
+                        incoming_damage >= max(10, int(state.hp * 0.12))
+                        and priest_gap > max(4, int(damage * 0.3))
+                        and not priest_scaling_soon
+                    ):
+                        self._last_policy_debug["kin_target"] = (
+                            f"early_follower_focus:r{round_no}:pressure={follower_pressure}:priest_gap={priest_gap}:incoming={incoming_damage}"
+                        )
+                        return best_follower
+                    if (
+                        follower_pressure >= max(10, int(incoming_damage * 0.4))
+                        and priest_gap > max(6, int(damage * 0.4))
+                        and not priest_scaling_soon
+                    ):
+                        self._last_policy_debug["kin_target"] = (
+                            f"early_follower_pressure:r{round_no}:pressure={follower_pressure}:priest_gap={priest_gap}:incoming={incoming_damage}"
+                        )
+                        return best_follower
 
             if round_no >= 6 and priest_targets:
                 best_priest = max(
@@ -1909,6 +2099,8 @@ class SimpleFlowPolicy:
                 forecast_now = _forecast_intent_categories(enemy, 0)
                 forecast_next = _forecast_intent_categories(enemy, 1)
                 forecast_damage_next = _forecast_damage_max(enemy, 0)
+                forecast_phase_now = _forecast_phase(enemy, 0)
+                forecast_phase_next = _forecast_phase(enemy, 1)
                 early_or_scaling = 1 if round_no <= 4 or priest_strength >= 3 else 0
                 priest_bias = 300.0 if is_priest and kin_scaling_phase else (180.0 if is_priest else 0.0)
                 priest_hp_window = max(0, effective_hp - damage)
@@ -1919,8 +2111,14 @@ class SimpleFlowPolicy:
                 )
                 if is_priest and ("buff" in forecast_now or "buff" in forecast_next):
                     priest_bias += 120.0
+                if is_priest and forecast_phase_now in {"scale", "all_in"}:
+                    priest_bias += 110.0
+                if is_priest and forecast_phase_next in {"scale", "all_in"}:
+                    priest_bias += 90.0
                 if is_priest and ("debuff" in forecast_now or "debuff" in forecast_next):
                     priest_bias += 40.0 if priest_near_lethal else -35.0
+                if is_priest and round_no <= 5 and priest_near_lethal:
+                    priest_bias += 150.0
                 follower_lethal_bias = 0.0
                 if is_follower and lethal:
                     if incoming_damage >= max(8, int(state.hp * 0.22)):
@@ -1929,6 +2127,8 @@ class SimpleFlowPolicy:
                         follower_lethal_bias += 18.0
                     if forecast_damage_next >= max(8, int(state.hp * 0.2)):
                         follower_lethal_bias += 55.0
+                    if forecast_phase_now in {"pressure", "all_in"} or forecast_phase_next in {"pressure", "all_in"}:
+                        follower_lethal_bias += 35.0
                 lethal_bias = lethal * (9000.0 if is_priest and kin_all_in_phase else (7000.0 if is_priest else (300.0 if incoming_damage >= state.hp else 0.0)))
                 non_priest_penalty = -340.0 if kin_scaling_phase and not is_priest else 0.0
                 return (
@@ -1958,6 +2158,42 @@ class SimpleFlowPolicy:
                 )
 
             return max(enemies, key=boss_target_score)
+        if act == 1 and len(enemies) > 1 and damage > 0:
+            act1_forecast = forecast_enemy_intent(state, horizon=2)
+            act1_rows = list(act1_forecast.get("rows") or [])
+
+            def _forecast_row(enemy: dict[str, Any]) -> dict[str, Any]:
+                enemy_key = self._text(enemy.get("id") or enemy.get("name"))
+                for row in act1_rows:
+                    row_enemy = self._text(row.get("enemy"))
+                    if enemy_key and (enemy_key in row_enemy or row_enemy in enemy_key):
+                        return row
+                return {}
+
+            def act1_target_score(enemy: dict[str, Any]) -> tuple[float, int, int, int]:
+                matched_row = _forecast_row(enemy)
+                next_turn = dict(matched_row.get("next_turn_forecast") or {})
+                categories = {self._text(item) for item in (next_turn.get("intent_categories") or [])}
+                effective_hp = self._enemy_effective_hp(enemy)
+                lethal = 1 if damage >= effective_hp else 0
+                threat = self._enemy_threat(enemy)
+                predicted_two_turn_damage = self._safe_int(matched_row.get("predicted_two_turn_damage"), 0)
+                scaling_risk = self._safe_int(matched_row.get("scaling_risk"), 0)
+                support_bias = 0.0
+                if scaling_risk:
+                    support_bias += 40.0
+                if "buff" in categories or "summon" in categories:
+                    support_bias += 28.0
+                if "debuff" in categories:
+                    support_bias += 10.0
+                return (
+                    lethal * 5000.0 + support_bias + predicted_two_turn_damage * 7.0 + threat * 22.0 - effective_hp * 2.2,
+                    threat,
+                    -effective_hp,
+                    -self._safe_int(enemy.get("index"), 0),
+                )
+
+            return max(enemies, key=act1_target_score)
         return self._pick_damage_target(enemies, damage) or enemies[0]
 
     def _combat_card_score(self, state: GameStateView, card: dict[str, Any]) -> float:
