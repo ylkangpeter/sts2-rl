@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 """Analyze deterministic floor-17 boss attempts for flow-policy tuning."""
 
 from __future__ import annotations
@@ -260,6 +259,42 @@ def _boss_signature(rows: list[dict[str, Any]]) -> str:
     return "NO_BOSS_TRACE"
 
 
+def _enemy_role(enemy: dict[str, Any]) -> str:
+    enemy_id = str(enemy.get("id") or enemy.get("name") or "").strip().lower()
+    if "priest" in enemy_id or "神官" in enemy_id:
+        return "priest"
+    if "follower" in enemy_id or "教徒" in enemy_id:
+        return "follower"
+    return "other"
+
+
+def _kin_trace_metrics(trace: list[dict[str, Any]]) -> dict[str, Any]:
+    early_attack_targets: Counter[str] = Counter()
+    first_priest_target_round: int | None = None
+    follower_alive_by_round: dict[int, int] = {}
+    for row in trace:
+        round_no = _safe_int(row.get("round"), 0)
+        enemies = list(row.get("enemies") or [])
+        if round_no in (3, 4) and round_no not in follower_alive_by_round:
+            follower_alive_by_round[round_no] = sum(1 for enemy in enemies if _enemy_role(enemy) == "follower")
+        target_name = str(row.get("target_name") or "")
+        target_role = _enemy_role({"name": target_name})
+        is_damage_action = (
+            (row.get("action") == "play_card" and _safe_int(row.get("played_damage"), 0) > 0)
+            or (row.get("action") == "use_potion" and bool(target_name))
+        )
+        if 1 <= round_no <= 3 and is_damage_action:
+            early_attack_targets.update([target_role if target_role != "other" else (target_name or "unknown")])
+        if first_priest_target_round is None and target_role == "priest" and is_damage_action:
+            first_priest_target_round = round_no
+    return {
+        "early_attack_targets_round_1_3": dict(early_attack_targets),
+        "follower_alive_round_3": follower_alive_by_round.get(3),
+        "follower_alive_round_4": follower_alive_by_round.get(4),
+        "first_priest_target_round": first_priest_target_round,
+    }
+
+
 def _deck_counter(state: GameStateView | None) -> Counter[str]:
     if state is None:
         return Counter()
@@ -341,6 +376,7 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
     deck = _deck_counter(boss_entry_state)
     combat_actions = [row for row in boss_rows if row.get("decision") == "combat_play"]
     played_cards = [row.get("played_card") for row in combat_actions if row.get("played_card")]
+    kin_metrics = _kin_trace_metrics(boss_rows) if _boss_signature(boss_rows).startswith("KIN_") else {}
     return {
         "seed": seed,
         "source": seed_row,
@@ -364,6 +400,7 @@ def _trace_seed(seed_row: dict[str, Any], args: argparse.Namespace, worker_slot:
         "intent_mismatch_count": sum(_safe_int(row.get("intent_mismatch_count"), 0) for row in boss_rows),
         "deck": dict(deck),
         "played_cards": Counter(played_cards),
+        "kin_metrics": kin_metrics,
         "trace": boss_rows,
         "trace_tail": boss_rows[-12:],
     }
@@ -479,7 +516,7 @@ def _summarize_group(rows: list[dict[str, Any]], clears: list[dict[str, Any]], f
         values = [value for value in values if value >= 0]
         return round(mean(values), 2) if values else 0.0
 
-    return {
+    summary = {
         "attempts": len(rows),
         "clears": len(clears),
         "fails": len(fails),
@@ -494,6 +531,28 @@ def _summarize_group(rows: list[dict[str, Any]], clears: list[dict[str, Any]], f
         "avg_potions_used": avg("potions_used", rows),
         "avg_intent_mismatches": avg("intent_mismatch_count", rows),
     }
+    kin_rows = [row for row in rows if isinstance(row.get("kin_metrics"), dict) and row.get("kin_metrics")]
+    if kin_rows:
+        target_counter: Counter[str] = Counter()
+        follower_round3: list[int] = []
+        follower_round4: list[int] = []
+        first_priest_round: list[int] = []
+        for row in kin_rows:
+            metrics = dict(row.get("kin_metrics") or {})
+            target_counter.update({str(key): _safe_int(value, 0) for key, value in (metrics.get("early_attack_targets_round_1_3") or {}).items()})
+            if metrics.get("follower_alive_round_3") is not None:
+                follower_round3.append(_safe_int(metrics.get("follower_alive_round_3"), 0))
+            if metrics.get("follower_alive_round_4") is not None:
+                follower_round4.append(_safe_int(metrics.get("follower_alive_round_4"), 0))
+            if metrics.get("first_priest_target_round") is not None:
+                first_priest_round.append(_safe_int(metrics.get("first_priest_target_round"), 0))
+        summary["kin_trace"] = {
+            "early_attack_targets_round_1_3": dict(target_counter),
+            "avg_follower_alive_round_3": round(mean(follower_round3), 2) if follower_round3 else 0.0,
+            "avg_follower_alive_round_4": round(mean(follower_round4), 2) if follower_round4 else 0.0,
+            "avg_first_priest_target_round": round(mean(first_priest_round), 2) if first_priest_round else 0.0,
+        }
+    return summary
 
 
 def _summarize_mismatch_group(rows: list[dict[str, Any]]) -> dict[str, Any]:

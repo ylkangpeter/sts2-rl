@@ -1,5 +1,5 @@
 {
-  "version": "v3_act1_boss_tuning",
+  "version": "v4_act1_boss_tuning",
   "entries": [
     {
       "name": "vantom_boss",
@@ -17,7 +17,7 @@
       "name": "ceremonial_beast_boss",
       "match_any": ["ceremonial_beast", "ceremonial beast", "仪式兽"],
       "timeline": {
-        "1": {"round": 1, "intent_categories": ["attack", "debuff"], "damage_max": 10, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
+        "1": {"round": 1, "intent_categories": ["buff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "setup"},
         "2": {"round": 2, "intent_categories": ["attack", "buff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
         "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 18, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
         "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 20, "hit_count": 2, "targets_all": true, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "aoe_burst"},
@@ -29,7 +29,7 @@
       "name": "kin_priest",
       "match_any": ["kin_priest", "kin priest", "同族神官"],
       "timeline": {
-        "1": {"round": 1, "intent_categories": ["buff", "debuff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": true, "spawn_or_scale": true, "special_phase_tag": "setup"},
+        "1": {"round": 1, "intent_categories": ["attack", "debuff"], "damage_max": 8, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "tempo"},
         "2": {"round": 2, "intent_categories": ["attack", "buff"], "damage_max": 12, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
         "3": {"round": 3, "intent_categories": ["attack", "debuff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
         "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 16, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
@@ -45,7 +45,7 @@
       "timeline": {
         "1": {"round": 1, "intent_categories": ["attack", "buff"], "damage_max": 8, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
         "2": {"round": 2, "intent_categories": ["attack", "debuff"], "damage_max": 10, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
-        "3": {"round": 3, "intent_categories": ["buff"], "damage_max": 0, "hit_count": 0, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": true, "special_phase_tag": "scale"},
+        "3": {"round": 3, "intent_categories": ["attack"], "damage_max": 12, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
         "4": {"round": 4, "intent_categories": ["attack", "buff"], "damage_max": 12, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "tempo"},
         "5": {"round": 5, "intent_categories": ["attack", "debuff"], "damage_max": 13, "hit_count": 2, "targets_all": false, "adds_block": false, "adds_buff": false, "adds_debuff": true, "spawn_or_scale": false, "special_phase_tag": "pressure"},
         "6": {"round": 6, "intent_categories": ["attack", "buff"], "damage_max": 14, "hit_count": 1, "targets_all": false, "adds_block": false, "adds_buff": true, "adds_debuff": false, "spawn_or_scale": false, "special_phase_tag": "all_in"}

@@ -80,10 +80,10 @@ def _intent_category(enemy: dict[str, Any]) -> str:
         return "unknown"
     if any(token in text for token in ("attack", "strike", "slash", "beam", "bite", "hit", "damage", "攻击")):
         return "attack"
-    if any(token in text for token in ("buff", "strength", "armor", "ritual", "power", "强化", "力量", "增益")):
-        return "buff"
     if any(token in text for token in ("debuff", "weak", "vulnerable", "frail", "减益", "虚弱", "易伤")):
         return "debuff"
+    if any(token in text for token in ("buff", "strength", "armor", "ritual", "power", "强化", "力量", "增益")):
+        return "buff"
     if any(token in text for token in ("defend", "block", "护甲", "格挡", "防御")):
         return "block"
     if any(token in text for token in ("summon", "spawn", "call", "召唤")):
