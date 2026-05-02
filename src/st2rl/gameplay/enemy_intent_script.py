@@ -168,6 +168,23 @@ def _current_step_with_branch_overrides(enemy: dict[str, Any], step: dict[str, A
         stunned["spawn_or_scale"] = False
         stunned["special_phase_tag"] = "stun"
         return stunned
+    if (
+        "ceremonial_beast" in enemy_key
+        and _safe_int(enemy.get("hp"), 999) <= 150
+        and _intent_category(enemy) == "debuff"
+        and _enemy_intended_damage(enemy) <= 0
+    ):
+        threshold_debuff = dict(step)
+        threshold_debuff["intent_categories"] = ["debuff"]
+        threshold_debuff["damage_max"] = 0
+        threshold_debuff["hit_count"] = 0
+        threshold_debuff["targets_all"] = False
+        threshold_debuff["adds_block"] = False
+        threshold_debuff["adds_buff"] = False
+        threshold_debuff["adds_debuff"] = True
+        threshold_debuff["spawn_or_scale"] = False
+        threshold_debuff["special_phase_tag"] = "threshold_debuff"
+        return threshold_debuff
     return step
 
 

@@ -195,6 +195,13 @@ class SimpleFlowPolicy:
         kin_scaling_phase = kin_multi_target and bool(kin_priest_enemies) and (round_no >= 6 or kin_priest_strength >= 3)
         kin_all_in_phase = kin_multi_target and bool(kin_priest_enemies) and (round_no >= 8 or kin_priest_strength >= 5)
         kin_solo_priest = is_kin and len(enemies) == 1 and bool(kin_priest_enemies)
+
+        def _play_card_action(card: dict[str, Any]) -> FlowAction:
+            args = {"card_index": card["index"]}
+            if card_needs_enemy_target(card):
+                args["target_index"] = self._pick_combat_target(state, card, enemies).get("index", enemies[0]["index"])
+            return FlowAction("play_card", args)
+
         if kin_solo_priest and incoming_damage >= state.hp and len(playable) > 1:
             block_playable = [card for card in playable if self._card_block(card) > 0]
             if block_playable:
@@ -287,6 +294,42 @@ class SimpleFlowPolicy:
                 safe_next_turn = expected_next_turn_pressure <= max(20, int(state.hp * 0.55))
                 if all_in_damage and block_gap <= max(12, int(state.hp * 0.5)) and safe_next_turn:
                     playable = all_in_damage
+
+        if is_ceremonial_beast and round_no <= 5 and len(playable) > 1:
+            projected_hp_after_current_block = state.hp + state.block - incoming_damage
+            safe_to_push_damage = (
+                incoming_damage <= 0
+                or projected_hp_after_current_block >= max(22, int(state.max_hp * 0.32))
+                or block_gap <= max(6, int(state.hp * 0.14))
+            )
+            if safe_to_push_damage:
+                def _ceremonial_damage_candidate(card: dict[str, Any]) -> bool:
+                    damage = self._card_damage(card)
+                    if damage <= 0 or self._is_hp_loss_energy_card_id(card):
+                        return False
+                    hp_loss = self._card_hp_loss(card)
+                    if hp_loss <= 0:
+                        return True
+                    projected_after_hp_loss = state.hp - hp_loss + state.block - incoming_damage
+                    if projected_after_hp_loss < max(18, int(state.max_hp * 0.25)):
+                        return False
+                    return damage >= 8 or self._card_block(card) > 0
+
+                damage_playable = [card for card in playable if _ceremonial_damage_candidate(card)]
+                if damage_playable:
+                    def _ceremonial_damage_score(card: dict[str, Any]) -> float:
+                        text = f"{self._text(card.get('name'))} {self._text(card.get('description'))}"
+                        debuff_bonus = 12.0 if ("vulnerable" in text or "weak" in text or "易伤" in text or "虚弱" in text) else 0.0
+                        hp_loss_bonus = 5.0 if self._card_hp_loss(card) > 0 and self._card_damage(card) >= 10 else 0.0
+                        return (
+                            self._combat_card_score(state, card)
+                            + self._card_damage(card) * 5.8
+                            + min(self._card_block(card), max(0, incoming_damage - state.block)) * 1.2
+                            + debuff_bonus
+                            + hp_loss_bonus
+                        )
+
+                    return _play_card_action(max(damage_playable, key=_ceremonial_damage_score))
 
         if act == 1 and high_value_combat and len(playable) > 1:
             if requires_block_now:
@@ -650,12 +693,12 @@ class SimpleFlowPolicy:
                         args["target_index"] = self._pick_combat_target(state, block_card, enemies).get("index", enemies[0]["index"])
                     return FlowAction("play_card", args)
 
-        if is_ceremonial_beast and round_no <= 5 and block_gap >= max(4, int(state.hp * 0.14)):
+        if is_ceremonial_beast and round_no <= 5 and block_gap >= max(8, int(state.hp * 0.22)):
             block_playable = [card for card in playable if self._card_block(card) > 0]
             if block_playable:
                 block_scores = [
                     (
-                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * 3.4,
+                        self._combat_card_score(state, card) + min(self._card_block(card), block_gap) * 2.7,
                         card,
                     )
                     for card in block_playable
