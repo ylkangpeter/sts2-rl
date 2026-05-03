@@ -147,6 +147,7 @@ Training is considered healthy only when all of the following hold:
 
 - Python source files should start with `# -*- coding: utf-8 -*-`.
 - Keep the runtime simple and deterministic on Windows.
+- On this Windows runtime, prefer PowerShell-native commands for startup, process inspection, and repository operations; do not rely on `rg` when PowerShell built-ins such as `Get-ChildItem` and `Select-String` are sufficient.
 - Avoid spawning visible console windows for worker subprocesses.
 - This repository depends on a local `sts2-cli` checkout or fork.
 - Prefer resolving `sts2-cli` from `STS2_CLI_ROOT`, then sibling directories such as `../sts2-cli`.
