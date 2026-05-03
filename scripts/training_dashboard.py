@@ -1853,12 +1853,6 @@ def _shared_runtime_env() -> dict[str, str]:
     projects = runtime.get("projects") or {}
     game_dir = str((projects or {}).get("game_dir") or "").strip()
     env: dict[str, str] = {"PYTHONUNBUFFERED": "1"}
-    src_dir = str((ROOT / "src").resolve())
-    existing_pythonpath = os.environ.get("PYTHONPATH", "").strip()
-    if existing_pythonpath:
-        env["PYTHONPATH"] = os.pathsep.join([src_dir, existing_pythonpath])
-    else:
-        env["PYTHONPATH"] = src_dir
     if game_dir:
         env["STS2_GAME_DIR"] = game_dir
     return env

@@ -196,22 +196,22 @@ function Start-ManagedProcess {
         }
     }
 
-    $pythonDir = Split-Path -Parent $nodePythonExe
-    $venvRoot = Split-Path -Parent $pythonDir
-    if (Test-Path -LiteralPath $venvRoot) {
-        $effectiveEnv["VIRTUAL_ENV"] = $venvRoot
-        $existingPath = [Environment]::GetEnvironmentVariable("Path", "Process")
-        if ([string]::IsNullOrWhiteSpace($existingPath)) {
-            $effectiveEnv["Path"] = $pythonDir
-        } else {
-            $effectiveEnv["Path"] = "$pythonDir;$existingPath"
+    $pythonDir = Split-Path -Parent $nodePythonExe -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($pythonDir)) {
+        $venvRoot = Split-Path -Parent $pythonDir -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($venvRoot) -and (Test-Path -LiteralPath $venvRoot)) {
+            $effectiveEnv["VIRTUAL_ENV"] = $venvRoot
+            $existingPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+            if ([string]::IsNullOrWhiteSpace($existingPath)) {
+                $effectiveEnv["Path"] = $pythonDir
+            } else {
+                $effectiveEnv["Path"] = "$pythonDir;$existingPath"
+            }
         }
     }
 
     $envBackup["PATH"] = [Environment]::GetEnvironmentVariable("PATH", "Process")
     $envBackup["Path"] = [Environment]::GetEnvironmentVariable("Path", "Process")
-    [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
-    [Environment]::SetEnvironmentVariable("Path", $null, "Process")
     foreach ($key in $effectiveEnv.Keys) {
         $envBackup[[string]$key] = [Environment]::GetEnvironmentVariable([string]$key, "Process")
         [Environment]::SetEnvironmentVariable([string]$key, [string]$effectiveEnv[$key], "Process")

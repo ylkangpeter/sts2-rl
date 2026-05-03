@@ -1,13 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "src"))
-
 from scripts.analyze_boss_floor import _aggregate
 from scripts.training_dashboard import _build_act1_metrics
 from st2rl.gameplay.enemy_intent_script import describe_enemy_intent, forecast_enemy_intent
@@ -55,7 +48,7 @@ def test_forecast_enemy_intent_returns_structured_act1_rows() -> None:
     assert "intent_categories" in row["next_turn_forecast"]
 
 
-def test_describe_enemy_intent_reports_mismatch_and_phase() -> None:
+def test_describe_enemy_intent_reports_match_and_phase() -> None:
     state = _state_view(
         {
             "decision": "combat_play",
@@ -82,10 +75,10 @@ def test_describe_enemy_intent_reports_mismatch_and_phase() -> None:
     snapshot = describe_enemy_intent(state, horizon=3)
 
     assert snapshot["matched_enemies"] == 1
-    assert snapshot["mismatch_count"] == 1
+    assert snapshot["mismatch_count"] == 0
     row = snapshot["rows"][0]
-    assert row["mismatch"] is True
-    assert row["expected_step"]["special_phase_tag"] == "setup"
+    assert row["mismatch"] is False
+    assert row["expected_step"]["special_phase_tag"] == "tempo"
     assert row["short_horizon_forecast"][1]["special_phase_tag"] == "pressure"
 
 

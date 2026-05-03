@@ -165,11 +165,16 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_seeds(path: Path) -> list[str]:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    seeds = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    seeds = [
+        line.strip().lstrip("\ufeff")
+        for line in lines
+        if line.strip().lstrip("\ufeff") and not line.strip().lstrip("\ufeff").startswith("#")
+    ]
     seen: set[str] = set()
     unique: list[str] = []
     for seed in seeds:
+        seed = seed.strip().lstrip("\ufeff")
         if seed in seen:
             continue
         seen.add(seed)

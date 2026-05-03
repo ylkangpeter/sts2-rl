@@ -8,10 +8,6 @@ This example demonstrates:
 """
 
 import sys
-import os
-
-# 添加 src 到路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from st2rl.training import UnifiedTrainer
 from st2rl.inference import UnifiedRunner

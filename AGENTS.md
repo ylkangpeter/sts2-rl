@@ -92,6 +92,10 @@ Training is considered healthy only when all of the following hold:
 
 ## Script And Runtime Output Discipline
 
+- Project scripts should run from the system default `python` after the package is installed normally. Do not depend on ad-hoc `PYTHONPATH`, manual `sys.path` injection, repo bootstrap shims, or absolute interpreter paths as a substitute for proper packaging/startup behavior.
+- If a script only works when `PYTHONPATH=src` or a hand-picked venv path is supplied, treat that as a project bug. Fix packaging, imports, startup configuration, or the script entrypoint so the same command works with the default Python environment.
+- Startup scripts must use PowerShell-native process launches on Windows and must preserve the caller's environment well enough that `python` can be resolved from the normal system `PATH`.
+- Do not commit temporary import/bootstrap helpers added during debugging. Once the root cause is fixed, remove the helper and verify commands without path overrides.
 - Never treat a backtest, training run, or server probe as healthy just because the process exits with code 0 or prints a summary.
 - Inspect script output, result JSON, worker debug endpoints, and relevant stderr tails for every run used to make a decision.
 - Any non-empty per-seed `err`, `error`, Python/C# exception, `MissingMethodException`, `NullReferenceException`, `Game not found`, timeout, deadlock hint, or warning from the game server/headless runtime must be investigated.

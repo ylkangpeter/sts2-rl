@@ -11,7 +11,6 @@ import random
 import threading
 from pathlib import Path
 from statistics import mean
-import sys
 from typing import Any
 
 from st2rl.gameplay.config import FlowPolicyConfig
@@ -20,11 +19,12 @@ from st2rl.gameplay.policy import SimpleFlowPolicy
 from st2rl.gameplay.types import FlowAction, GameStateView
 from st2rl.protocols.http_cli import HttpCliProtocol, HttpCliProtocolConfig
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from backtest_flow_policy import _boss_cleared, _is_boss_state, _state_floor
+try:
+    from scripts.backtest_flow_policy import _boss_cleared, _is_boss_state, _state_floor
+except ModuleNotFoundError as exc:
+    if exc.name != "scripts":
+        raise
+    from backtest_flow_policy import _boss_cleared, _is_boss_state, _state_floor
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -88,9 +88,9 @@ def _load_seed_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.seeds_file is None:
         raise SystemExit("Provide --backtest-json or --seeds-file.")
     seeds = [
-        line.strip()
-        for line in args.seeds_file.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        line.strip().lstrip("\ufeff")
+        for line in args.seeds_file.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip().lstrip("\ufeff") and not line.strip().lstrip("\ufeff").startswith("#")
     ]
     return _dedupe_seed_rows([{"seed": seed} for seed in seeds])[: max(0, args.max_seeds)]
 
@@ -99,9 +99,10 @@ def _dedupe_seed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for row in rows:
-        seed = str(row.get("seed") or "").strip()
+        seed = str(row.get("seed") or "").strip().lstrip("\ufeff")
         if not seed or seed in seen:
             continue
+        row["seed"] = seed
         seen.add(seed)
         unique.append(row)
     return unique
