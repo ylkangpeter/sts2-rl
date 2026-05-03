@@ -140,7 +140,7 @@ class RewardTracker:
             hp_ratio = state.hp / max(1, state.max_hp)
             reward += hp_ratio * self.config.act1_boss_prep_hp_reward
             reward += min(1.0, self._deck_block_density(state) / 0.3) * self.config.act1_boss_prep_block_density_reward
-            reward += min(2, self._potion_count(state)) * self.config.act1_boss_potion_reward
+            reward += min(2, self._potion_count(state)) * self.config.act1_boss_prep_potion_reward
         return reward
 
     def compute(self, state: GameStateView) -> float:

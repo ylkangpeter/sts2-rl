@@ -1491,6 +1491,24 @@ class HttpCliRlEnv(gym.Env):
         }
         return float(mapping.get(normalized, 0)) / 5.0
 
+    def _enemy_intended_damage(self, state: GameStateView) -> int:
+        total = 0
+        for enemy in state.living_enemies():
+            intents = enemy.get("intents") or []
+            if isinstance(intents, list):
+                for intent in intents:
+                    if not isinstance(intent, dict):
+                        continue
+                    damage = max(0, self._safe_number(intent.get("damage"), 0))
+                    hits = max(1, self._safe_number(intent.get("hits"), 1))
+                    total += damage * hits
+            for key in ("intent_damage", "damage", "intentDamage"):
+                if enemy.get(key) is None:
+                    continue
+                total += max(0, self._safe_number(enemy.get(key), 0))
+                break
+        return total
+
     def _enemy_forecast_features(
         self,
         state: GameStateView,

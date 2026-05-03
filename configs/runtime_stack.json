@@ -12,7 +12,11 @@
     "health_path": "/health",
     "script": "python\\http_game_service.py",
     "workdir": ".",
-    "process_match": "python\\\\http_game_service.py"
+    "process_match": "python\\\\http_game_service.py",
+    "env": {
+      "STS2_HTTP_THREADS": "64",
+      "STS2_HTTP_CONNECTION_LIMIT": "384"
+    }
   },
   "dashboard": {
     "enabled": true,

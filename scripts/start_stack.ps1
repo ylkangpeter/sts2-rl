@@ -278,8 +278,12 @@ Write-Info "Python executable: $pythonExe"
 
 Start-ManagedProcess -Name "service" -Node $config.service -PythonExe $pythonExe -DefaultRoot $sts2CliRoot -SharedEnv $sharedEnv
 Start-ManagedProcess -Name "dashboard" -Node $config.dashboard -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv
-Start-ManagedProcess -Name "watchdog" -Node $config.watchdog -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv
-Start-ManagedProcess -Name "session_supervisor" -Node $config.session_supervisor -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv
+if ($config.watchdog -and $config.watchdog.enabled) {
+    Write-Warning "watchdog is enabled in config but start_stack will not launch it; runtime contract allows service, dashboard, and client only"
+}
+if ($config.session_supervisor -and $config.session_supervisor.enabled) {
+    Write-Warning "session_supervisor is enabled in config but start_stack will not launch it; runtime contract allows service, dashboard, and client only"
+}
 
 if ($IncludeClient) {
     Start-ManagedProcess -Name "client" -Node $config.client -PythonExe $pythonExe -DefaultRoot $st2rlRoot -SharedEnv $sharedEnv -ForceEnabled:$true

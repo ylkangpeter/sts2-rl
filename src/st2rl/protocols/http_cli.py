@@ -400,12 +400,11 @@ class HttpCliProtocol(FlowProtocol):
         return session
 
     def _get_session(self) -> requests.Session:
-        thread_id = threading.get_ident()
         with self._session_lock:
-            session = self._sessions.get(thread_id)
+            session = self._sessions.get(0)
             if session is None:
                 session = self._build_session()
-                self._sessions[thread_id] = session
+                self._sessions[0] = session
             return session
 
     def close(self) -> None:
@@ -576,6 +575,31 @@ class HttpCliProtocol(FlowProtocol):
         result = self._request("POST", f"/admin/workers/{worker_key}/reset", payload={}, retries=1)
         return result.get("status") == "success"
 
+    def _existing_worker_slot_start(self, worker_slot: int, seed: str) -> ProtocolStartResult | None:
+        expected_seed = str(seed or "").strip()
+        if not expected_seed:
+            return None
+        for game in self._list_games():
+            if not isinstance(game, dict) or not self._slot_matches_game(worker_slot, game):
+                continue
+            if str(game.get("seed") or "").strip() != expected_seed:
+                continue
+            game_id = str(game.get("game_id") or "").strip()
+            if not game_id:
+                continue
+            state = self.get_state(game_id)
+            return ProtocolStartResult(game_id=game_id, raw_state=state)
+        worker_key = f"slot_{int(worker_slot):02d}"
+        for worker in self._list_workers():
+            if not isinstance(worker, dict) or str(worker.get("worker_key") or "") != worker_key:
+                continue
+            game_id = str(worker.get("game_id") or "").strip()
+            if not game_id or expected_seed not in game_id:
+                continue
+            state = self.get_state(game_id)
+            return ProtocolStartResult(game_id=game_id, raw_state=state)
+        return None
+
     def start_game(self, character: str, seed: str, worker_slot: int | None = None) -> ProtocolStartResult:
         with self._start_lock:
             payload = {"character": character, "seed": seed}
@@ -596,6 +620,9 @@ class HttpCliProtocol(FlowProtocol):
                 message = str(data.get("message") or "")
                 if worker_slot is None or attempt >= attempts - 1 or "busy" not in message.lower():
                     break
+                existing = self._existing_worker_slot_start(int(worker_slot), seed)
+                if existing is not None:
+                    return existing
                 # Never force-close/reset a busy slot here: another concurrent
                 # training/backtest worker may legitimately own that game.
                 # Cross-worker eviction causes cascading "Game not found" errors.
